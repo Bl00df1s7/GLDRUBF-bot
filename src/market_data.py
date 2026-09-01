@@ -53,7 +53,12 @@ def candle_to_row(candle) -> dict:
     }
 
 
-def load_candles(token: str, uid: str, candles_count: int = 200) -> pd.DataFrame:
+def load_candles(
+    token: str,
+    uid: str,
+    candles_count: int = 200,
+    timeframe: str = "4H"
+) -> pd.DataFrame:
     """
     Load recent candles from T-Invest API.
     
@@ -61,6 +66,7 @@ def load_candles(token: str, uid: str, candles_count: int = 200) -> pd.DataFrame
         token: T-Invest API token
         uid: Instrument UID
         candles_count: Number of candles to load
+        timeframe: Candle timeframe (e.g., "4H", "1H", "15m")
         
     Returns:
         DataFrame with OHLCV data
@@ -73,13 +79,33 @@ def load_candles(token: str, uid: str, candles_count: int = 200) -> pd.DataFrame
     
     now_utc = datetime.now(timezone.utc)
     
-    # 4H = 6 candles per day, add buffer
-    days = int(candles_count / 6) + 10
+    # Calculate days needed based on timeframe
+    # 4H = 6 candles per day, 1H = 24 candles per day, 15m = 96 candles per day
+    if timeframe == "4H":
+        candles_per_day = 6
+    elif timeframe == "1H":
+        candles_per_day = 24
+    elif timeframe == "15m":
+        candles_per_day = 96
+    else:
+        candles_per_day = 6  # Default to 4H
+    
+    days = int(candles_count / candles_per_day) + 10
     start_date = now_utc - timedelta(days=days)
     
     rows = []
     current = start_date
     chunk = timedelta(days=90)
+    
+    # Map timeframe string to CandleInterval
+    timeframe_map = {
+        "4H": CandleInterval.CANDLE_INTERVAL_4_HOUR,
+        "1H": CandleInterval.CANDLE_INTERVAL_HOUR,
+        "15m": CandleInterval.CANDLE_INTERVAL_15_MIN,
+        "5m": CandleInterval.CANDLE_INTERVAL_5_MIN,
+        "1m": CandleInterval.CANDLE_INTERVAL_MINUTE,
+    }
+    candle_interval = timeframe_map.get(timeframe, CandleInterval.CANDLE_INTERVAL_4_HOUR)
     
     while current < now_utc:
         chunk_end = min(current + chunk, now_utc)
@@ -89,7 +115,7 @@ def load_candles(token: str, uid: str, candles_count: int = 200) -> pd.DataFrame
                 instrument_id=uid,
                 from_=current,
                 to=chunk_end,
-                interval=CandleInterval.CANDLE_INTERVAL_4_HOUR,
+                interval=candle_interval,
             )
         
         rows.extend(candle_to_row(candle) for candle in response.candles)
