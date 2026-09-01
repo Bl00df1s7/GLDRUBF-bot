@@ -97,15 +97,25 @@ def load_candles(
     current = start_date
     chunk = timedelta(days=90)
     
-    # Map timeframe string to CandleInterval
+    # Map timeframe string to CandleInterval according to T-Invest API documentation
+    # https://developer.tbank.ru/invest/api
+    # Valid intervals: CANDLE_INTERVAL_1_MIN, CANDLE_INTERVAL_5_MIN, CANDLE_INTERVAL_15_MIN,
+    #                  CANDLE_INTERVAL_HOUR, CANDLE_INTERVAL_2_HOUR, CANDLE_INTERVAL_4_HOUR,
+    #                  CANDLE_INTERVAL_DAY, CANDLE_INTERVAL_WEEK, CANDLE_INTERVAL_MONTH
     timeframe_map = {
-        "4H": CandleInterval.CANDLE_INTERVAL_4_HOUR,
-        "1H": CandleInterval.CANDLE_INTERVAL_HOUR,
-        "15m": CandleInterval.CANDLE_INTERVAL_15_MIN,
-        "5m": CandleInterval.CANDLE_INTERVAL_5_MIN,
-        "1m": CandleInterval.CANDLE_INTERVAL_MINUTE,
+        "4H": getattr(CandleInterval, 'CANDLE_INTERVAL_4_HOUR', None),
+        "2H": getattr(CandleInterval, 'CANDLE_INTERVAL_2_HOUR', None),
+        "1H": getattr(CandleInterval, 'CANDLE_INTERVAL_HOUR', None),
+        "30m": getattr(CandleInterval, 'CANDLE_INTERVAL_30_MIN', None),
+        "15m": getattr(CandleInterval, 'CANDLE_INTERVAL_15_MIN', None),
+        "5m": getattr(CandleInterval, 'CANDLE_INTERVAL_5_MIN', None),
+        "1m": getattr(CandleInterval, 'CANDLE_INTERVAL_1_MIN', None),
     }
-    candle_interval = timeframe_map.get(timeframe, CandleInterval.CANDLE_INTERVAL_4_HOUR)
+    
+    candle_interval = timeframe_map.get(timeframe)
+    if candle_interval is None:
+        # Fallback to 4H if timeframe not supported
+        candle_interval = CandleInterval.CANDLE_INTERVAL_4_HOUR
     
     while current < now_utc:
         chunk_end = min(current + chunk, now_utc)
