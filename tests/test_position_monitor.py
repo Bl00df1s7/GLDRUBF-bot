@@ -470,5 +470,160 @@ class TestMessageFormatting(unittest.TestCase):
         self.assertIn("Давление:", message)
 
 
+class TestBugFixes(unittest.TestCase):
+    """Test fixes for reported bugs."""
+    
+    def test_distance_to_be_equals_pnl_when_profitable(self):
+        """
+        Bug #1 fix: Distance to BE should equal P&L when position is profitable.
+        
+        For a SHORT position at entry 12259.10, current price 12165.90:
+        - P&L = +93.2 points (profit)
+        - Distance to BE (entry_price) should be exactly 93.2 points
+        
+        Note: Distance to BE uses is_be=True flag for correct calculation.
+        """
+        # Test SHORT position with is_be=True
+        dist_short = _calculate_distance_to_level("SHORT", 12165.90, 12259.10, is_sl=False, is_be=True)
+        self.assertAlmostEqual(dist_short, 93.2, places=1)
+        
+        # Test LONG position with is_be=True
+        dist_long = _calculate_distance_to_level("LONG", 105.0, 100.0, is_sl=False, is_be=True)
+        self.assertEqual(dist_long, 5.0)
+        
+        # Verify: distance to BE should always equal abs(P&L) when profitable
+        pnl_short, _ = _calculate_pnl("SHORT", 12259.10, 12165.90)
+        self.assertAlmostEqual(abs(pnl_short), dist_short, places=1)
+    
+    def test_structure_break_only_on_close_not_wick(self):
+        """
+        Bug #2 fix: Structure break only triggers on CLOSE beyond level, not wick.
+        
+        For SHORT at 12259.10, entry candle high must be >= 12259.10.
+        Current close at 12165.90 should NOT trigger structure break
+        because it's below entry price, not above entry candle high.
+        """
+        entry_candle_high = 12280.0  # Entry candle high (contains entry price)
+        current_close = 12165.90     # Current price (below entry)
+        
+        entry_broken, prev_h4_broken = _check_structure_break(
+            "SHORT", 
+            current_close, 
+            None,           # entry_candle_low (not relevant)
+            entry_candle_high,
+            None, None      # prev_h4 levels
+        )
+        
+        # Should NOT be broken - price closed BELOW entry candle high
+        self.assertFalse(entry_broken)
+        self.assertFalse(prev_h4_broken)
+    
+    def test_short_structure_break_requires_close_above_high(self):
+        """SHORT structure break requires close ABOVE entry candle high."""
+        entry_candle_high = 12259.10
+        
+        # Close above high - should break
+        entry_broken, _ = _check_structure_break(
+            "SHORT", 12270.0, None, entry_candle_high, None, None
+        )
+        self.assertTrue(entry_broken)
+        
+        # Close at high - should NOT break (needs to be strictly above)
+        entry_broken, _ = _check_structure_break(
+            "SHORT", 12259.10, None, entry_candle_high, None, None
+        )
+        self.assertFalse(entry_broken)
+        
+        # Close below high - should NOT break
+        entry_broken, _ = _check_structure_break(
+            "SHORT", 12200.0, None, entry_candle_high, None, None
+        )
+        self.assertFalse(entry_broken)
+    
+    def test_entry_candle_validation_contains_entry_price(self):
+        """Entry candle must contain entry price in its range."""
+        from src.position_monitor import _get_structural_levels
+        
+        # Create 4H candles where entry price is within candle range
+        dates_4h = pd.date_range(start='2024-01-01', periods=3, freq='4H')
+        df_4h = pd.DataFrame({
+            'time': dates_4h,
+            'open': [12200, 12250, 12300],
+            'high': [12300, 12350, 12400],  # Second candle contains 12259.10
+            'low': [12150, 12200, 12250],   # Second candle contains 12259.10
+            'close': [12250, 12300, 12350],
+        })
+        
+        entry_time = dates_4h[1]  # During second candle
+        entry_price = 12259.10
+        direction = "SHORT"
+        
+        result = _get_structural_levels(df_4h, entry_time, entry_price, direction)
+        
+        # Entry candle high should be >= entry price
+        self.assertIsNotNone(result['entry_candle_high'])
+        self.assertGreaterEqual(result['entry_candle_high'], entry_price)
+        
+        # Entry candle low should be <= entry price
+        self.assertIsNotNone(result['entry_candle_low'])
+        self.assertLessEqual(result['entry_candle_low'], entry_price)
+    
+    def test_full_integration_real_case(self):
+        """Integration test with real reported bug case."""
+        position_state = {
+            'direction': 'SHORT',
+            'entry_price': 12259.10,
+            'sl_price': 12619.10,
+            'tp_price': 11400.0,
+            'be_trigger': 12259.10,
+        }
+        
+        stored_levels = {
+            'recommended_sl': 12619.10,
+            'tp': 11400.0,
+            'be_trigger': 12259.10,
+            'be_activated': False,
+        }
+        
+        # Create 1H monitor data ending at 12165.90
+        dates = pd.date_range(start='2024-01-01', periods=10, freq='1H')
+        df_monitor = pd.DataFrame({
+            'time': dates,
+            'open': [12200, 12180, 12150, 12100, 12080, 12090, 12110, 12130, 12150, 12160],
+            'high': [12220, 12200, 12170, 12120, 12100, 12110, 12130, 12150, 12170, 12180],
+            'low': [12180, 12150, 12100, 12070, 12060, 12070, 12090, 12110, 12130, 12140],
+            'close': [12200, 12180, 12150, 12100, 12080, 12090, 12110, 12130, 12150, 12165.90],
+            'atr': [55.0] * 10,
+        })
+        
+        # Create 4H structural data
+        dates_4h = pd.date_range(start='2024-01-01', periods=5, freq='4H')
+        df_4h = pd.DataFrame({
+            'time': dates_4h,
+            'open': [12200, 12250, 12300, 12350, 12400],
+            'high': [12280, 12320, 12380, 12420, 12450],  # Entry candle high >= 12259.10
+            'low': [12180, 12230, 12280, 12320, 12380],   # Entry candle low <= 12259.10
+            'close': [12250, 12300, 12350, 12400, 12420],
+        })
+        
+        health = calculate_position_health(
+            position_state,
+            df_monitor,
+            df_4h,
+            stored_levels,
+        )
+        
+        # Verify P&L is correct
+        self.assertAlmostEqual(health.pnl_points, 93.2, places=1)
+        
+        # Verify distance to BE equals P&L (Bug #1 fix)
+        self.assertIsNotNone(health.distance_to_be_points)
+        self.assertAlmostEqual(health.distance_to_be_points, 93.2, places=1)
+        
+        # Verify structure is NOT broken (Bug #2 fix)
+        # Current close 12165.90 is BELOW entry candle high (~12320)
+        self.assertFalse(health.entry_structure_broken)
+
+
 if __name__ == '__main__':
     unittest.main()

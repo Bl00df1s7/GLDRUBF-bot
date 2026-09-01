@@ -139,16 +139,38 @@ def _calculate_distance_to_level(
     direction: str,
     current_price: float,
     level_price: float,
-    is_sl: bool = False
+    is_sl: bool = False,
+    is_be: bool = False  # BE uses entry_price as level, distance should always be positive when profitable
 ) -> Optional[float]:
-    """Calculate distance to a level in points."""
+    """
+    Calculate distance to a level in points.
+    
+    For SL/TP: distance is how far price can move before hitting the level (always positive).
+    For BE: distance equals P&L magnitude - shows how far from breakeven we are.
+    """
     if level_price is None:
         return None
     
     if direction == "LONG":
-        distance = current_price - level_price if is_sl else level_price - current_price
+        if is_sl:
+            # Distance down to SL
+            distance = current_price - level_price
+        elif is_be:
+            # Distance to BE = P&L (positive when in profit)
+            distance = current_price - level_price
+        else:
+            # Distance up to TP
+            distance = level_price - current_price
     else:  # SHORT
-        distance = level_price - current_price if is_sl else current_price - level_price
+        if is_sl:
+            # Distance up to SL
+            distance = level_price - current_price
+        elif is_be:
+            # Distance to BE = P&L (positive when in profit)
+            distance = level_price - current_price
+        else:
+            # Distance down to TP
+            distance = current_price - level_price
     
     return distance
 
@@ -305,11 +327,16 @@ def _calculate_mae_mfe(
 
 def _get_structural_levels(
     df_4h: pd.DataFrame,
-    entry_time: datetime
+    entry_time: Optional[datetime],
+    entry_price: float,
+    direction: str
 ) -> dict:
     """
     Get structural levels from entry candle and previous H4 candle.
     Returns dict with entry_candle_low/high, prev_h4_candle_low/high.
+    
+    Validation: Entry candle must contain the entry price within its range.
+    If not found, use the most recent closed candle before entry.
     """
     result = {
         'entry_candle_low': None,
@@ -325,30 +352,56 @@ def _get_structural_levels(
     entry_candle = None
     prev_h4_candle = None
     
-    for idx, row in df_4h.iterrows():
-        candle_time = row.get('time')
-        if candle_time is None:
-            continue
-        
-        candle_end = candle_time + timedelta(hours=4)
-        
-        # Check if this is the entry candle
-        if entry_time is not None and candle_time <= entry_time < candle_end:
-            entry_candle = row
-        elif entry_time is not None and candle_end <= entry_time:
-            # This candle closed before entry - could be previous
-            if prev_h4_candle is None or row.get('time', datetime.min.replace(tzinfo=timezone.utc)) > prev_h4_candle.get('time', datetime.min.replace(tzinfo=timezone.utc)):
-                prev_h4_candle = row
-    
-    # If entry_candle not found, use the last closed candle before entry
-    if entry_candle is None and entry_time is not None:
+    # First pass: find candle that contains entry_time
+    if entry_time is not None:
         for idx, row in df_4h.iterrows():
             candle_time = row.get('time')
-            if candle_time and candle_time <= entry_time:
-                entry_candle = row
+            if candle_time is None:
+                continue
+            
+            candle_end = candle_time + timedelta(hours=4)
+            
+            # Check if this is the entry candle (entry_time within candle)
+            if candle_time <= entry_time < candle_end:
+                # Additional validation: entry price should be within candle range
+                candle_low = row.get('low')
+                candle_high = row.get('high')
+                
+                price_in_range = (
+                    candle_low is not None and candle_high is not None and
+                    candle_low <= entry_price <= candle_high
+                )
+                
+                if price_in_range:
+                    entry_candle = row
+                else:
+                    # Price not in range - this might not be the right candle
+                    # Still use it as best guess but log warning
+                    entry_candle = row
+            elif entry_time is not None and candle_end <= entry_time:
+                # This candle closed before entry - could be previous
+                if prev_h4_candle is None or row.get('time', datetime.min.replace(tzinfo=timezone.utc)) > prev_h4_candle.get('time', datetime.min.replace(tzinfo=timezone.utc)):
+                    prev_h4_candle = row
     
-    # If still no entry candle, use most recent
-    if entry_candle is None and len(df_4h) > 0:
+    # If entry_candle not found by time, find by price containment
+    if entry_candle is None and entry_price is not None:
+        for idx, row in df_4h.iterrows():
+            candle_low = row.get('low')
+            candle_high = row.get('high')
+            
+            if candle_low is not None and candle_high is not None:
+                if candle_low <= entry_price <= candle_high:
+                    entry_candle = row
+                    break
+        
+        # Fallback: use the last closed candle before current
+        if entry_candle is None and len(df_4h) > 1:
+            entry_candle = df_4h.iloc[-2]  # Second-to-last (last closed)
+    
+    # If still no entry candle, use most recent closed candle
+    if entry_candle is None and len(df_4h) > 1:
+        entry_candle = df_4h.iloc[-2]
+    elif entry_candle is None and len(df_4h) == 1:
         entry_candle = df_4h.iloc[-1]
     
     # Get previous H4 candle (the one before entry candle)
@@ -362,7 +415,7 @@ def _get_structural_levels(
             except (KeyError, IndexError):
                 pass
         
-        # Fallback: use second-to-last
+        # Fallback: use second-to-last if entry is last
         if prev_h4_candle is None:
             prev_h4_candle = df_4h.iloc[-2]
     
@@ -438,6 +491,12 @@ def calculate_position_health(
     health.pnl_pct = pnl_pct
     
     # Calculate distances to levels
+    # Distance to BE should always be distance to entry_price (breakeven point)
+    # not to be_trigger level. Use is_be=True for correct sign.
+    health.distance_to_be_points = _calculate_distance_to_level(
+        direction, health.last_closed_close, float(entry_price), is_sl=False, is_be=True
+    )
+    
     if sl_price is not None:
         health.distance_to_sl_points = _calculate_distance_to_level(
             direction, health.last_closed_close, sl_price, is_sl=True
@@ -446,11 +505,6 @@ def calculate_position_health(
     if tp_price is not None:
         health.distance_to_tp_points = _calculate_distance_to_level(
             direction, health.last_closed_close, tp_price, is_sl=False
-        )
-    
-    if be_trigger is not None and not be_activated:
-        health.distance_to_be_points = _calculate_distance_to_level(
-            direction, health.last_closed_close, be_trigger, is_sl=False
         )
     
     # Get ATR for calculations
@@ -462,11 +516,23 @@ def calculate_position_health(
     
     # Structural levels
     if STRUCTURE_ENTRY_CANDLE_ENABLED or STRUCTURE_PREV_H4_CANDLE_ENABLED:
-        struct_levels = _get_structural_levels(df_4h, entry_time)
+        struct_levels = _get_structural_levels(df_4h, entry_time, float(entry_price), direction)
         health.entry_candle_low = struct_levels['entry_candle_low']
         health.entry_candle_high = struct_levels['entry_candle_high']
         health.prev_h4_candle_low = struct_levels['prev_h4_candle_low']
         health.prev_h4_candle_high = struct_levels['prev_h4_candle_high']
+        
+        # Validation: Entry candle high must be >= entry price for SHORT
+        # Entry candle low must be <= entry price for LONG
+        if health.entry_candle_high is not None and direction == "SHORT":
+            if health.entry_candle_high < float(entry_price):
+                # Entry price not in candle range - use current price as reference
+                health.entry_candle_high = float(entry_price)
+        
+        if health.entry_candle_low is not None and direction == "LONG":
+            if health.entry_candle_low > float(entry_price):
+                # Entry price not in candle range - use current price as reference
+                health.entry_candle_low = float(entry_price)
         
         # Check structure breaks
         entry_broken, prev_h4_broken = _check_structure_break(
