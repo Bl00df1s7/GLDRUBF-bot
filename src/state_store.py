@@ -62,6 +62,11 @@ def load_state() -> dict:
             "last_action": None,
             "warnings": [],
             "last_run_timestamp": None,
+            # Position monitor state
+            "monitor_last_alert_level": None,
+            "monitor_last_alert_reasons": [],
+            "monitor_last_alert_candle_time": None,
+            "monitor_last_state_hash": None,
         }
     
     try:
@@ -83,6 +88,11 @@ def load_state() -> dict:
                 "last_action": None,
                 "warnings": [],
                 "last_run_timestamp": None,
+                # Position monitor state
+                "monitor_last_alert_level": None,
+                "monitor_last_alert_reasons": [],
+                "monitor_last_alert_candle_time": None,
+                "monitor_last_state_hash": None,
             }
             for key, default_value in defaults.items():
                 if key not in state:
@@ -105,6 +115,11 @@ def load_state() -> dict:
             "last_action": None,
             "warnings": ["State file corrupted, reset"],
             "last_run_timestamp": None,
+            # Position monitor state
+            "monitor_last_alert_level": None,
+            "monitor_last_alert_reasons": [],
+            "monitor_last_alert_candle_time": None,
+            "monitor_last_state_hash": None,
         }
 
 
@@ -177,6 +192,12 @@ def update_state_for_new_position(
     state["last_exit_signal"] = None
     state["warnings"] = state.get("warnings", []) + ["New position detected, state reset"]
     
+    # Reset monitor state for new position
+    state["monitor_last_alert_level"] = None
+    state["monitor_last_alert_reasons"] = []
+    state["monitor_last_alert_candle_time"] = None
+    state["monitor_last_state_hash"] = None
+    
     return state
 
 
@@ -195,6 +216,12 @@ def update_state_for_closed_position(state: dict) -> dict:
     state["be_activated"] = False
     state["last_exit_signal"] = None
     state["warnings"] = state.get("warnings", []) + ["Position closed, state reset"]
+    
+    # Reset monitor state when position closes
+    state["monitor_last_alert_level"] = None
+    state["monitor_last_alert_reasons"] = []
+    state["monitor_last_alert_candle_time"] = None
+    state["monitor_last_state_hash"] = None
     
     return state
 
@@ -237,3 +264,40 @@ def get_stored_levels(state: dict) -> dict:
         "be_trigger": state.get("be_trigger"),
         "be_activated": state.get("be_activated", False),
     }
+
+
+def get_monitor_state(state: dict) -> dict:
+    """
+    Get position monitor state from state store.
+    Returns dictionary with monitor alert state.
+    """
+    return {
+        "last_alert_level": state.get("monitor_last_alert_level"),
+        "last_alert_reasons": state.get("monitor_last_alert_reasons", []),
+        "last_alert_candle_time": state.get("monitor_last_alert_candle_time"),
+        "last_state_hash": state.get("monitor_last_state_hash"),
+    }
+
+
+def update_monitor_state(
+    state: dict,
+    alert_level: str,
+    alert_reasons: list,
+    candle_time: datetime
+) -> dict:
+    """
+    Update position monitor state after sending alert.
+    Returns updated state.
+    """
+    import hashlib
+    
+    # Compute hash of current state for deduplication
+    state_data = f"{alert_level}:{','.join(sorted(alert_reasons))}"
+    state_hash = hashlib.sha256(state_data.encode()).hexdigest()[:16]
+    
+    state["monitor_last_alert_level"] = alert_level
+    state["monitor_last_alert_reasons"] = alert_reasons
+    state["monitor_last_alert_candle_time"] = candle_time.isoformat() if candle_time else None
+    state["monitor_last_state_hash"] = state_hash
+    
+    return state

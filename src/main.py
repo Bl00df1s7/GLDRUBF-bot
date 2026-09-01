@@ -35,7 +35,25 @@ from src.state_store import (
     activate_break_even,
     update_candle_processed,
     get_stored_levels,
+    get_monitor_state,
+    update_monitor_state,
 )
+
+try:
+    from config.settings import (
+        POSITION_MONITOR_ENABLED,
+        MONITOR_TIMEFRAME,
+        MONITOR_ONLY_WHEN_POSITION,
+        UPDATE_ON_STATE_CHANGE_ONLY,
+        SEND_RECOVERY_MESSAGE,
+    )
+except ImportError:
+    # Fallback if settings not updated
+    POSITION_MONITOR_ENABLED = False
+    MONITOR_TIMEFRAME = "1H"
+    MONITOR_ONLY_WHEN_POSITION = True
+    UPDATE_ON_STATE_CHANGE_ONLY = True
+    SEND_RECOVERY_MESSAGE = False
 
 
 # Signal only mode - no trading
@@ -375,10 +393,72 @@ def main():
     
     # Update state
     state = update_candle_processed(state, candle_data, action, exit_signal)
+    
+    # Position monitor integration
+    if POSITION_MONITOR_ENABLED and position_state["direction"] in ("LONG", "SHORT"):
+        try:
+            from src.position_monitor import (
+                calculate_position_health,
+                format_position_monitor_message,
+                should_send_alert,
+            )
+            
+            # Get monitor timeframe data (1H by default)
+            df_monitor = load_candles(token, instrument.uid, candles_count=100, timeframe=MONITOR_TIMEFRAME)
+            
+            if not df_monitor.empty:
+                # Calculate indicators for monitor timeframe
+                df_monitor = prepare_indicators(df_monitor)
+                
+                # Get entry time (use signal candle time as fallback)
+                entry_time = last_closed.get("time")  # Fallback to 4H signal candle
+                
+                # Calculate position health
+                health = calculate_position_health(
+                    position_state=position_state,
+                    df_monitor=df_monitor,
+                    df_4h=df,
+                    stored_levels=stored_levels,
+                    entry_time=entry_time,
+                )
+                
+                # Get previous monitor state
+                monitor_state = get_monitor_state(state)
+                
+                # Check if alert should be sent
+                if should_send_alert(
+                    health=health,
+                    last_alert_level=monitor_state["last_alert_level"],
+                    last_alert_reasons=monitor_state["last_alert_reasons"],
+                    send_recovery=SEND_RECOVERY_MESSAGE,
+                ):
+                    # Format and send monitor alert
+                    monitor_message = format_position_monitor_message(health)
+                    
+                    # Prepend header with instrument name
+                    full_message = f"🟠 GLDRUBF · Мониторинг позиции\n{monitor_message}"
+                    
+                    send_telegram_message(bot_token, chat_id, full_message)
+                    print("✅ Position monitor alert sent")
+                    
+                    # Update monitor state
+                    state = update_monitor_state(
+                        state,
+                        health.alert_level,
+                        health.alert_reasons,
+                        health.last_closed_candle_time,
+                    )
+                else:
+                    print("🔇 Position monitor: no state change, skipping alert")
+            else:
+                print("⚠️ No monitor timeframe data available")
+        except Exception as e:
+            print(f"⚠️ Position monitor error: {e}")
+    
     save_state(state)
     print("\n💾 State saved")
     
-    # Format and send Telegram message
+    # Format and send Telegram message (main strategy status)
     print("\n📱 Sending status to Telegram...")
     
     # Use debug mode from settings
