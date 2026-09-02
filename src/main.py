@@ -232,7 +232,11 @@ def _run():
 
     position_changed = check_position_changed(state, current_position_key)
 
-    if not position_changed and check_candle_already_processed(state, candle_data):
+    if (
+        position_info is None
+        and not position_changed
+        and check_candle_already_processed(state, candle_data)
+    ):
         print("\n✅ Same candle already processed, no state change - skipping duplicate message")
         return
 
@@ -274,10 +278,9 @@ def _run():
 
         direction = position_info["direction"]
         stored_levels = get_stored_levels(state)
+        atr = float(last_closed["atr"]) if not pd.isna(last_closed["atr"]) else 0
 
         if stored_levels["initial_sl"] is None or position_changed:
-            atr = float(last_closed["atr"]) if not pd.isna(last_closed["atr"]) else 0
-
             if direction == "LONG":
                 initial_sl = entry_price - atr * 3.0 if not np.isnan(entry_price) and atr > 0 else np.nan
                 tp = entry_price * 1.07 if not np.isnan(entry_price) else np.nan
