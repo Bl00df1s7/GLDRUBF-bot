@@ -61,6 +61,16 @@ class TestDonchianLookahead(unittest.TestCase):
 
 class TestClosedCandle(unittest.TestCase):
     """Test that signals are only calculated for closed candles."""
+
+    def test_candle_period_is_formatted_in_moscow_time(self):
+        from src.main import format_candle_period
+
+        candle = {
+            "time": datetime(2026, 9, 2, 12, tzinfo=timezone.utc),
+            "candle_close_time": datetime(2026, 9, 2, 16, tzinfo=timezone.utc),
+        }
+
+        self.assertEqual(format_candle_period(candle), "2026-09-02 15:00 - 19:00 МСК")
     
     def test_unclosed_candle_skipped(self):
         """If last candle is not closed, signals should not be calculated."""

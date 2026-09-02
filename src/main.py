@@ -61,6 +61,7 @@ except ImportError:
 
 SIGNAL_ONLY = not AUTO_TRADING_ENABLED
 MIN_DATA_LENGTH = DONCHIAN_LEN + ATR_LEN + 20
+MSK = timezone(timedelta(hours=3))
 
 
 def is_candle_closed(candle_time: datetime, candle_duration: timedelta = timedelta(hours=4)) -> bool:
@@ -88,6 +89,23 @@ def get_last_closed_candle(df):
             return None, f"DATA_INVALID: {col} is NaN"
 
     return last_closed, None
+
+
+def format_candle_period(candle: dict) -> str:
+    candle_start = candle["time"]
+    candle_end = candle.get("candle_close_time", candle_start + timedelta(hours=4))
+
+    if getattr(candle_start, "tzinfo", None) is None:
+        candle_start = candle_start.replace(tzinfo=timezone.utc)
+    if getattr(candle_end, "tzinfo", None) is None:
+        candle_end = candle_end.replace(tzinfo=timezone.utc)
+
+    candle_start_msk = candle_start.astimezone(MSK)
+    candle_end_msk = candle_end.astimezone(MSK)
+    return (
+        f"{candle_start_msk.strftime('%Y-%m-%d %H:%M')} - "
+        f"{candle_end_msk.strftime('%H:%M')} МСК"
+    )
 
 
 def check_data_sufficiency(df) -> tuple:
@@ -219,7 +237,7 @@ def _run():
         )
         return
 
-    print(f"\n🕐 Last closed candle: {last_closed['time'].strftime('%Y-%m-%d %H:%M:%S')} UTC")
+    print(f"\n🕐 Last closed candle: {format_candle_period(last_closed)}")
     print(f"   Close: {last_closed['close']:.2f}")
 
     # Build candle data for state

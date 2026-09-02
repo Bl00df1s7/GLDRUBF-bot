@@ -86,12 +86,21 @@ def format_status_message(
     
     # Convert candle time to Moscow time for display
     candle_time = last_closed.get("time")
+    candle_end_time = last_closed.get("candle_close_time")
     if candle_time:
         # Handle pandas Timestamp (may be tz-naive)
         if hasattr(candle_time, 'tz') and candle_time.tz is None:
             candle_time = candle_time.tz_localize('UTC')
         candle_time_msk = candle_time.astimezone(msk_tz)
-        candle_time_str = candle_time_msk.strftime("%d.%m.%Y %H:%M") + " МСК"
+        if candle_end_time is None:
+            candle_end_time = candle_time + timedelta(hours=4)
+        if hasattr(candle_end_time, 'tz') and candle_end_time.tz is None:
+            candle_end_time = candle_end_time.tz_localize('UTC')
+        candle_end_time_msk = candle_end_time.astimezone(msk_tz)
+        candle_time_str = (
+            f"{candle_time_msk.strftime('%d.%m.%Y %H:%M')} - "
+            f"{candle_end_time_msk.strftime('%H:%M')} МСК"
+        )
     else:
         candle_time_str = "н/д"
     
