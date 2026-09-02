@@ -58,6 +58,16 @@ def load_state() -> dict:
             "tp": None,
             "be_trigger": None,
             "be_activated": False,
+            "stop_order_ids": {},
+            "stop_order_id": None,
+            "entry_time": None,
+            "entry_price": None,
+            "entry_lots": 0,
+            "daily_session_date": None,
+            "daily_start_balance": None,
+            "daily_realized_pnl": 0.0,
+            "daily_loss_pct": 0.0,
+            "TRADING_HALTED": False,
             "last_exit_signal": None,
             "last_action": None,
             "warnings": [],
@@ -84,6 +94,16 @@ def load_state() -> dict:
                 "tp": None,
                 "be_trigger": None,
                 "be_activated": False,
+                "stop_order_ids": {},
+                "stop_order_id": None,
+                "entry_time": None,
+                "entry_price": None,
+                "entry_lots": 0,
+                "daily_session_date": None,
+                "daily_start_balance": None,
+                "daily_realized_pnl": 0.0,
+                "daily_loss_pct": 0.0,
+                "TRADING_HALTED": False,
                 "last_exit_signal": None,
                 "last_action": None,
                 "warnings": [],
@@ -111,6 +131,16 @@ def load_state() -> dict:
             "tp": None,
             "be_trigger": None,
             "be_activated": False,
+            "stop_order_ids": {},
+            "stop_order_id": None,
+            "entry_time": None,
+            "entry_price": None,
+            "entry_lots": 0,
+            "daily_session_date": None,
+            "daily_start_balance": None,
+            "daily_realized_pnl": 0.0,
+            "daily_loss_pct": 0.0,
+            "TRADING_HALTED": False,
             "last_exit_signal": None,
             "last_action": None,
             "warnings": ["State file corrupted, reset"],
@@ -189,6 +219,11 @@ def update_state_for_new_position(
     state["tp"] = tp
     state["be_trigger"] = be_trigger
     state["be_activated"] = False
+    state["stop_order_ids"] = {}
+    state["stop_order_id"] = None
+    state["entry_time"] = None
+    state["entry_price"] = None
+    state["entry_lots"] = 0
     state["last_exit_signal"] = None
     state["warnings"] = state.get("warnings", []) + ["New position detected, state reset"]
     
@@ -214,6 +249,11 @@ def update_state_for_closed_position(state: dict) -> dict:
     state["tp"] = None
     state["be_trigger"] = None
     state["be_activated"] = False
+    state["stop_order_ids"] = {}
+    state["stop_order_id"] = None
+    state["entry_time"] = None
+    state["entry_price"] = None
+    state["entry_lots"] = 0
     state["last_exit_signal"] = None
     state["warnings"] = state.get("warnings", []) + ["Position closed, state reset"]
     
@@ -263,6 +303,8 @@ def get_stored_levels(state: dict) -> dict:
         "tp": state.get("tp"),
         "be_trigger": state.get("be_trigger"),
         "be_activated": state.get("be_activated", False),
+        "stop_order_ids": state.get("stop_order_ids", {}),
+        "stop_order_id": state.get("stop_order_id"),
     }
 
 

@@ -1,15 +1,41 @@
-"""
-Instrument discovery and management.
-SIGNAL ONLY MODE - Uses t_tech.invest if available.
-"""
+"""Instrument discovery and price/quantity quantization."""
+
+from decimal import Decimal, ROUND_HALF_UP
 
 try:
-    from t_tech.invest import Client, CandleInterval
+    from t_tech.invest import CandleInterval
     T_TECH_AVAILABLE = True
 except ImportError:
     T_TECH_AVAILABLE = False
-    Client = None
     CandleInterval = None
+
+from src.client_factory import get_client
+
+
+def _quotation_to_decimal(value) -> Decimal:
+    """Convert a numeric value or SDK Quotation to Decimal."""
+    if hasattr(value, "units") and hasattr(value, "nano"):
+        return Decimal(value.units) + (Decimal(value.nano) / Decimal(1_000_000_000))
+    return Decimal(str(value))
+
+
+def quantize_price(price: float, min_price_increment) -> float:
+    """Round a price to the nearest instrument price increment."""
+    increment = _quotation_to_decimal(min_price_increment)
+    if increment <= 0:
+        raise ValueError("min_price_increment must be positive")
+    value = _quotation_to_decimal(price)
+    steps = (value / increment).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+    return float(steps * increment)
+
+
+def quantize_lots(quantity: int, lot_size: int) -> int:
+    """Round base-unit quantity down to a whole number of instrument lots."""
+    if lot_size <= 0:
+        raise ValueError("lot_size must be positive")
+    if quantity <= 0:
+        return 0
+    return (int(quantity) // int(lot_size)) * int(lot_size)
 
 
 def get_gldrubf_instrument(token: str) -> dict:
@@ -30,7 +56,7 @@ def get_gldrubf_instrument(token: str) -> dict:
     if not T_TECH_AVAILABLE:
         raise RuntimeError("t_tech.invest module not available. Install with: pip install t-tech")
     
-    with Client(token) as client:
+    with get_client(token) as client:
         response = client.instruments.futures()
         futures = response.instruments
     

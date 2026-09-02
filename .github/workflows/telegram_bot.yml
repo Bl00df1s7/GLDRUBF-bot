@@ -1,14 +1,7 @@
 name: Telegram Bot
 
 on:
-  schedule:
-    # Запуск каждые 4 часа начиная с 03:01 МСК (00:01 UTC)
-    - cron: '1 3,7,11,15,19,23 * * *'
   workflow_dispatch:
-  workflow_run:
-    workflows: ["Run Gold Strategy"]
-    types:
-      - completed
 
 jobs:
   bot:

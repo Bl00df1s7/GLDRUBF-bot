@@ -13,7 +13,7 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.indicators import calculate_atr, prepare_indicators, calculate_sar
-from src.strategy import check_entry_signal, check_exit_conditions
+from src.strategy import check_entry_signal, check_exit_conditions, should_close_by_monitor
 from src.state_store import (
     load_state,
     save_state,
@@ -130,6 +130,26 @@ class TestEntrySignals(unittest.TestCase):
         
         result = check_entry_signal(last_closed)
         self.assertIsNone(result)
+
+    def test_monitor_structure_break_closes(self):
+        health = type("Health", (), {
+            "alert_level": "STRUCTURE_BREAK",
+            "distance_to_sl_points": 100,
+            "pressure_atr_mult": 0.5,
+            "adverse_speed_atr_mult": 1.6,
+            "entry_price": 10000,
+        })()
+        self.assertEqual(should_close_by_monitor(health), (True, "MONITOR_STRUCTURE"))
+
+    def test_monitor_normal_holds(self):
+        health = type("Health", (), {
+            "alert_level": "NORMAL",
+            "distance_to_sl_points": 100,
+            "pressure_atr_mult": 3.0,
+            "adverse_speed_atr_mult": 3.0,
+            "entry_price": 10000,
+        })()
+        self.assertEqual(should_close_by_monitor(health), (False, ""))
 
 
 class TestATR(unittest.TestCase):

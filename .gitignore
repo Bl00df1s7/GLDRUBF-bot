@@ -16,6 +16,10 @@ venv/
 .env
 .env.local
 .env.*
+token.env
+state.json
+trades.csv
+logs/
 
 # Logs and temp files
 *.log

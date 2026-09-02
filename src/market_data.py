@@ -5,15 +5,17 @@ SIGNAL ONLY MODE - Uses t_tech.invest if available, otherwise mock data for test
 
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 try:
-    from t_tech.invest import Client, CandleInterval
+    from t_tech.invest import CandleInterval
     T_TECH_AVAILABLE = True
 except ImportError:
     T_TECH_AVAILABLE = False
-    Client = None
     CandleInterval = None
+
+from src.client_factory import get_client
 
 
 def quotation_to_float(value) -> float:
@@ -120,7 +122,7 @@ def load_candles(
     while current < now_utc:
         chunk_end = min(current + chunk, now_utc)
         
-        with Client(token) as services:
+        with get_client(token) as services:
             response = services.market_data.get_candles(
                 instrument_id=uid,
                 from_=current,
@@ -159,7 +161,7 @@ def get_current_price(token: str, uid: str) -> float:
     if not T_TECH_AVAILABLE:
         raise RuntimeError("t_tech.invest module not available")
     
-    with Client(token) as services:
+    with get_client(token) as services:
         response = services.market_data.get_last_prices(
             instrument_id=[uid]
         )
@@ -168,3 +170,9 @@ def get_current_price(token: str, uid: str) -> float:
         raise RuntimeError("Не удалось получить текущую цену GLDRUBF")
     
     return quotation_to_float(response.last_prices[0].price)
+
+
+def is_trading_time(now: datetime = None) -> bool:
+    """Return whether the current Moscow time is after the 03:00 session start."""
+    current = (now or datetime.now(timezone.utc)).astimezone(ZoneInfo("Europe/Moscow"))
+    return current.time() >= time(3, 0)

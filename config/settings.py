@@ -24,7 +24,13 @@ SAR_MAX = 0.20
 # Target instrument
 TARGET_TICKER = "GLDRUBF"
 
+# Trading mode
+AUTO_TRADING_ENABLED = True  # Enable automatic trading (False = signal only)
+RESERVE_RATIO = 0.10         # Keep 10% of deposit as reserve
+MAX_DAILY_LOSS_PCT = 0.03    # Halt new entries after 3% realized loss
+
 # Telegram settings
+TELEGRAM_ENABLED = False     # Enable Telegram notifications
 TELEGRAM_DEBUG_MODE = False  # Show technical debug info in messages
 
 # ============================================================

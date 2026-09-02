@@ -1,15 +1,22 @@
-name: Run Gold Strategy
+name: GLDRUBF Auto Trading
 
 on:
   schedule:
-    # Запуск каждые 4 часа начиная с 03:01 МСК (00:01 UTC)
-    - cron: '1 3,7,11,15,19,23 * * *'
+    # GitHub Actions uses UTC: 03:01, 07:01, ... MSK = 00:01, 04:01, ... UTC.
+    - cron: '1 0,4,8,12,16,20 * * *'
   workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gldrubf-auto-trading
+  cancel-in-progress: false
 
 jobs:
   run-strategy:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -21,13 +28,32 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install t-tech-investments --index-url https://opensource.tbank.ru/api/v4/projects/238/packages/pypi/simple
-          pip install pandas numpy requests
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Restore runtime state
+        uses: actions/cache/restore@v4
+        with:
+          path: runtime
+          key: gldrubf-runtime-${{ github.run_id }}
+          restore-keys: |
+            gldrubf-runtime-
 
       - name: Run strategy
         env:
           T_SANDAPI: ${{ secrets.T_SANDAPI }}
-          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          AUTO_TRADING_ENABLED: "true"
+          TELEGRAM_ENABLED: "false"
+          STATE_FILE: ${{ github.workspace }}/runtime/state.json
+          TRADES_FILE: ${{ github.workspace }}/runtime/trades.csv
+          LOG_DIR: ${{ github.workspace }}/runtime/logs
         run: |
+          mkdir -p runtime/logs
           python -m src.main
+
+      - name: Save runtime state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: runtime
+          key: gldrubf-runtime-${{ github.run_id }}

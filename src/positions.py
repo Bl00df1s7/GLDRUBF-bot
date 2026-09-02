@@ -12,6 +12,8 @@ except ImportError:
     T_TECH_AVAILABLE = False
     Client = None
 
+from src.client_factory import get_client
+
 from config.settings import TARGET_TICKER, SL_ATR, TP_PCT, BE_PCT
 
 
@@ -48,7 +50,7 @@ def find_gldrubf_position(token: str, instrument) -> dict:
     print(f"Base ticker for matching: {target_ticker_base}\n")
     
     # Keep context open for all operations
-    with Client(token) as client:
+    with get_client(token) as client:
         accounts_response = client.users.get_accounts()
         accounts = accounts_response.accounts
         
@@ -185,7 +187,7 @@ def get_position_state(
     
     entry_price = np.nan
     
-    with Client(token) as client:
+    with get_client(token) as client:
         portfolio = client.operations.get_portfolio(account_id=account_id)
         
         for portfolio_pos in portfolio.positions:

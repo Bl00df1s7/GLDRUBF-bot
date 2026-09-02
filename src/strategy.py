@@ -32,7 +32,7 @@ def check_entry_signal(last_closed: dict) -> str:
     if long_signal and short_signal:
         print("⚠️ Donchian anomaly: both long and short signals")
         return None
-    
+
     if long_signal:
         return "LONG"
     elif short_signal:
@@ -41,6 +41,28 @@ def check_entry_signal(last_closed: dict) -> str:
         return None
 
 
+def should_close_by_monitor(health) -> tuple:
+    """Return whether monitor recommendations require an emergency close."""
+    alert_level = getattr(health, "alert_level", "NORMAL")
+    distance_to_sl = getattr(health, "distance_to_sl_points", None)
+    pressure_atr = getattr(health, "pressure_atr_mult", None)
+    adverse_speed_atr = getattr(health, "adverse_speed_atr_mult", None)
+
+    # PositionHealth currently exposes ATR-normalized pressure and speed,
+    # while SL distance is compared against the monitor's 0.1% fallback ATR.
+    entry_price = getattr(health, "entry_price", None)
+    sl_threshold = abs(entry_price) * 0.0005 if entry_price else None
+
+    if alert_level == "CRITICAL" and sl_threshold is not None and distance_to_sl is not None:
+        if distance_to_sl < sl_threshold:
+            return True, "MONITOR_CRITICAL"
+    if alert_level == "STRUCTURE_BREAK" and adverse_speed_atr is not None:
+        if adverse_speed_atr > 1.5:
+            return True, "MONITOR_STRUCTURE"
+    if alert_level == "FAST_ADVERSE" and pressure_atr is not None:
+        if pressure_atr > 2.0:
+            return True, "MONITOR_FAST_ADVERSE"
+    return False, ""
 def check_exit_conditions(
     position_state: dict,
     last_closed: dict,
