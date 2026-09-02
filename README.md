@@ -118,6 +118,8 @@ GitHub Actions runner временный, поэтому workflow сохраня
 1 */4 * * * cd /путь/к/GLDRUBF-Sentry && /путь/к/GLDRUBF-Sentry/venv/bin/python -m src.main >> bot.log 2>&1
 ```
 
+Каждый запуск пишет JSON-лог в `logs/bot_YYYYMMDD.log` (или в каталог из `LOG_DIR`). Событие `run_summary` содержит сигнал входа, сигнал выхода, итоговое действие и текущую позицию; `run_completed` дополнительно содержит результат ордера. Для пропущенных запусков записывается причина в `run_skipped` или `run_finished_without_signal`.
+
 ## Логика стратегии
 
 `src/indicators.py` рассчитывает:

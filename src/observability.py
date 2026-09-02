@@ -17,6 +17,18 @@ class JsonFormatter(logging.Formatter):
             "message": record.getMessage(),
             "correlation_id": getattr(record, "correlation_id", None),
         }
+        for field in (
+            "mode",
+            "entry_signal",
+            "exit_signal",
+            "action",
+            "position",
+            "trade_result",
+            "reason",
+        ):
+            value = getattr(record, field, None)
+            if value is not None:
+                payload[field] = value
         return json.dumps(payload, ensure_ascii=True)
 
 

@@ -164,6 +164,10 @@ def _run():
     if df_raw.empty:
         error_msg = "Failed to load GLDRUBF candles"
         print(f"❌ {error_msg}")
+        logger.info(
+            "run_finished_without_signal",
+            extra={"correlation_id": correlation_id, "reason": "empty_market_data"},
+        )
         _send_telegram_safe(
             bot_token, chat_id,
             f"❌ ERROR: {error_msg}\nРежим: {mode_str}."
@@ -191,6 +195,10 @@ def _run():
 
     if candle_error == "WAIT_FOR_CLOSED_CANDLE":
         print("\n⏳ Candle not yet closed, skipping signal calculation")
+        logger.info(
+            "run_finished_without_signal",
+            extra={"correlation_id": correlation_id, "reason": "waiting_for_closed_4h_candle"},
+        )
         _send_telegram_safe(
             bot_token, chat_id,
             f"⏳ Свеча еще не закрыта, расчет пропущен.\nРежим: {mode_str}."
@@ -201,6 +209,10 @@ def _run():
         print(f"\n⚠️ {candle_error}")
 
     if last_closed is None:
+        logger.info(
+            "run_finished_without_signal",
+            extra={"correlation_id": correlation_id, "reason": candle_error},
+        )
         _send_telegram_safe(
             bot_token, chat_id,
             f"⚠️ Ошибка данных свечи: {candle_error}\nРежим: {mode_str}."
@@ -238,6 +250,15 @@ def _run():
         and check_candle_already_processed(state, candle_data)
     ):
         print("\n✅ Same candle already processed, no state change - skipping duplicate message")
+        logger.info(
+            "run_skipped",
+            extra={
+                "correlation_id": correlation_id,
+                "mode": "AUTO TRADING" if AUTO_TRADING_ENABLED else "SIGNAL ONLY",
+                "position": "NONE",
+                "reason": "same_4h_candle_already_processed",
+            },
+        )
         return
 
     print(f"\n🔍 Searching for GLDRUBF position...")
@@ -465,6 +486,18 @@ def _run():
     # Re-record the final action when monitoring overrides the strategy action.
     state = update_candle_processed(state, candle_data, action, exit_signal)
 
+    logger.info(
+        "run_summary",
+        extra={
+            "correlation_id": correlation_id,
+            "mode": mode_str,
+            "entry_signal": entry_signal,
+            "exit_signal": exit_signal,
+            "action": action,
+            "position": position_state["direction"],
+        },
+    )
+
     # === AUTO TRADING EXECUTION ===
     trade_result = None
     if AUTO_TRADING_ENABLED and action not in ("WAIT", "HOLD_POSITION", "BE_TRIGGERED"):
@@ -634,7 +667,16 @@ def _run():
     if trade_result:
         print(f"Trade:    {trade_result}")
 
-    logger.info("run_completed", extra={"correlation_id": correlation_id})
+    logger.info(
+        "run_completed",
+        extra={
+            "correlation_id": correlation_id,
+            "mode": mode_str,
+            "action": action,
+            "position": position_state["direction"],
+            "trade_result": trade_result,
+        },
+    )
     print(f"\n✅ Strategy execution completed ({mode_str})")
 
 

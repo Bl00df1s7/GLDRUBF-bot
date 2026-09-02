@@ -53,6 +53,13 @@ jobs:
           mkdir -p runtime/logs
           python -m src.main
 
+      - name: Show run log
+        if: always()
+        run: |
+          for log_file in runtime/logs/bot_*.log; do
+            [ -f "$log_file" ] && cat "$log_file"
+          done
+
       - name: Save runtime state
         if: always()
         uses: actions/cache/save@v4
