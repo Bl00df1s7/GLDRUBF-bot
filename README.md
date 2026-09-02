@@ -108,7 +108,7 @@ TELEGRAM_ENABLED = False
 RESERVE_RATIO = 0.10
 ```
 
-Для production-запуска рекомендуется workflow `.github/workflows/gold_strategy.yml`. Он запускает один прогон каждые 4 часа в `03:01, 07:01, 11:01, 15:01, 19:01, 23:01 МСК` и допускает ручной запуск через `workflow_dispatch`.
+Для production-запуска рекомендуется workflow `.github/workflows/gold_strategy.yml`. Он запускает мониторинг по будням каждый час в `:05` с `03:05` до `23:05 МСК`, а также выполняет финальную проверку в `23:50 МСК`. Ручной запуск доступен через `workflow_dispatch`.
 
 GitHub Actions runner временный, поэтому workflow сохраняет `runtime/state.json`, `runtime/trades.csv` и `runtime/logs/` через Actions Cache. Мониторинг позиции выполняется внутри того же `src.main`; отдельный процесс мониторинга не нужен.
 

@@ -2,8 +2,10 @@ name: GLDRUBF Auto Trading
 
 on:
   schedule:
-    # Run hourly so the 1H position monitor runs between 4H signal candles.
-    - cron: '1 * * * *'
+    # GitHub Actions uses UTC. Runs at 03:05-23:05 MSK on weekdays,
+    # plus a final session check at 23:50 MSK.
+    - cron: '5 0-20 * * 1-5'
+    - cron: '50 20 * * 1-5'
   workflow_dispatch:
 
 permissions:
