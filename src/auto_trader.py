@@ -89,10 +89,24 @@ def get_account_balance(token: str, account_id: str) -> float:
         raise RuntimeError("t_tech.invest module not available")
 
     with get_client(token) as client:
-        portfolio = client.operations.get_portfolio(account_id=account_id)
-
-        # total_amount_portfolio is the total portfolio value
         from src.market_data import quotation_to_float
+
+        positions = client.operations.get_positions(account_id=account_id)
+        money = sum(
+            quotation_to_float(value)
+            for value in positions.money
+            if getattr(value, "currency", "rub").lower() == "rub"
+        )
+        blocked = sum(
+            quotation_to_float(value)
+            for value in positions.blocked
+            if getattr(value, "currency", "rub").lower() == "rub"
+        )
+
+        if money > 0:
+            return max(money - blocked, 0.0)
+
+        portfolio = client.operations.get_portfolio(account_id=account_id)
         total_value = quotation_to_float(portfolio.total_amount_portfolio)
 
         return total_value

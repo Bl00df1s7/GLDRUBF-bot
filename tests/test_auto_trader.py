@@ -2,10 +2,27 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from src.auto_trader import calculate_position_size, open_position, wait_for_order_fill
+from src.auto_trader import (
+    calculate_position_size,
+    get_account_balance,
+    open_position,
+    wait_for_order_fill,
+)
 
 
 class TestOrderExecution(unittest.TestCase):
+    @patch("src.auto_trader.get_client")
+    def test_account_balance_uses_free_rub_cash(self, get_client):
+        client = MagicMock()
+        get_client.return_value.__enter__.return_value = client
+        client.operations.get_positions.return_value = SimpleNamespace(
+            money=[SimpleNamespace(currency="rub", units=10000, nano=0)],
+            blocked=[SimpleNamespace(currency="rub", units=2500, nano=0)],
+        )
+
+        self.assertEqual(get_account_balance("token", "account"), 7500)
+        client.operations.get_portfolio.assert_not_called()
+
     @patch("src.auto_trader._get_margin_per_lot", return_value=1000.0)
     def test_position_size_uses_blocked_margin(self, _margin):
         lots = calculate_position_size(10000, 15000, 1, "uid", "token", "account")
