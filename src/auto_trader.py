@@ -191,7 +191,7 @@ def open_position(
         instrument_uid: Instrument UID
         direction: "LONG" or "SHORT"
         quantity_lots: Number of lots
-        price: Current price (for limit order reference)
+        price: Current price (used for position sizing and protection levels)
 
     Returns:
         Tuple of (success, message)
@@ -221,7 +221,6 @@ def open_position(
                 direction=order_direction,
                 account_id=account_id,
                 order_type=OrderType.ORDER_TYPE_MARKET,
-                order_id=f"gldrubf_{direction.lower()}_{int(__import__('time').time())}",
             )
 
             order_id = response.order_id
@@ -326,7 +325,6 @@ def close_position(
                 direction=close_direction,
                 account_id=account_id,
                 order_type=OrderType.ORDER_TYPE_MARKET,
-                order_id=f"gldrubf_close_{direction.lower()}_{int(__import__('time').time())}",
             )
 
             order_state, lots_executed = wait_for_order_fill(

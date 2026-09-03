@@ -64,6 +64,7 @@ class TestOrderExecution(unittest.TestCase):
         self.assertFalse(success)
         self.assertIn("not filled", message)
         place_protection_orders.assert_not_called()
+        self.assertNotIn("order_id", client.orders.post_order.call_args.kwargs)
 
     @patch("src.stop_orders.place_protection_orders", return_value={"stop_loss": "sl", "take_profit": "tp"})
     @patch("src.auto_trader.get_client")
@@ -94,6 +95,7 @@ class TestOrderExecution(unittest.TestCase):
         self.assertTrue(success)
         self.assertEqual(state["stop_order_id"], "sl")
         self.assertEqual(place_protection_orders.call_args.kwargs["quantity_lots"], 2)
+        self.assertNotIn("order_id", client.orders.post_order.call_args.kwargs)
 
 
 if __name__ == "__main__":
