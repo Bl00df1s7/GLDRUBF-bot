@@ -28,6 +28,26 @@ jobs:
         with:
           python-version: '3.11'
 
+      # Сервер opensource.tbank.ru (PyPI-индекс T-Invest SDK) и
+      # invest-public-api.tbank.ru выдают сертификаты, выпущенные «Russian Trusted
+      # Sub CA» (МИДцифры). Корень этой ЦС отсутствует в стандартном хранилище CA
+      # на ubuntu-latest и в certifi, поэтому pip падает с
+      # CERTIFICATE_VERIFY_FAILED. Решение — добавить сертификат Russian Trusted CA
+      # (из certs/) в доверяемое хранилище. Проверку TLS мы НЕ отключаем
+      # (--trusted-host не используем).
+      - name: Trust Russian Trusted CA for tbank hosts
+        run: |
+          sudo cp certs/russian-trusted-sub-ca.pem \
+                  certs/russian-trusted-root-ca.pem \
+                  /usr/local/share/ca-certificates/
+          sudo update-ca-certificates
+          # pip может использовать certifi вместо системного хранилища —
+          # собираем объединённый CA-бандл и указываем его для pip и requests
+          bundle="$(python tools/pip_ca_bundle.py)"
+          echo "PIP_CERT=${bundle}" >> "$GITHUB_ENV"
+          echo "REQUESTS_CA_BUNDLE=${bundle}" >> "$GITHUB_ENV"
+          echo "SSL_CERT_FILE=${bundle}" >> "$GITHUB_ENV"
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
