@@ -40,7 +40,7 @@ def configure_logging() -> tuple:
     filename = os.path.join(log_dir, f"bot_{datetime.utcnow():%Y%m%d}.log")
     handler = logging.FileHandler(filename)
     handler.setFormatter(JsonFormatter())
-    logger = logging.getLogger("gldrubf")
+    logger = logging.getLogger("golden_bot")
     logger.handlers.clear()
     logger.setLevel(logging.INFO)
     logger.addHandler(handler)

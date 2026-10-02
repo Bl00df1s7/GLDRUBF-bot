@@ -1,5 +1,11 @@
 """
-Auto-trading module for GLDRUBF strategy.
+Execution primitives shared by the C5 adapters.
+
+The legacy GLDRUBF orchestration (execute_signal / open_position with
+SL/TP / calculate_position_size) is NOT part of the C5 production path;
+it is kept only for the archive branch and its unit tests. The C5
+runtime uses wait_for_order_fill / _ensure_market_order_available /
+_status_name through src.execution_adapter.
 Executes trades via T-Invest API based on strategy signals.
 """
 

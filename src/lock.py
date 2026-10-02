@@ -5,7 +5,7 @@ from contextlib import contextmanager
 
 
 @contextmanager
-def process_lock(path: str = "/tmp/gldrubf.lock"):
+def process_lock(path: str = "/tmp/c5_bot.lock"):
     """Acquire an exclusive PID lock and remove it when the run ends."""
     while True:
         try:

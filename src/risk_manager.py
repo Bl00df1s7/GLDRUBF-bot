@@ -1,4 +1,11 @@
-"""Daily loss circuit breaker for the GLDRUBF trading session."""
+"""Legacy daily-loss circuit breaker (GLDRUBF archive).
+
+NOT used by the C5 production runtime. C5 protection lives in
+src/protection.py (10% daily breaker / 20% DD freeze / 30% kill switch).
+The only C5-side usage here is the generic ``session_date`` helper.
+"""
+
+import warnings
 
 from dataclasses import dataclass
 from datetime import datetime, time, timedelta, timezone

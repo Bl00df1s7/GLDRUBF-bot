@@ -32,7 +32,12 @@ SAR_INC = 0.02
 SAR_MAX = 0.20
 
 # Target instrument
-TARGET_TICKER = "GLDRUBF"
+# Stage 2D: the active production instrument is CNYRUBF (C5 strategy).
+# GLDRUBF belongs to legacy/gldrubf-old-strategy and must not appear in
+# the runtime path. TARGET_TICKER kept as an alias so generic infra/tests
+# resolve to the ACTIVE instrument, not a hidden GLDRUBF dependency.
+TARGET_TICKER = "CNYRUBF"
+LEGACY_TARGET_TICKER = "GLDRUBF"  # archive reference only — NOT used by runtime
 
 # Trading mode
 AUTO_TRADING_ENABLED = True  # Enable automatic trading (False = signal only)

@@ -312,7 +312,7 @@ def format_status_message(
         opposite_warning = "\n⚠️ Встречный сигнал LONG не является выходом по текущим правилам."
     
     # Build message
-    header = "GLDRUBF · 4H · ручной режим"
+    header = "C5 · CNYRUBF_SPBFUT · ручной режим"
     
     market_section = (
         "Рынок:\n"

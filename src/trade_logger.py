@@ -37,7 +37,7 @@ def record_trade(
     pnl_gross: float,
     commission: float,
     exit_reason: str,
-    figi: str = "FUTGLDRUBF00",
+    figi: str = "CNYRUBF_SPBFUT",
 ) -> None:
     """Append one completed trade to trades.csv."""
     path = _journal_path()
