@@ -219,6 +219,17 @@ def open_position(
     if not T_TECH_AVAILABLE:
         return False, "t_tech.invest not available"
 
+    # Stage 5A hard gate: NO order may reach OrdersServiceApi.post_order
+    # unless AUTO_TRADING_ENABLED=true; PAPER mode is routed exclusively
+    # through PaperExecutionAdapter and can never arrive here. Fail closed.
+    from src.runtime_config import TradingConfigError, enforce_trading_gate, \
+        load_trading_config
+    try:
+        enforce_trading_gate(load_trading_config())
+    except TradingConfigError as exc:
+        print(f"   ⛔ TRADING_BLOCKED (fail closed): {exc}")
+        return False, f"TRADING_BLOCKED: {exc}"
+
     if quantity_lots <= 0:
         return False, "Quantity must be > 0"
     if stop_loss is None or take_profit is None:
@@ -312,6 +323,17 @@ def close_position(
     """
     if not T_TECH_AVAILABLE:
         return False, "t_tech.invest not available"
+
+    # Stage 5A hard gate (mirrors open_position): AUTO_TRADING_ENABLED!=true
+    # or missing/invalid TRADING_MODE blocks every real order before
+    # OrdersServiceApi.post_order can be reached. Fail closed.
+    from src.runtime_config import TradingConfigError, enforce_trading_gate, \
+        load_trading_config
+    try:
+        enforce_trading_gate(load_trading_config())
+    except TradingConfigError as exc:
+        print(f"   ⛔ TRADING_BLOCKED (fail closed): {exc}")
+        return False, f"TRADING_BLOCKED: {exc}"
 
     if quantity_lots <= 0:
         return False, "Quantity must be > 0"
