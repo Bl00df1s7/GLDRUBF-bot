@@ -9,7 +9,16 @@ import hashlib
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any
 
-STATE_FILE = os.environ.get("STATE_FILE", "/tmp/gldrubf_state.json")
+STATE_FILE = os.environ.get("C5_STATE_FILE",
+                            os.environ.get("STATE_FILE",
+                                           "/tmp/c5_runtime_state.json"))
+
+
+def state_file_path() -> str:
+    """Resolve the state file at call time (honors env overrides)."""
+    return os.environ.get("C5_STATE_FILE",
+                           os.environ.get("STATE_FILE",
+                                          "/tmp/c5_runtime_state.json"))
 
 
 def _mask_account_id(account_id: str) -> str:
@@ -44,10 +53,31 @@ def _build_position_key(position_state: dict) -> Optional[str]:
     return f"{instrument}:{direction}:{entry_key}:{account_masked}"
 
 
+# ── C5 Stage 2D runtime keys (persisted across restarts) ──────────────
+C5_STATE_DEFAULTS = {
+    "last_c5_entry_control_timestamp": None,
+    "last_processed_5m_ts": None,
+    "last_processed_5m_hash": None,
+    "c5_position_direction": None,
+    "c5_position_qty": 0,
+    "c5_entry_price": None,
+    "margin_long_rate": None,
+    "margin_short_rate": None,
+    "reconcile_status": None,
+}
+
+
+def _ensure_c5_keys(state: dict) -> dict:
+    for key, default in C5_STATE_DEFAULTS.items():
+        if key not in state:
+            state[key] = default
+    return state
+
+
 def load_state() -> dict:
     """Load state from file."""
-    if not os.path.exists(STATE_FILE):
-        return {
+    if not os.path.exists(state_file_path()):
+        return _ensure_c5_keys({
             "last_processed_candle_timestamp": None,
             "last_processed_candle_hash": None,
             "position_key": None,
@@ -82,10 +112,10 @@ def load_state() -> dict:
             "monitor_last_alert_reasons": [],
             "monitor_last_alert_candle_time": None,
             "monitor_last_state_hash": None,
-        }
-    
+        })
+
     try:
-        with open(STATE_FILE, "r") as f:
+        with open(state_file_path(), "r") as f:
             state = json.load(f)
             # Ensure all keys exist
             defaults = {
@@ -122,10 +152,10 @@ def load_state() -> dict:
             for key, default_value in defaults.items():
                 if key not in state:
                     state[key] = default_value
-            return state
+            return _ensure_c5_keys(state)
     except (json.JSONDecodeError, IOError) as e:
         print(f"⚠️ State load error: {e}")
-        return {
+        return _ensure_c5_keys({
             "last_processed_candle_timestamp": None,
             "last_processed_candle_hash": None,
             "position_key": None,
