@@ -110,7 +110,9 @@ def test_rc_auto_parsing(raw):
     from src.runtime_config import parse_auto_trading
     result = parse_auto_trading(raw)
     assert isinstance(result, bool)
-    if raw is None or str(raw).strip().lower() in ("1", "true", "yes", "on"):
+    # Spec: None / missing -> False; "" / blank -> False; invalid -> False.
+    # True ONLY for explicitly allowed true-values (case/whitespace tolerant).
+    if raw is not None and str(raw).strip().lower() in ("1", "true", "yes", "on"):
         assert result is True
     else:
         # missing / blank / invalid → false (fail closed for trading)
@@ -337,15 +339,43 @@ def test_i_paper_tmon_is_local_only(no_real_client):
 # J — PAPER full lifecycle flat → BUY → LONG → SELL → flat
 #     through the REAL runtime pipeline (fakes only at boundaries)
 # ══════════════════════════════════════════════════════════════════════
+DAILY_HL = 0.07815   # half-range of each synthetic daily bar
+
+
 def daily_df(n=60):
+    """Deterministic realistic OHLC: H=1400+HL, L=1400-HL, C=1400.
+
+    Wilder TR = max(H-L, |H-prev_close|, |L-prev_close|) = 2*HL per bar
+    → ATR14 == 2*HL == 0.1563 (non-zero; c5_core fail-closes on 0.0) and
+    risk_multiplier = clip(0.1563/0.1563, 0.5, 1.5) == 1.0 — frozen math
+    untouched, only the test market data is chosen deliberately.
+    Same principle as tests/test_stage2d_runtime.py (non-degenerate OHLC).
+    Channel Upper/Lower(10) stays exactly at 1400 so LONG_BREAK/SHORT_BREAK
+    signals are unchanged.
+
+    Frozen sizing with this fixture (verified against c5_core.evaluate):
+      equity          = 1_000_000
+      ATR14           = 0.1563
+      risk_multiplier = 1.0
+      risk_budget     = 1_000_000 * 0.20 * 1.0 = 200_000
+      margin/contract = 1400 * 1000 * 0.0585  = 81_900
+      qty_risk        = floor(200_000 / 81_900) = 2
+      qty_margin      = floor(1_000_000 / 81_900) = 12
+      max_qty         = min(qty_risk, qty_margin, 40) = 2  (qty_raw)
+      M/E             = 163_800 / 1_000_000 = 0.1638 <= 0.30
+      stage cap       = 5
+      final qty       = min(2, 5) = 2
+    ⇒ qty=2 is the CORRECT frozen-C5 result at equity=1M; the stage cap
+    of 5 is NOT reached (it would need risk_budget >= 4*81_900)."""
     import pandas as pd
     rows = []
     d = REF_DATE - dt.timedelta(days=n - 1)
     for _ in range(n):
         ts = pd.Timestamp(d.isoformat(), tz="UTC")
-        rows.append({"time": ts, "open": PRICE, "high": PRICE,
-                     "low": PRICE, "close": PRICE, "volume": 1})
+        rows.append({"time": ts, "open": PRICE, "high": PRICE + DAILY_HL,
+                     "low": PRICE - DAILY_HL, "close": PRICE, "volume": 1})
         d += dt.timedelta(days=1)
+    assert rows[-1]["time"].tz_convert(MSK).date() == REF_DATE
     return pd.DataFrame(rows)
 
 
@@ -422,17 +452,24 @@ def test_j_paper_full_lifecycle_flat_buy_long_sell_flat(state_env,
         # ── 16:05 control point: ENTER_LONG executed on paper ────────
         d1 = rt.run_cycle()
         assert d1.action == "ENTER_LONG"
-        assert d1.qty == 5
-        assert broker.position_qty == 5           # simulated long opened
+        # qty=2 is the frozen-C5 sizing result for equity=1M with this
+        # fixture (risk_budget 200k / margin_per_contract 81.9k → qty_risk=2;
+        # stage cap 5 is NOT reached). See daily_df docstring for the full
+        # arithmetic — we assert the frozen outcome, not a hand-picked 5.
+        assert d1.qty == 2
+        assert broker.position_qty == 2           # simulated long opened
         assert adapter.orders[0] == {"instrument": "CNYRUBF", "side": "BUY",
-                                     "qty": 5}
+                                     "qty": 2}
         st = json.loads(open(state_env / "state.json").read())
         assert st["c5_position_direction"] == "LONG"
 
         # ── HOLD: same candle already processed, nothing re-executed ─
+        # With a LONG position open the frozen c5_core takes the EXIT/HOLD
+        # branch and returns HOLD (entry signals are ignored in position);
+        # the runtime's duplicate-candle guard is covered by len(orders)==1.
         d2 = rt.run_cycle()
-        assert d2.action == "NO_ENTRY"
-        assert broker.position_qty == 5
+        assert d2.action == "HOLD"
+        assert broker.position_qty == 2
         assert len(adapter.orders) == 1
 
         # ── next closed 5m bar breaks Lower(10): EXIT → flat ─────────
@@ -442,7 +479,7 @@ def test_j_paper_full_lifecycle_flat_buy_long_sell_flat(state_env,
         assert d3.action == "EXIT"
         assert broker.position_qty == 0           # back to flat locally
         assert adapter.orders[-1] == {"instrument": "CNYRUBF",
-                                      "side": "SELL", "qty": 5}
+                                      "side": "SELL", "qty": 2}
         st = json.loads(open(state_env / "state.json").read())
         assert st["c5_position_qty"] == 0
         assert st["c5_position_direction"] is None
