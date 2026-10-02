@@ -190,18 +190,19 @@ def load_state() -> dict:
             "monitor_last_alert_reasons": [],
             "monitor_last_alert_candle_time": None,
             "monitor_last_state_hash": None,
-        }
+        })
 
 
 def save_state(state: dict) -> None:
     """Save state to file."""
     try:
+        path = state_file_path()
         # Ensure directory exists
-        state_dir = os.path.dirname(STATE_FILE)
+        state_dir = os.path.dirname(path)
         if state_dir and not os.path.exists(state_dir):
             os.makedirs(state_dir, exist_ok=True)
-        
-        with open(STATE_FILE, "w") as f:
+
+        with open(path, "w") as f:
             json.dump(state, f, indent=2, default=str)
     except IOError as e:
         print(f"⚠️ State save error: {e}")
