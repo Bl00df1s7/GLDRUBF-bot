@@ -61,9 +61,15 @@ def fetch_margin_rates(token: str, instrument_id: str) -> MarginRates:
     """
     try:
         with get_client(token) as client:
-            response = client.instruments.future(
+            # get_future(CNYRUBF_SPBFUT, responseView=FULL). The installed
+            # t-tech-investments SDK exposes this as instruments.future_by(
+            # class_code="SPBFUT", id="CNYRUBF"); the dataclass field names
+            # are snake_case (dlong_client / dshort_client) and carry the
+            # live per-contract ГО in RUB — the direct equivalent of the
+            # REST responseView=FULL payload. No other source is permitted.
+            response = client.instruments.future_by(
+                class_code="SPBFUT",
                 id=instrument_id,
-                response_view="FULL",
             )
     except Exception as exc:  # network / gRPC / SDK errors
         logger.error(
@@ -76,8 +82,16 @@ def fetch_margin_rates(token: str, instrument_id: str) -> MarginRates:
 
     future = getattr(response, "instrument", None) or response
 
-    long_raw = quotation_to_float(getattr(future, "dlongClient", None))
-    short_raw = quotation_to_float(getattr(future, "dshortClient", None))
+    long_raw = quotation_to_float(
+        getattr(future, "dlong_client", None)
+        if getattr(future, "dlong_client", None) is not None
+        else getattr(future, "dlongClient", None)
+    )
+    short_raw = quotation_to_float(
+        getattr(future, "dshort_client", None)
+        if getattr(future, "dshort_client", None) is not None
+        else getattr(future, "dshortClient", None)
+    )
 
     if not (_valid(long_raw) and _valid(short_raw)):
         logger.error(
