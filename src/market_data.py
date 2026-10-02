@@ -218,7 +218,7 @@ def daily_bars_from_df(df, exclude_date=None):
         if k > 0:
             p = rows[k - 1]
             prev = (float(p.high) + float(p.low) + float(p.close)) / 3.0
-        bars.append(DailyBar(date=r.date, open=float(r.open), high=float(r.high),
+        bars.append(DailyBar(trade_date=r.date, high=float(r.high),
                              low=float(r.low), close=float(r.close),
                              prev_close=prev))
     return bars
