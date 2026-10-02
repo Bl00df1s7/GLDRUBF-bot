@@ -65,8 +65,3 @@ def get_c5_instrument(token: str):
 
     return instrument
 
-
-# Backward-compatible alias for generic infra/tests that still reference
-# the old helper name. It now resolves the ACTIVE C5 instrument only —
-# it never looks up GLDRUBF.
-get_gldrubf_instrument = get_c5_instrument
