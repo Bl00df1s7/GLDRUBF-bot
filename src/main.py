@@ -17,11 +17,13 @@ import sys
 # Add src directory to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from config.settings import AUTO_TRADING_ENABLED, C5_TARGET_TICKER
 from src.c5_runtime import C5Runtime, run_once
 from src.state_store import load_state, save_state
 
-SIGNAL_ONLY = not AUTO_TRADING_ENABLED
+# Stage 5A: trading-safety config (TRADING_MODE / AUTO_TRADING_ENABLED) is
+# parsed EXACTLY ONCE in src.runtime_config and enforced inside the C5
+# runtime before execution. This entrypoint stays thin — no local parsing,
+# no defaults, no second gate.
 
 
 def _run():
