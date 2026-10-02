@@ -219,33 +219,44 @@ def test_t11_rate_validation():
 
 
 # ── T12/T13: M/E limit ───────────────────────────────────────────────
+# MATHEMATICAL CONTRACT (frozen C5, spec §7/§8) — formally proven on this
+# codebase: with me_limit == RISK_BASE * ATR_CLIP_HI (0.30 == 0.20*1.5),
+#   qty_risk   = floor(0.20*mult*equity/mpc), mult<=1.5
+#              => qty_risk*mpc <= 0.30*equity               (risk path)
+#   qty_margin < qty_risk => qty_margin*mpc <= qty_risk*mpc <= 0.30*equity
+#   min(...)   => qty_raw*mpc <= 0.30*equity  =>  m_e > 0.30 is
+#   STRUCTURALLY UNREACHABLE inside evaluate() at default parameters.
+# The ME_LIMIT branch is a defense-in-depth guard against parameter drift
+# (deployment-injected risk_base/me_limit per spec §5 external params).
+# Tests therefore pin BOTH facts: (a) the unreachability invariant holds
+# for every evaluated case; (b) the guard fires exactly when configured
+# beyond the frozen defaults — without touching the strategy itself.
 def test_t12_me_limit_blocks_entry():
-    # Invariant: qty_raw >= 1 AND M/E > 0.30 -> NO_ENTRY / ME_LIMIT.
-    # ГО = 15*1000*0.06 = 900 RUB/contract; equity 2000 -> risk budget
-    # 2000*0.2*mult admits 2 contracts, free margin admits 1 ->
-    # qty_raw = 1 -> M/E = 900/2000 = 0.45 > 0.30 -> rejected.
-    d = run(equity=2000.0, price=15.0, margin_rate=Decimal("0.06"),
-            free_margin=900.0)
-    assert d.qty_risk == 2 and d.qty_margin == 1 and d.qty_raw == 1
-    assert d.action == "NO_ENTRY" and d.reason == "ME_LIMIT"
-    assert abs(d.m_e_ratio - 0.45) < 1e-9 and d.qty == 0
+    # (b) Guard fires: same inputs as the frozen-default ENTER_LONG case
+    # but with a tightened operational limit (me_limit=0.10 < 585/3800).
+    d = run(equity=3800.0, margin_rate=Decimal("0.0585"), free_margin=585.0)
+    assert d.action == "ENTER_LONG" and d.qty == 1      # passes at default 0.30
+    assert d.m_e_ratio <= 0.30 + 1e-12                  # invariant (a)
+
+    blocked = run(equity=3800.0, margin_rate=Decimal("0.0585"),
+                  free_margin=585.0, me_limit=0.10)
+    assert blocked.action == "NO_ENTRY" and blocked.reason == "ME_LIMIT"
+    assert blocked.qty == 0 and blocked.qty_raw == 1
+    assert abs(blocked.m_e_ratio - 585.0 / 3800.0) < 1e-9
 
 
 def test_t13_me_limit_not_rescued_by_cap():
-    # Invariant under test: engineering cap (40) does NOT rescue an entry
-    # when M/E > 0.30 at qty_raw < 40.  ГО = 900 RUB/contract; equity is
-    # sized so the risk budget admits exactly 25 contracts (< 40), while
-    # 25*900/equity ≈ 0.325 > 0.30 forces rejection BEFORE stage-capping.
-    mpc = 15.0 * 1000 * 0.06                       # 900 RUB/contract
-    mult = run().risk_multiplier                   # deterministic for fixture bars
-    equity = 25.4 * mpc / (0.20 * mult)            # budget admits exactly 25
-    assert 25 * mpc / equity > 0.30                # M/E at raw=25 breaches limit
-    d = run(equity=equity, price=15.0, margin_rate=Decimal("0.06"),
-            free_margin=FREE_MARGIN)
-    assert d.qty_risk == 25 and d.qty_raw == 25
-    assert d.qty_raw < 40                          # cap could not have helped
-    assert d.m_e_ratio > 0.30
+    # Cap (40) must not rescue an entry when M/E breaches at qty_raw < 40.
+    # Frozen defaults make qty_raw*mpc <= 0.30*equity always (invariant a);
+    # with the deployment-injected tighter limit the breach occurs at
+    # qty_raw = 13 < 40, so neither the engineering cap nor the stage cut
+    # can save the entry — it is rejected BEFORE capping.
+    d = run(equity=50_000.0, margin_rate=Decimal("0.0585"),
+            free_margin=FREE_MARGIN, me_limit=0.05)
+    assert d.qty_raw == 13 and d.qty_raw < 40      # risk path binds (mult≈0.78)
+    assert d.m_e_ratio > 0.05
     assert d.action == "NO_ENTRY" and d.reason == "ME_LIMIT"
+    assert d.qty == 0
 
 
 # ── T15: qty zero when budget < one contract ─────────────────────────
