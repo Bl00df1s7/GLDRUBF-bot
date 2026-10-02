@@ -64,7 +64,9 @@ jobs:
       - name: Run strategy
         env:
           T_SANDAPI: ${{ secrets.T_SANDAPI }}
-          AUTO_TRADING_ENABLED: "true"
+          # LIVE SAFETY GATE: auto-trading disabled until Stage 2D acceptance.
+          # Do not flip to "true" without a completed pre-live audit.
+          AUTO_TRADING_ENABLED: "false"
           TELEGRAM_ENABLED: "false"
           STATE_FILE: ${{ github.workspace }}/runtime/state.json
           TRADES_FILE: ${{ github.workspace }}/runtime/trades.csv
