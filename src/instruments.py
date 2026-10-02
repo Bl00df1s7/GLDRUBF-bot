@@ -38,45 +38,35 @@ def quantize_lots(quantity: int, lot_size: int) -> int:
     return (int(quantity) // int(lot_size)) * int(lot_size)
 
 
-def get_gldrubf_instrument(token: str) -> dict:
+def get_c5_instrument(token: str):
+    """Resolve the ACTIVE C5 instrument: CNYRUBF on SPBFUT.
+
+    Uses instruments.future_by(class_code="SPBFUT", id="CNYRUBF") — the
+    same call shape the margin provider uses (get_future FULL). No
+    GLDRUBF lookup, no fallback to another instrument.
     """
-    Find GLDRUBF futures instrument.
-    
-    Args:
-        token: T-Invest API token
-        
-    Returns:
-        Instrument object with uid, figi, ticker, etc.
-        
-    Raises:
-        RuntimeError: If t_tech not available or instrument not found
-    """
-    from config.settings import TARGET_TICKER
-    
+    from config.settings import C5_CLASS_CODE, C5_TARGET_TICKER
+
     if not T_TECH_AVAILABLE:
         raise RuntimeError("t_tech.invest module not available. Install with: pip install t-tech")
-    
+
     with get_client(token) as client:
-        response = client.instruments.futures()
-        futures = response.instruments
-    
-    instrument = None
-    
-    for x in futures:
-        if x.ticker.upper() == TARGET_TICKER:
-            instrument = x
-            break
-    
-    if instrument is None:
-        raise RuntimeError(f"Фьючерс {TARGET_TICKER} не найден")
-    
+        response = client.instruments.future_by(
+            class_code=C5_CLASS_CODE, id=C5_TARGET_TICKER,
+        )
+    instrument = getattr(response, "instrument", None) or response
+    if instrument is None or not getattr(instrument, "uid", None):
+        raise RuntimeError(f"Фьючерс {C5_TARGET_TICKER}/{C5_CLASS_CODE} не найден")
+
     print("=== INSTRUMENT ===")
     print(f"Ticker:       {instrument.ticker}")
-    print(f"Name:         {instrument.name}")
     print(f"UID:          {instrument.uid}")
-    print(f"FIGI:         {instrument.figi}")
-    print(f"Class code:   {instrument.class_code}")
-    print(f"Lot:          {instrument.lot}")
-    print(f"Min tick:     {instrument.min_price_increment}")
-    
+    print(f"Class code:   {getattr(instrument, 'class_code', '')}")
+
     return instrument
+
+
+# Backward-compatible alias for generic infra/tests that still reference
+# the old helper name. It now resolves the ACTIVE C5 instrument only —
+# it never looks up GLDRUBF.
+get_gldrubf_instrument = get_c5_instrument

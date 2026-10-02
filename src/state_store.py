@@ -47,7 +47,7 @@ def _build_position_key(position_state: dict) -> Optional[str]:
     # Use entry_price rounded to avoid floating point issues
     entry_key = f"{round(entry_price, 4) if entry_price else 'unknown'}"
     
-    instrument = position_state.get("instrument", "GLDRUBF")
+    instrument = position_state.get("instrument", "CNYRUBF")
     account_masked = _mask_account_id(position_state.get("account_id", ""))
     
     return f"{instrument}:{direction}:{entry_key}:{account_masked}"
