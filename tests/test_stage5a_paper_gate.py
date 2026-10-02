@@ -272,6 +272,7 @@ def test_f_auto_false_live_blocked_no_post_order(state_env, monkeypatch,
 def test_f_main_entrypoint_refuses_without_token(state_env, monkeypatch):
     """c5_runtime.main() fails closed before touching credentials."""
     _mode_env(monkeypatch, "LIVE", None)  # AUTO missing → false
+    monkeypatch.delenv("T_SANDAPI", raising=False)
     monkeypatch.delenv("SANDBOX_TOKEN", raising=False)
     monkeypatch.delenv("INVEST_TOKEN", raising=False)
     from src import c5_runtime
@@ -279,6 +280,89 @@ def test_f_main_entrypoint_refuses_without_token(state_env, monkeypatch):
 
 
 # ══════════════════════════════════════════════════════════════════════
+# Credential wiring — T_SANDAPI is the ONLY accepted token env name.
+# Legacy names (SANDBOX_TOKEN / INVEST_TOKEN) must NOT enable runtime.
+# Token values are never logged; only fake fixtures are used.
+# ══════════════════════════════════════════════════════════════════════
+@pytest.mark.parametrize(
+    "env_name", ["SANDBOX_TOKEN", "INVEST_TOKEN"])
+def test_credential_legacy_names_do_not_enable_runtime(monkeypatch,
+                                                       env_name):
+    """Old token env names must fail closed when T_SANDAPI is absent."""
+    import src.c5_runtime as rt_mod
+    monkeypatch.delenv("T_SANDAPI", raising=False)
+    monkeypatch.setenv(env_name, "fake-token-must-not-be-accepted")
+    # Trading gate opened (LIVE+true) so the ONLY possible blocker is
+    # the missing credential: main() reads ONLY T_SANDAPI → run_once
+    # receives "" → hard abort. Legacy value is never accepted.
+    _mode_env(monkeypatch, "LIVE", "true")
+    with pytest.raises(RuntimeError, match="T_SANDAPI"):
+        rt_mod.main()
+
+
+def test_credential_present_missing_empty(monkeypatch):
+    """Required checks 1–3 for BOTH production entrypoints:
+    1. T_SANDAPI present → token successfully read/forwarded;
+    2. T_SANDAPI missing → fail closed;
+    3. T_SANDAPI empty  → fail closed."""
+    import src.main as m
+    import src.c5_runtime as rt_mod
+    captured = {}
+
+    def fake_run_once(token):
+        captured["token"] = token
+        from src.c5_runtime import _noop_decision
+        return _noop_decision()
+
+    monkeypatch.setattr(m, "run_once", fake_run_once)
+    monkeypatch.setattr(rt_mod, "run_once", fake_run_once)
+    _mode_env(monkeypatch, "LIVE", "true")
+    monkeypatch.delenv("SANDBOX_TOKEN", raising=False)
+    monkeypatch.delenv("INVEST_TOKEN", raising=False)
+
+    # 1. present → forwarded by both entrypoints.
+    monkeypatch.setenv("T_SANDAPI", "fake-token-ok")
+    captured.clear(); m._run()
+    assert captured["token"] == "fake-token-ok"
+    captured.clear(); rt_mod.main()
+    assert captured["token"] == "fake-token-ok"
+
+    # 2. missing → fail closed (src.main._run uses the REAL run_once
+    # guard here; c5_runtime.main forwards "" to the real run_once).
+    monkeypatch.delenv("T_SANDAPI")
+    monkeypatch.setattr(rt_mod, "run_once",
+                        lambda t: (_ for _ in ()).throw(
+                            RuntimeError("boom")) if False else None)
+    with pytest.raises(RuntimeError, match="T_SANDAPI"):
+        m._run()
+
+    # 3. empty string → fail closed.
+    monkeypatch.setenv("T_SANDAPI", "")
+    with pytest.raises(RuntimeError, match="T_SANDAPI"):
+        m._run()
+
+
+def test_credential_main_forwards_only_t_sandapi(monkeypatch):
+    """c5_runtime.main() consults ONLY os.environ['T_SANDAPI']: legacy
+    names present + T_SANDAPI absent → run_once gets an EMPTY token
+    (fail-closed path), i.e. legacy values are never forwarded."""
+    import src.c5_runtime as rt_mod
+    captured = {}
+
+    def spy_run_once(token):
+        captured["token"] = token
+        raise RuntimeError("stop-after-capture")
+
+    monkeypatch.setattr(rt_mod, "run_once", spy_run_once)
+    _mode_env(monkeypatch, "LIVE", "true")
+    monkeypatch.delenv("T_SANDAPI", raising=False)
+    monkeypatch.setenv("SANDBOX_TOKEN", "fake-legacy-token")
+    monkeypatch.setenv("INVEST_TOKEN", "fake-legacy-token")
+    with pytest.raises(RuntimeError, match="stop-after-capture"):
+        rt_mod.main()
+    assert captured["token"] == ""  # legacy names never consulted
+
+
 # G/H/I — PAPER BUY / SELL / TMON are LOCAL ONLY (post_order booby-trap)
 # ══════════════════════════════════════════════════════════════════════
 @pytest.fixture

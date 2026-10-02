@@ -896,7 +896,7 @@ def test_main_entrypoint_delegates_to_c5_runtime(env, monkeypatch):
         return _noop_decision()
 
     monkeypatch.setattr(m, "run_once", fake_run_once)
-    monkeypatch.setenv("SANDBOX_TOKEN", "tok-123")
+    monkeypatch.setenv("T_SANDAPI", "tok-123")
     m._run()
     assert captured["token"] == "tok-123"
 

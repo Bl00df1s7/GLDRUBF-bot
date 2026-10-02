@@ -34,10 +34,12 @@ def _run():
     here anymore; it exists only in the archive branch
     legacy/gldrubf-old-strategy.
     """
-    token = os.environ.get("SANDBOX_TOKEN") or os.environ.get(
-        "INVEST_TOKEN", "")
+    # Credential wiring: the ONLY accepted token env name is T_SANDAPI.
+    # No fallback to legacy names; missing/empty token fails closed.
+    # The token value itself is never logged or printed.
+    token = os.environ.get("T_SANDAPI", "")
     if not token:
-        raise RuntimeError("SANDBOX_TOKEN / INVEST_TOKEN is empty")
+        raise RuntimeError("T_SANDAPI is missing or empty (fail closed)")
     decision = run_once(token)
     print(f"\n✅ C5 cycle completed: action={decision.action} "
           f"qty={decision.qty} reason={decision.reason}")

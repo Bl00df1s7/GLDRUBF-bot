@@ -543,7 +543,7 @@ def run_once(token: str) -> c5_core.Decision:
     injected into the runtime — there is no second parser downstream.
     """
     if not token:
-        raise RuntimeError("SANDBOX_TOKEN / INVEST_TOKEN is empty")
+        raise RuntimeError("T_SANDAPI is missing or empty (fail closed)")
     config = load_trading_config()
     runtime = C5Runtime(token, config=config)
     return runtime.run_cycle()
@@ -565,7 +565,10 @@ def main() -> None:
             "execution (mode=%s). Nothing was sent to the broker.",
             config.mode)
         return
-    token = os.environ.get("SANDBOX_TOKEN") or os.environ.get("INVEST_TOKEN", "")
+    # Credential wiring: the ONLY accepted token env name is T_SANDAPI.
+    # No fallback to legacy names; missing/empty token fails closed in
+    # run_once(). The token value itself is never logged or printed.
+    token = os.environ.get("T_SANDAPI", "")
     decision = run_once(token)
     logger.info("RUN_RESULT action=%s qty=%d reason=%s",
                 decision.action, decision.qty, decision.reason)
