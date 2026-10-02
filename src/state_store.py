@@ -72,6 +72,11 @@ def load_state() -> dict:
             "last_action": None,
             "warnings": [],
             "last_run_timestamp": None,
+            # C5 protection state (persisted across restarts)
+            "c5_daily_session_date": None,
+            "c5_daily_start_equity": None,
+            "equity_peak": None,
+            "kill_switch": False,
             # Position monitor state
             "monitor_last_alert_level": None,
             "monitor_last_alert_reasons": [],
@@ -145,6 +150,11 @@ def load_state() -> dict:
             "last_action": None,
             "warnings": ["State file corrupted, reset"],
             "last_run_timestamp": None,
+            # C5 protection state (persisted across restarts)
+            "c5_daily_session_date": None,
+            "c5_daily_start_equity": None,
+            "equity_peak": None,
+            "kill_switch": False,
             # Position monitor state
             "monitor_last_alert_level": None,
             "monitor_last_alert_reasons": [],
