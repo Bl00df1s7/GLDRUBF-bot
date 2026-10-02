@@ -189,13 +189,16 @@ class C5Runtime:
         """Resolve instrument, adapter, account; reconcile; refresh margin.
 
         Returns the reconciled snapshot or None when startup failed
-        (NO LIVE EXECUTION in that case).
+        (NO LIVE EXECUTION in that case). Already-resolved components are
+        never re-fetched (idempotent bootstrap; also lets integration
+        tests inject boundary fakes without touching the network).
         """
-        try:
-            self.instrument = get_c5_instrument(self.token)
-        except Exception as exc:
-            logger.error("STARTUP: CNYRUBF instrument unavailable: %s", exc)
-            return None
+        if self.instrument is None:
+            try:
+                self.instrument = get_c5_instrument(self.token)
+            except Exception as exc:
+                logger.error("STARTUP: CNYRUBF instrument unavailable: %s", exc)
+                return None
 
         if self.adapter is None:
             self.adapter, mode = build_execution_adapter(
@@ -203,11 +206,12 @@ class C5Runtime:
             self.trader = self.trader or self.adapter
             logger.info("STARTUP: execution adapter mode=%s", mode)
 
-        try:
-            self.account_id = self.adapter.find_account()
-        except Exception as exc:
-            logger.error("STARTUP: account discovery failed: %s", exc)
-            return None
+        if self.account_id is None:
+            try:
+                self.account_id = self.adapter.find_account()
+            except Exception as exc:
+                logger.error("STARTUP: account discovery failed: %s", exc)
+                return None
 
         if self._margin is None:
             self._margin = MarginTracker(self.token, C5_TARGET_TICKER)
