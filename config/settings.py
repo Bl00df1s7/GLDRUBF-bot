@@ -39,8 +39,11 @@ SAR_MAX = 0.20
 TARGET_TICKER = "CNYRUBF"
 LEGACY_TARGET_TICKER = "GLDRUBF"  # archive reference only — NOT used by runtime
 
-# Trading mode
-AUTO_TRADING_ENABLED = True  # Enable automatic trading (False = signal only)
+# Trading mode — legacy default kept ONLY as a module constant; the C5
+# runtime never reads this value (see src/runtime_config.py, Stage 5A:
+# TRADING_MODE / AUTO_TRADING_ENABLED are parsed from the environment,
+# fail-closed).
+AUTO_TRADING_ENABLED = True  # LEGACY reference only — NOT used by C5 runtime
 RESERVE_RATIO = 0.10         # Keep 10% of deposit as reserve
 MAX_DAILY_LOSS_PCT = 0.03    # Halt new entries after 3% realized loss
 
@@ -158,5 +161,7 @@ C5_MARGIN_RATE_CHANGE_EPS = 1e-9
 C5_MARGIN_RATE_MIN = 0.0
 C5_MARGIN_RATE_MAX = 0.5
 
-# C5 auto-trading mode switch (paper/live handled by T_Invest sandbox token)
-AUTO_TRADING_ENABLED = True
+# C5 auto-trading mode switch — Stage 5A: the runtime NEVER reads this
+# constant. TRADING_MODE and AUTO_TRADING_ENABLED are parsed from the
+# environment exactly once, in src/runtime_config.py (fail closed).
+# This duplicate is removed to kill the second source of truth.

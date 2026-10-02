@@ -336,14 +336,28 @@ class SimulatedBroker:
         self.equity = max(self.equity, 0.0)
 
 
-def build_execution_adapter(token: str, instrument_uid: str):
-    """Factory honoring MODE env: LIVE (default) / PAPER.
+def build_execution_adapter(token: str, instrument_uid: str, config=None):
+    """Factory honoring the Stage 5A safety gate (single source of truth).
 
-    LIVE must NEVER silently degrade to paper: adapter choice is explicit.
+    ``config`` is a validated ``src.runtime_config.TradingConfig``; when
+    omitted it is loaded from the environment via the ONE parser. There is
+    NO default mode and NO default to LIVE:
+
+      * PAPER → PaperExecutionAdapter + SimulatedBroker — local state only;
+        this code path physically cannot reach OrdersServiceApi.post_order().
+      * LIVE  → LiveExecutionAdapter — allowed ONLY with an explicit
+        TRADING_MODE=LIVE plus AUTO_TRADING_ENABLED=true (enforced by
+        load_trading_config / enforce_trading_gate in src/runtime_config.py).
+      * missing/invalid TRADING_MODE → TradingConfigError (fail closed).
     """
-    mode = os.environ.get("TRADING_MODE", "LIVE").upper()
-    if mode == "PAPER":
+    from src.runtime_config import (load_trading_config, enforce_trading_gate)
+
+    if config is None:
+        config = load_trading_config()
+    # Fail closed BEFORE any adapter exists: AUTO=false blocks everything,
+    # including paper order flow.
+    enforce_trading_gate(config)
+
+    if config.is_paper:
         return PaperExecutionAdapter(SimulatedBroker()), "PAPER"
-    if mode == "LIVE":
-        return LiveExecutionAdapter(token, instrument_uid), "LIVE"
-    raise ValueError(f"Unknown TRADING_MODE: {mode!r} (expected LIVE|PAPER)")
+    return LiveExecutionAdapter(token, instrument_uid), "LIVE"

@@ -37,7 +37,6 @@ import pandas as pd
 from zoneinfo import ZoneInfo
 
 from config.settings import (
-    AUTO_TRADING_ENABLED,
     C5_CLASS_CODE,
     C5_CONTRACT_SIZE_CNY,
     C5_CONTROL_HOUR_MS,
@@ -52,6 +51,12 @@ from src.instruments import get_c5_instrument
 from src.margin_provider import MarginApiUnavailable, MarginTracker
 from src.market_data import daily_bars_from_df, load_candles
 from src.protection import evaluate_protections
+from src.runtime_config import (
+    TradingConfig,
+    TradingConfigError,
+    enforce_trading_gate,
+    load_trading_config,
+)
 from src.state_store import load_state, save_state
 from src.strategies import c5_core
 
@@ -72,6 +77,7 @@ REASON_PROTECTION_BLOCKED = "PROTECTION_BLOCKED"
 REASON_KILL_SWITCH = "KILL_SWITCH"
 REASON_SLIPPAGE_GUARD = "SLIPPAGE_GUARD"
 REASON_RECONCILE_FAILED = "RECONCILE_FAILED"
+REASON_TRADING_BLOCKED = "TRADING_BLOCKED_BY_CONFIG"
 
 
 def _now_utc() -> datetime:
@@ -174,7 +180,7 @@ class C5Runtime:
 
     def __init__(self, token: str, adapter=None, trader=None,
                  margin_tracker: Optional[MarginTracker] = None,
-                 now_fn=_now_utc):
+                 now_fn=_now_utc, config: Optional[TradingConfig] = None):
         self.token = token
         self.adapter = adapter
         self.trader = trader or adapter
@@ -183,6 +189,12 @@ class C5Runtime:
         self.now_fn = now_fn
         self.instrument = None
         self.account_id = None
+        # Stage 5A safety gate — parsed ONCE via src.runtime_config (the
+        # single source of truth). Injected configs are used as-is; when
+        # omitted the validated env snapshot is loaded here (no second
+        # parser exists anywhere else). Fail-closed errors from an
+        # invalid/missing TRADING_MODE propagate to the caller.
+        self.config = config if config is not None else load_trading_config()
 
     # ── infrastructure wiring ────────────────────────────────────────
     def bootstrap(self, state: dict) -> Optional[object]:
@@ -192,8 +204,12 @@ class C5Runtime:
         (NO LIVE EXECUTION in that case). Already-resolved components are
         never re-fetched (idempotent bootstrap; also lets integration
         tests inject boundary fakes without touching the network).
+
+        PAPER mode uses a purely local SimulatedBroker and therefore does
+        NOT require the live market-data API at bootstrap; LIVE keeps the
+        full instrument-resolution + reconcile flow.
         """
-        if self.instrument is None:
+        if self.instrument is None and not self.config.is_paper:
             try:
                 self.instrument = get_c5_instrument(self.token)
             except Exception as exc:
@@ -202,7 +218,7 @@ class C5Runtime:
 
         if self.adapter is None:
             self.adapter, mode = build_execution_adapter(
-                self.token, self.instrument.uid)
+                self.token, self.instrument.uid, config=self.config)
             self.trader = self.trader or self.adapter
             logger.info("STARTUP: execution adapter mode=%s", mode)
 
@@ -245,6 +261,17 @@ class C5Runtime:
 
     # ── one full cycle ───────────────────────────────────────────────
     def run_cycle(self) -> c5_core.Decision:
+        # STAGE 5A SAFETY GATE — evaluated BEFORE anything that can reach
+        # an execution adapter. AUTO_TRADING_ENABLED=false (or missing /
+        # invalid) blocks ALL order flow, paper included. This is the only
+        # gate check; main.py stays a thin entrypoint and never re-parses.
+        try:
+            enforce_trading_gate(self.config)
+        except TradingConfigError as exc:
+            logger.error("TRADING_BLOCKED before execution: %s", exc)
+            return c5_core.block_entry(_noop_decision(),
+                                       REASON_TRADING_BLOCKED)
+
         now_utc = self.now_fn()
         now_msk = _msk(now_utc)
 
@@ -509,21 +536,36 @@ def _noop_decision() -> c5_core.Decision:
 
 
 def run_once(token: str) -> c5_core.Decision:
-    """Single production cycle (used by workflow / scheduler)."""
+    """Single production cycle (used by workflow / scheduler).
+
+    Stage 5A: the trading-safety config is loaded ONCE here via
+    src.runtime_config (fail closed on missing/invalid TRADING_MODE) and
+    injected into the runtime — there is no second parser downstream.
+    """
     if not token:
         raise RuntimeError("SANDBOX_TOKEN / INVEST_TOKEN is empty")
-    runtime = C5Runtime(token)
+    config = load_trading_config()
+    runtime = C5Runtime(token, config=config)
     return runtime.run_cycle()
 
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s %(message)s")
-    token = os.environ.get("SANDBOX_TOKEN") or os.environ.get("INVEST_TOKEN", "")
-    mode = os.environ.get("TRADING_MODE", "PAPER").upper()
-    if not AUTO_TRADING_ENABLED and mode != "PAPER":
-        logger.error("AUTO_TRADING_ENABLED=false — LIVE execution disabled")
+    # Fail closed BEFORE any network/token use: missing or invalid
+    # TRADING_MODE aborts; AUTO_TRADING_ENABLED!=true aborts.
+    try:
+        config = load_trading_config()
+    except TradingConfigError as exc:
+        logger.error("STARTUP REFUSED (fail closed): %s", exc)
+        raise SystemExit(2) from exc
+    if not config.trading_allowed:
+        logger.error(
+            "AUTO_TRADING_ENABLED is not true — trading blocked before "
+            "execution (mode=%s). Nothing was sent to the broker.",
+            config.mode)
         return
+    token = os.environ.get("SANDBOX_TOKEN") or os.environ.get("INVEST_TOKEN", "")
     decision = run_once(token)
     logger.info("RUN_RESULT action=%s qty=%d reason=%s",
                 decision.action, decision.qty, decision.reason)
