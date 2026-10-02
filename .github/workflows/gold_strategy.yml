@@ -1,0 +1,88 @@
+name: GLDRUBF Auto Trading
+
+on:
+  schedule:
+    # GitHub Actions uses UTC. Runs at 03:05-23:05 MSK on weekdays,
+    # plus a final session check at 23:50 MSK.
+    - cron: '5 0-20 * * 1-5'
+    - cron: '50 20 * * 1-5'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gldrubf-auto-trading
+  cancel-in-progress: false
+
+jobs:
+  run-strategy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # Сервер opensource.tbank.ru (PyPI-индекс T-Invest SDK) и
+      # invest-public-api.tbank.ru выдают сертификаты, выпущенные «Russian Trusted
+      # Sub CA» (МИДцифры). Корень этой ЦС отсутствует в стандартном хранилище CA
+      # на ubuntu-latest и в certifi, поэтому pip падает с
+      # CERTIFICATE_VERIFY_FAILED. Решение — добавить сертификат Russian Trusted CA
+      # (из certs/) в доверяемое хранилище. Проверку TLS мы НЕ отключаем
+      # (--trusted-host не используем).
+      - name: Trust Russian Trusted CA for tbank hosts
+        run: |
+          sudo cp certs/russian-trusted-sub-ca.pem \
+                  certs/russian-trusted-root-ca.pem \
+                  /usr/local/share/ca-certificates/
+          sudo update-ca-certificates
+          # pip может использовать certifi вместо системного хранилища —
+          # собираем объединённый CA-бандл и указываем его для pip и requests
+          bundle="$(python tools/pip_ca_bundle.py)"
+          echo "PIP_CERT=${bundle}" >> "$GITHUB_ENV"
+          echo "REQUESTS_CA_BUNDLE=${bundle}" >> "$GITHUB_ENV"
+          echo "SSL_CERT_FILE=${bundle}" >> "$GITHUB_ENV"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Restore runtime state
+        uses: actions/cache/restore@v4
+        with:
+          path: runtime
+          key: gldrubf-runtime-${{ github.run_id }}
+          restore-keys: |
+            gldrubf-runtime-
+
+      - name: Run strategy
+        env:
+          T_SANDAPI: ${{ secrets.T_SANDAPI }}
+          AUTO_TRADING_ENABLED: "true"
+          TELEGRAM_ENABLED: "false"
+          STATE_FILE: ${{ github.workspace }}/runtime/state.json
+          TRADES_FILE: ${{ github.workspace }}/runtime/trades.csv
+          LOG_DIR: ${{ github.workspace }}/runtime/logs
+        run: |
+          mkdir -p runtime/logs
+          python -m src.main
+
+      - name: Show run log
+        if: always()
+        run: |
+          for log_file in runtime/logs/bot_*.log; do
+            [ -f "$log_file" ] && cat "$log_file"
+          done
+
+      - name: Save runtime state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: runtime
+          key: gldrubf-runtime-${{ github.run_id }}
