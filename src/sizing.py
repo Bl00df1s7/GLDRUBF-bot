@@ -152,18 +152,23 @@ def size_position(
     if margin_per_contract_rub is None or margin_per_contract_rub <= 0:
         # Explicitly NOT a fallback: caller must block entry on API failure.
         return SizingResult(False, "MARGIN_API_UNAVAILABLE")
-    if cny_rub_rate is None or cny_rub_rate <= 0:
-        return SizingResult(False, "FX_RATE_UNAVAILABLE")
+    # CNY/RUB rate is needed only for the liquidity/slippage depth walk;
+    # it never participates in the frozen risk budget (§7 of C5 spec).
+    fx_ok = cny_rub_rate is not None and cny_rub_rate > 0
 
     try:
         multiplier = compute_risk_multiplier(atr14)
     except ValueError as exc:
         return SizingResult(False, "ATR_UNAVAILABLE", details={"error": str(exc)})
 
-    # risk budget in RUB and per-contract adverse-move risk in RUB.
+    # Frozen risk model (C5 spec §7–§8):
+    #   risk_budget = equity * RISK_BASE * clip(ATR_target/ATR14, 0.5, 1.5)
+    #   qty_risk    = floor(risk_budget / live ГО per contract)
+    # The ГО-based denominator makes higher volatility shrink the size
+    # automatically (multiplier < 1), matching the economic meaning.
     risk_budget = equity_rub * C5_RISK_BUDGET_PCT * multiplier
-    per_contract_risk_rub = atr14 * contract_size_cny * cny_rub_rate
-    risk_qty = int(math.floor(risk_budget / per_contract_risk_rub)) if per_contract_risk_rub > 0 else 0
+    risk_qty = int(math.floor(risk_budget / margin_per_contract_rub)) \
+        if margin_per_contract_rub > 0 else 0
 
     # margin capacity under the operational M/E safety limit.
     available_margin_rub = max(0.0, equity_rub * me_limit
@@ -172,13 +177,19 @@ def size_position(
 
     # engineering / liquidity cap
     guess = max(risk_qty, 0)
-    liquidity_qty = compute_liquidity_qty(
-        quantity_guess=max(guess, 1),
-        notional_per_contract_rub=contract_size_cny * cny_rub_rate,
-        book_asks=book_asks or [],
-        direction=direction,
-        mid_price=mid_price if mid_price else price_rub,
-    )
+    if fx_ok and book_asks and mid_price:
+        liquidity_qty = compute_liquidity_qty(
+            quantity_guess=max(guess, 1),
+            notional_per_contract_rub=contract_size_cny * cny_rub_rate,
+            book_asks=book_asks,
+            direction=direction,
+            mid_price=mid_price,
+        )
+    else:
+        # No depth data supplied: the execution guard (src.execution_guard)
+        # performs the mandatory slippage check before any order is sent;
+        # here liquidity defaults to the engineering cap.
+        liquidity_qty = int(max_qty)
 
     calculated = min(risk_qty, margin_qty, liquidity_qty, max_qty)
     final = min(calculated, stage_max_qty)

@@ -96,10 +96,15 @@ C5_TARGET_TICKER = "CNYRUBF"
 C5_CLASS_CODE = "SPBFUT"
 C5_INSTRUMENT_ISIN = "CNYRUBF_SPBFUT"
 
-# Timeframe for signal candles
-C5_TIMEFRAME = "4H"
+# Signal timeframe: DAILY closed bars for channels/ATR + one 5m control
+# candle at 16:00 MSK per trading day (spec §CONTROL_TIME / §BAR_TIMEFRAME).
+C5_TIMEFRAME = "1d"
+C5_CONTROL_TIMEFRAME = "5m"
+C5_CONTROL_HOUR_MS = 16          # 16:00 MSK control point, once per day
 
-# Entry Donchian N = 10, Exit Donchian M = 5 (trend following, frozen)
+# Entry Donchian N = 10, Exit Donchian M = 5 (trend following, frozen).
+# Channels are built from CLOSED DAILY bars shifted by 1 (no lookahead);
+# the comparison price is the close of the 16:00 MSK 5m control candle.
 C5_ENTRY_DONCHIAN = 10
 C5_EXIT_DONCHIAN = 5
 
@@ -141,6 +146,12 @@ C5_KILL_SWITCH_DD = 0.30       # vs historical equity peak: full halt
 # after reconnect and after API recovery; MARGIN_RATE_CHANGED event on delta.
 C5_MARGIN_REFRESH_BEFORE_ENTRY = True
 C5_MARGIN_RATE_CHANGE_EPS = 1e-9
+
+# Validity band for a live ГО rate coming from get_future(..., FULL).
+# Out-of-band values are treated as MARGIN_API_UNAVAILABLE (NO ENTRY);
+# there is NO fallback to remembered/hardcoded rates (0.0585 / 0.0576).
+C5_MARGIN_RATE_MIN = 0.0
+C5_MARGIN_RATE_MAX = 0.5
 
 # C5 auto-trading mode switch (paper/live handled by T_Invest sandbox token)
 AUTO_TRADING_ENABLED = True
