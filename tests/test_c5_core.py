@@ -220,20 +220,31 @@ def test_t11_rate_validation():
 
 # ── T12/T13: M/E limit ───────────────────────────────────────────────
 def test_t12_me_limit_blocks_entry():
-    mpc = PRICE * 1000 * float(RATE)               # 585 RUB/contract
-    equity = 1000.0                                # qty_raw=1 -> M/E = 0.585
-    d = run(equity=equity, free_margin=FREE_MARGIN)
+    # Invariant: qty_raw >= 1 AND M/E > 0.30 -> NO_ENTRY / ME_LIMIT.
+    # ГО = 15*1000*0.06 = 900 RUB/contract; equity 2000 -> risk budget
+    # 2000*0.2*mult admits 2 contracts, free margin admits 1 ->
+    # qty_raw = 1 -> M/E = 900/2000 = 0.45 > 0.30 -> rejected.
+    d = run(equity=2000.0, price=15.0, margin_rate=Decimal("0.06"),
+            free_margin=900.0)
+    assert d.qty_risk == 2 and d.qty_margin == 1 and d.qty_raw == 1
     assert d.action == "NO_ENTRY" and d.reason == "ME_LIMIT"
-    assert d.m_e_ratio > 0.30 and d.qty == 0
+    assert abs(d.m_e_ratio - 0.45) < 1e-9 and d.qty == 0
 
 
 def test_t13_me_limit_not_rescued_by_cap():
-    # qty_raw=25 (< 40) but M/E = 0.35 must still be rejected.
-    mpc = 585.0
-    equity = 25 * mpc / 0.35                       # ~41.8k
-    d = run(equity=equity, free_margin=FREE_MARGIN)
-    assert d.qty_raw == 25
-    assert 0.34 < d.m_e_ratio <= 0.36
+    # Invariant under test: engineering cap (40) does NOT rescue an entry
+    # when M/E > 0.30 at qty_raw < 40.  ГО = 900 RUB/contract; equity is
+    # sized so the risk budget admits exactly 25 contracts (< 40), while
+    # 25*900/equity ≈ 0.325 > 0.30 forces rejection BEFORE stage-capping.
+    mpc = 15.0 * 1000 * 0.06                       # 900 RUB/contract
+    mult = run().risk_multiplier                   # deterministic for fixture bars
+    equity = 25.4 * mpc / (0.20 * mult)            # budget admits exactly 25
+    assert 25 * mpc / equity > 0.30                # M/E at raw=25 breaches limit
+    d = run(equity=equity, price=15.0, margin_rate=Decimal("0.06"),
+            free_margin=FREE_MARGIN)
+    assert d.qty_risk == 25 and d.qty_raw == 25
+    assert d.qty_raw < 40                          # cap could not have helped
+    assert d.m_e_ratio > 0.30
     assert d.action == "NO_ENTRY" and d.reason == "ME_LIMIT"
 
 
@@ -249,10 +260,8 @@ def test_t16_determinism_and_purity():
     d1 = run(daily_bars=bars)
     d2 = run(daily_bars=bars)
     assert d1 == d2
-    # inputs untouched
-    assert bars[0].trade_date == make_daily()[0].trade_date
-    with pytest.raises(Exception):
-        object.__setattr__ if False else None
+    # inputs untouched (module is pure — no mutation of caller data)
+    assert bars == make_daily()
     from dataclasses import FrozenInstanceError
     with pytest.raises(FrozenInstanceError):
         d1.qty = 99
