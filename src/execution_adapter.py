@@ -191,6 +191,21 @@ class LiveExecutionAdapter(BaseExecutionAdapter):
         from src.auto_trader import (_ensure_market_order_available,
                                      _status_name, wait_for_order_fill)
 
+        # STAGE 5A DEFENSE-IN-DEPTH gate — re-checked immediately before
+        # the ONLY OrdersServiceApi.post_order call site of this adapter.
+        # AUTO_TRADING_ENABLED!=true blocks real order flow regardless of
+        # TRADING_MODE; PAPER mode never constructs a LiveExecutionAdapter
+        # (build_execution_adapter routes PAPER → PaperExecutionAdapter),
+        # so PAPER can physically not reach this line. Fail closed.
+        from src.runtime_config import (TradingConfigError,
+                                        enforce_trading_gate,
+                                        load_trading_config)
+        try:
+            enforce_trading_gate(load_trading_config())
+        except TradingConfigError as exc:
+            logger.error("LIVE_ORDER_BLOCKED (fail closed): %s", exc)
+            return ExecutionResult(False, f"TRADING_BLOCKED:{exc}")
+
         direction = (OrderDirection.ORDER_DIRECTION_BUY if buy
                      else OrderDirection.ORDER_DIRECTION_SELL)
         with get_client(self.token) as client:

@@ -6,10 +6,11 @@ validated result instead of re-parsing (no duplicated checks).
 
 Rules (fail closed — safety over convenience):
 
-  * TRADING_MODE          — required. Only "PAPER" or "LIVE"
-                            (case-insensitive) are valid. Missing or
-                            invalid → TradingConfigError. The runtime
-                            NEVER defaults to LIVE.
+  * TRADING_MODE          — MANDATORY. Only "PAPER" or "LIVE"
+                            (case-insensitive) are valid. Missing, blank
+                            or invalid → TradingConfigError (fail
+                            closed). There is NO default mode at all —
+                            not PAPER, and NEVER LIVE.
   * AUTO_TRADING_ENABLED  — optional. Parsed case-insensitively:
                             true/false, 1/0, yes/no, on/off.
                             Missing or invalid → False (trading blocked
@@ -89,12 +90,16 @@ def load_trading_config(environ: dict | None = None) -> TradingConfig:
 
     raw_mode = env.get(TRADING_MODE_ENV)
     if raw_mode is None or str(raw_mode).strip() == "":
-        # FAIL CLOSED — there is NO default trading mode and it is NEVER
-        # LIVE. An unset TRADING_MODE means: no real order flow at all.
-        # The safest runnable state is PAPER + AUTO disabled (signal-only,
-        # blocked before execution); any actual trading still requires an
-        # explicit TRADING_MODE plus AUTO_TRADING_ENABLED=true.
-        return TradingConfig(mode=MODE_PAPER, auto_trading_enabled=False)
+        # FAIL CLOSED — TRADING_MODE is MANDATORY. There is NO default
+        # trading mode whatsoever (not PAPER, and never LIVE): the bot
+        # refuses to construct a runtime until the operator explicitly
+        # declares the mode. Missing value → hard error, exactly like an
+        # invalid one; nothing downstream can fall back to LIVE.
+        raise TradingConfigError(
+            f"{TRADING_MODE_ENV} is required but missing/blank — there is "
+            f"no default trading mode (fail closed; never defaults to "
+            f"LIVE). Set {TRADING_MODE_ENV} to one of "
+            f"{', '.join(VALID_MODES)} only when this is intentional.")
     mode = str(raw_mode).strip().upper()
     if mode not in VALID_MODES:
         # Invalid value → refuse completely (no adapter, no cycle).
