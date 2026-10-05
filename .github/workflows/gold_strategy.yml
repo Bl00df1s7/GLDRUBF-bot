@@ -64,6 +64,10 @@ jobs:
       - name: Run strategy
         env:
           T_SANDAPI: ${{ secrets.T_SANDAPI }}
+          # Stage 6B: explicit trading mode — MANDATORY since Stage 5A
+          # (src/runtime_config.py fails closed on missing/blank mode).
+          # PAPER only here; LIVE requires a separate deliberate change.
+          TRADING_MODE: "PAPER"
           # LIVE SAFETY GATE: auto-trading disabled until Stage 2D acceptance.
           # Do not flip to "true" without a completed pre-live audit.
           AUTO_TRADING_ENABLED: "false"
