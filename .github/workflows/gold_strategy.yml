@@ -7,6 +7,15 @@ on:
     - cron: '5 0-20 * * 1-5'
     - cron: '50 20 * * 1-5'
   workflow_dispatch:
+    inputs:
+      # Stage 6C: explicit opt-in for the real-data PAPER smoke test.
+      # Default false => AUTO_TRADING_ENABLED=false (no execution).
+      # true       => AUTO_TRADING_ENABLED=true, but TRADING_MODE stays
+      # hard-coded to "PAPER" below. LIVE is never reachable from here.
+      paper_smoke_test:
+        description: "Run real-data PAPER smoke test (execution via PaperExecutionAdapter only; post_order calls = 0)"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -64,15 +73,28 @@ jobs:
       - name: Run strategy
         env:
           T_SANDAPI: ${{ secrets.T_SANDAPI }}
-          # LIVE SAFETY GATE: auto-trading disabled until Stage 2D acceptance.
-          # Do not flip to "true" without a completed pre-live audit.
-          AUTO_TRADING_ENABLED: "false"
+          # Stage 6B: explicit trading mode — MANDATORY since Stage 5A
+          # (src/runtime_config.py fails closed on missing/blank mode).
+          # PAPER only here; LIVE requires a separate deliberate change.
+          # Stage 6C: TRADING_MODE is hard-coded "PAPER" even when the
+          # paper_smoke_test input is true — the input can NEVER enable LIVE.
+          TRADING_MODE: "PAPER"
+          # LIVE SAFETY GATE: auto-trading stays disabled for every normal
+          # run (schedule/push/dispatch without the flag). It becomes "true"
+          # ONLY on an explicit manual workflow_dispatch with
+          # paper_smoke_test=true, and even then execution goes through
+          # PaperExecutionAdapter because TRADING_MODE above is "PAPER".
+          AUTO_TRADING_ENABLED: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.paper_smoke_test && 'true' || 'false' }}
           TELEGRAM_ENABLED: "false"
           STATE_FILE: ${{ github.workspace }}/runtime/state.json
           TRADES_FILE: ${{ github.workspace }}/runtime/trades.csv
           LOG_DIR: ${{ github.workspace }}/runtime/logs
         run: |
           mkdir -p runtime/logs
+          # Safe config echo only — never print T_SANDAPI or any secret value.
+          echo "TRADING_MODE=${TRADING_MODE}"
+          echo "PAPER_SMOKE_TEST=${{ github.event_name == 'workflow_dispatch' && github.event.inputs.paper_smoke_test || false }}"
+          echo "AUTO_TRADING_ENABLED=${AUTO_TRADING_ENABLED}"
           python -m src.main
 
       - name: Show run log
