@@ -785,3 +785,151 @@ def test_m_full_lifecycle_enter_hold_exit_flat(state_env, market):
     # Monotonic sanity только как наблюдение, НЕ "cash == seed":
     # полная модель возврата ГО после SELL — отдельная будущая задача.
     assert broker.cash >= cash_after_buy
+
+
+# ══════════════════════════════════════════════════════════════════════
+# N — DETERMINISTIC PAPER RESTART / RECONCILE с открытой позицией
+#
+#   Runtime #1 → ENTER_LONG xN → state LONG xN → "restart" (brand-new
+#   C5Runtime + brand-new PaperExecutionAdapter; NOTHING carried in
+#   memory) → production reconcile()/bootstrap() восстанавливает позицию
+#   → следующий run_cycle() Runtime #2 продолжает работать с ней (HOLD),
+#   повторного BUY нет.
+#
+#   Фактический call chain position-restore (production, не подменён):
+#     run_cycle() → load_state()            (state file: idempotency keys,
+#                                            c5_position_qty/direction,
+#                                            c5_entry_price — persistence)
+#              → bootstrap(state)
+#                  → adapter.find_account()
+#                  → reconcile(adapter, account_id, state)
+#                      → snapshot = adapter.snapshot(account_id)
+#                        (PAPER: SimulatedBroker.position_qty/entry_price)
+#                      → broker_qty != stored_qty ⇒ adopt BROKER into state
+#                      → equity<=0 ⇒ ReconcileError (fail closed)
+#              → _position_from_snapshot(snapshot)  ← runtime читает
+#                позицию ИЗ SNAPSHOT, а не из state (snapshot = source of
+#                truth для live position; state = persistence/idempotency).
+#
+#   Restart в реальном процессе пересоздаёт SimulatedBroker заново через
+#   production factory `_build_paper_broker(read_adapter)` (execution_
+#   adapter.py:433) из read-only account snapshot. Здесь тот же factory
+#   вызывается НАПРЯМУЮ; единственный fake — external read boundary
+#   `read_adapter` (find_account/snapshot только), который возвращает
+#   сериализованное состояние брокера Phase 1 — ровно то, что реальный
+#   read API вернул бы после перезапуска процесса. run_cycle(),
+#   _evaluate_entry(), _evaluate_exit(), reconcile(), c5_core, sizing,
+#   guards, SimulatedBroker — реальные production-объекты.
+#
+#   Known gap (фиксируется, НЕ чинится в этом тесте): при restart
+#   `margin_locked_per_contract` НЕ входит ни в read snapshot, ни в state
+#   file ⇒ он сбрасывается в 0.0 и последующий EXIT освобождает ГО=0
+#   (broker fail-safe: не печатать свободные деньги из ниоткуда). Полная
+#   broker accounting модель — отдельная будущая задача; ассерт
+#   "cash == seed" здесь отсутствует намеренно.
+# ══════════════════════════════════════════════════════════════════════
+def test_n_paper_restart_reconcile_preserves_open_position(state_env, market):
+    from src.execution_adapter import (SimulatedBroker, PaperExecutionAdapter,
+                                       _build_paper_broker)
+
+    SEED_CASH = 2_000_000.0
+    SEED_EQUITY = 2_000_000.0
+
+    # ── PHASE 1 — RUNTIME #1: ENTER_LONG xN ───────────────────────────
+    broker1 = SimulatedBroker(cash=SEED_CASH, equity=SEED_EQUITY)
+    rt1, adapter1 = make_runtime(market, broker1)
+
+    C16 = candle_5m(CONTROL_DAY, 16, 0, LONG_BREAK)
+    set_candles(market, C16)
+
+    d1 = rt1.run_cycle()
+    assert d1.action == "ENTER_LONG"
+    QTY = d1.qty
+    assert QTY > 0                                   # qty=4 @ fixture math
+    assert broker1.position_qty == QTY
+    st_mid = read_state(state_env)
+    assert st_mid["c5_position_direction"] == "LONG"
+    assert st_mid["c5_position_qty"] == QTY
+    ENTRY_PRICE = st_mid["c5_entry_price"]           # persisted by runtime
+    assert len(buy_orders(adapter1)) == 1            # BUY order exists
+    cash_after_entry = broker1.cash
+    assert cash_after_entry < SEED_CASH              # ГО заблокирован
+
+    # ── PHASE 2 — SIMULATED PROCESS RESTART ───────────────────────────
+    # Runtime #1, adapter #1, broker #1 больше НЕ используются. Снимок
+    # внешнего состояния (брокерский счёт + state file) сохраняется —
+    # как при реальной перезапуске процесса.
+    persisted_state_file = (state_env / "state.json").read_text()
+    assert json.loads(persisted_state_file)["c5_position_qty"] == QTY
+
+    class ReadOnlyAccountApi:
+        """Fake ТОЛЬКО external read boundary (find_account/snapshot).
+        Физически не имеет post_order — как production read_adapter."""
+
+        def __init__(self, snap):
+            self._snap = snap
+
+        def find_account(self):
+            return "paper-restart-account"
+
+        def snapshot(self, account_id):
+            from src.execution_adapter import AccountSnapshot
+            return AccountSnapshot(
+                account_id=account_id,
+                equity_rub=self._snap.equity,
+                free_cash_rub=self._snap.cash,
+                position_qty=self._snap.position_qty,
+                entry_price=self._snap.entry_price or None,
+                tmon_qty=self._snap.tmon_qty,
+                open_orders=0,
+            )
+
+    # Production PAPER bootstrap path: brand-new SimulatedBroker seeded
+    # via _build_paper_broker from the read-only account snapshot.
+    broker2 = _build_paper_broker(ReadOnlyAccountApi(broker1))
+    assert broker2 is not broker1                    # fresh process memory
+    adapter2 = PaperExecutionAdapter(broker2)        # fresh orders ledger
+    assert adapter2.orders == []
+
+    # Brand-new C5Runtime — ничего не переносится в памяти; state file
+    # остаётся ТЕМ ЖЕ (тот же C5_STATE_FILE из fixtures state_env).
+    rt2, _ = make_runtime(market, broker2)
+    rt2.adapter = adapter2                           # fresh adapter instance
+    rt2.trader = adapter2
+
+    # ── PHASE 3 — RECONCILE (production bootstrap внутри run_cycle) ──
+    # Новая закрытая 5m свеча появляется ПОСЛЕ restart (16:05→closed
+    # 16:10) с NEUTRAL close ≥ Lower(5)=1400 ⇒ HOLD-условие.
+    C1605 = candle_5m(CONTROL_DAY, 16, 5, NEUTRAL)
+    set_candles(market, C16, C1605)
+    market.holder["now"] = utc_ms(CONTROL_DAY, 16, 10)
+
+    d2 = rt2.run_cycle()                             # real reconcile inside
+
+    # Позиция восстановлена: source of truth — broker snapshot, adopted
+    # reconcile() в state; direction/entry_price сохранены production.
+    assert broker2.position_qty == QTY               # qty_from_phase_1
+    st2 = read_state(state_env)
+    assert st2["c5_position_qty"] == QTY
+    assert st2["c5_position_direction"] == "LONG"
+    assert st2["reconcile_status"] == "OK"
+    # entry_price хранится production state ⇒ переживает restart:
+    assert st2["c5_entry_price"] == ENTRY_PRICE
+    # ...и seed-брокер получает его из read snapshot (_build_paper_broker):
+    assert broker2.entry_price == pytest.approx(ENTRY_PRICE)
+    # Повторного BUY из-за restart НЕТ (orders нового рантайма пусты):
+    assert adapter2.orders == []
+    assert buy_orders(adapter2) == []
+    assert sell_orders(adapter2) == []
+    # Оригинальный BUY остался ровно один в истории Phase 1:
+    assert len(buy_orders(adapter1)) == 1
+
+    # ── PHASE 4 — ПРОДОЛЖЕНИЕ РАБОТЫ: HOLD без новых ордеров ─────────
+    assert d2.action == "HOLD"                       # production continue
+    assert d2.reason == "HOLD_POSITION"              # фактический production reason
+    assert broker2.position_qty == QTY               # позиция прежняя
+    st3 = read_state(state_env)
+    assert st3["c5_position_direction"] == "LONG"
+    assert st3["c5_position_qty"] == QTY
+    assert len(adapter2.orders) == 0                 # новых orders нет
+    assert broker2.cash == cash_after_entry          # accounting не тронут
