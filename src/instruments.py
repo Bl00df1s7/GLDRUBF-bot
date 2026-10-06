@@ -3,11 +3,12 @@
 from decimal import Decimal, ROUND_HALF_UP
 
 try:
-    from t_tech.invest import CandleInterval
+    from t_tech.invest import CandleInterval, InstrumentIdType
     T_TECH_AVAILABLE = True
 except ImportError:
     T_TECH_AVAILABLE = False
     CandleInterval = None
+    InstrumentIdType = None
 
 from src.client_factory import get_client
 
@@ -51,7 +52,12 @@ def get_c5_instrument(token: str):
         raise RuntimeError("t_tech.invest module not available. Install with: pip install t-tech")
 
     with get_client(token) as client:
+        # SDK 1.51.0 contract: FutureBy(id_type, class_code, id). The server
+        # rejects requests without id_type with INVALID_ARGUMENT 30006
+        # "Missing parameter: id_type". We look the instrument up by ticker
+        # (CNYRUBF), so INSTRUMENT_ID_TYPE_TICKER is required.
         response = client.instruments.future_by(
+            id_type=InstrumentIdType.INSTRUMENT_ID_TYPE_TICKER,
             class_code=C5_CLASS_CODE, id=C5_TARGET_TICKER,
         )
     instrument = getattr(response, "instrument", None) or response
