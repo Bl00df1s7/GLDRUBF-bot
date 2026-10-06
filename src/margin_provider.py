@@ -19,6 +19,7 @@ from typing import Optional
 
 from config.settings import C5_MARGIN_RATE_CHANGE_EPS
 from src.client_factory import get_client
+from src.instruments import InstrumentIdType
 from src.market_data import quotation_to_float
 
 logger = logging.getLogger("golden_bot.margin")
@@ -63,11 +64,18 @@ def fetch_margin_rates(token: str, instrument_id: str) -> MarginRates:
         with get_client(token) as client:
             # get_future(CNYRUBF_SPBFUT, responseView=FULL). The installed
             # t-tech-investments SDK exposes this as instruments.future_by(
-            # class_code="SPBFUT", id="CNYRUBF"); the dataclass field names
-            # are snake_case (dlong_client / dshort_client) and carry the
-            # live per-contract ГО in RUB — the direct equivalent of the
-            # REST responseView=FULL payload. No other source is permitted.
+            # id_type=TICKER, class_code="SPBFUT", id="CNYRUBF"); the dataclass
+            # field names are snake_case (dlong_client / dshort_client) and
+            # carry the live per-contract ГО in RUB — the direct equivalent of
+            # the REST responseView=FULL payload. No other source is permitted.
+            #
+            # SDK 1.51.0 contract: FutureBy requires id_type; without it the
+            # server rejects the request with INVALID_ARGUMENT 30006
+            # "Missing parameter: id_type". We look the instrument up by
+            # ticker (CNYRUBF), so INSTRUMENT_ID_TYPE_TICKER is required
+            # (same shape as src.instruments.get_c5_instrument).
             response = client.instruments.future_by(
+                id_type=InstrumentIdType.INSTRUMENT_ID_TYPE_TICKER,
                 class_code="SPBFUT",
                 id=instrument_id,
             )

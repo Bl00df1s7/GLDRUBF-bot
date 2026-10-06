@@ -966,14 +966,18 @@ def test_instruments_module_has_no_gldrubf_semantic_names():
 
 def test_margin_provider_uses_future_by_full_equivalent(env, monkeypatch):
     """Real fetch_margin_rates against a fake SDK client: asserts the
-    dlongClient/dshortClient extraction and hard failure without fallback."""
+    dlongClient/dshortClient extraction and hard failure without fallback.
+
+    Also asserts the mandatory id_type=TICKER is passed (SDK 1.51.0:
+    FutureBy without id_type fails with INVALID_ARGUMENT 30006)."""
     import src.margin_provider as mp
+    from t_tech.invest import InstrumentIdType
 
     captured = {}
 
     class Instruments:
-        def future_by(self, *, class_code, id):
-            captured["call"] = (class_code, id)
+        def future_by(self, *, id_type, class_code, id):
+            captured["call"] = (id_type, class_code, id)
             return SimpleNamespace(instrument=SimpleNamespace(
                 dlong_client=0.0585, dshort_client=0.0576))
 
@@ -986,7 +990,8 @@ def test_margin_provider_uses_future_by_full_equivalent(env, monkeypatch):
 
     monkeypatch.setattr(mp, "get_client", fake_get_client)
     rates = mp.fetch_margin_rates("tok", "CNYRUBF")
-    assert captured["call"] == ("SPBFUT", "CNYRUBF")
+    assert captured["call"] == (
+        InstrumentIdType.INSTRUMENT_ID_TYPE_TICKER, "SPBFUT", "CNYRUBF")
     assert rates.for_direction("LONG") == 0.0585
     assert rates.for_direction("SHORT") == 0.0576
 
