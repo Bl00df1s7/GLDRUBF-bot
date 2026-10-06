@@ -56,13 +56,16 @@ already faked by the Stage 5B integration tests (tests/
 test_stage5b_paper_runtime.py):
 
   * --diag-market  src.c5_runtime.load_candles   → deterministic fixture
-                   (daily channel ≈ 1400 + closed 16:00 MSK 5m candle at
-                   1420 = a valid Upper(10) breakout) and
+                   in the REALISTIC CNYRUBF price range (daily channel
+                   ≈ 12.70 + closed 16:00 MSK 5m candle at 12.72 = a
+                   valid Upper(10) breakout) and
                    src.c5_runtime.fetch_order_book → tight book around
-                   mid 1400 (passes the frozen slippage guard).
-  * --diag-margin  injects a boundary fake margin_tracker via the
-                   EXISTING C5Runtime ctor DI hook (same seam Stage 5B
-                   uses) with rates dlong=0.0585 / dshort=0.0576.
+                   mid 12.70 (passes the frozen slippage guard).
+  * --diag-margin  uses the REAL production MarginTracker — live ГО via
+                   read-only FutureBy (dlongClient/dshortClient), NO
+                   hardcoded rates, NO separate diagnostic tracker class.
+                   Fail closed on API errors exactly like production
+                   (MARGIN_API_UNAVAILABLE ⇒ NO_ENTRY).
   * --diag-broker  builds the REAL production paper stack locally:
                    LiveExecutionAdapter used EXCLUSIVELY through its two
                    read-only methods (find_account/snapshot) seeds
@@ -85,9 +88,16 @@ Reproducible command (execution proof):
         --clock-epoch "2026-10-02T16:05:00+03:00" \
         --fresh-state --diag-market --diag-margin --diag-broker
 
-Expected end state: action=ENTER_LONG qty=2, order log contains
-PAPER_FILL CNYRUBF BUY x2, broker.position_qty=2, state file shows
-c5_position_qty=2 / LONG.
+Margin units contract (frozen, pinned by the Stage 2D K-tests):
+FutureBy dlongClient/dshortClient → MarginRates.long_margin_rub /
+.short_margin_rub → c5_runtime._to_decimal band (0, 0.5) →
+c5_core.margin_per_contract = price × contract_size × rate.
+The values are dimensionless per-contract ГО coefficients, NOT RUB sums.
+
+Expected end state: action=ENTER_LONG with qty > 0 (sizing reaches the
+stage cap whenever the real account can fund it), order log contains
+PAPER_FILL CNYRUBF BUY, broker.position_qty > 0, state file shows
+c5_position_qty > 0 / LONG.
 """
 from __future__ import annotations
 
@@ -113,6 +123,13 @@ def parse_clock_epoch(value: str) -> datetime:
     offset (so 16:01 MSK == '2026-10-02T16:01:00+03:00').
     """
     v = value.strip()
+    # Defensive: a value forwarded through env/CI (e.g. DIAG_ARGS written
+    # into $GITHUB_OUTPUT with embedded quotes) may arrive double-quoted,
+    # e.g. '"2026-10-02T16:05:00+03:00"'. Strip one layer of matching
+    # surrounding quotes before parsing — fail-closed behaviour for real
+    # garbage is unchanged (ValueError still propagates).
+    if len(v) >= 2 and v[0] == v[-1] and v[0] in ("'", '"'):
+        v = v[1:-1].strip()
     try:
         return datetime.fromtimestamp(float(v), tz=timezone.utc)
     except ValueError:
@@ -148,17 +165,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--diag-market", action="store_true",
         help="Diagnostic execution-proof boundary fake: patch "
-             "src.c5_runtime.load_candles (deterministic fixture: daily "
-             "channel ~1400 + closed 16:00 MSK 5m candle at 1420 = valid "
-             "Upper(10) breakout) and src.c5_runtime.fetch_order_book (tight "
-             "book around mid 1400). c5_core / sizing / guards stay REAL. "
+             "src.c5_runtime.load_candles (deterministic fixture in the "
+             "realistic CNYRUBF range: daily channel ~12.70 + closed "
+             "16:00 MSK 5m candle at 12.72 = valid Upper(10) breakout) and "
+             "src.c5_runtime.fetch_order_book (tight book around mid "
+             f"{DIAG_PRICE}). c5_core / sizing / guards stay REAL. "
              "Must be combined with --diag-margin and --diag-broker.")
     p.add_argument(
         "--diag-margin", action="store_true",
-        help="Diagnostic execution-proof boundary fake: inject a fake "
-             "margin_tracker (dlong=0.0585 / dshort=0.0576, Stage 5B values) "
-             "through the EXISTING C5Runtime ctor DI hook instead of the live "
-             "ГО API. Must be combined with --diag-market and --diag-broker.")
+        help="Diagnostic execution-proof flag: keep the REAL production "
+             "MarginTracker (live ГО via read-only FutureBy "
+             "dlongClient/dshortClient). NO hardcoded rates, NO diagnostic "
+             "tracker class; fail-closed on API errors exactly like "
+             "production. Must be combined with --diag-market and "
+             "--diag-broker.")
     p.add_argument(
         "--diag-broker", action="store_true",
         help="Diagnostic execution-proof seed: build the REAL production "
@@ -176,25 +196,41 @@ def build_parser() -> argparse.ArgumentParser:
 # Nothing inside c5_runtime / c5_core / protection / cash_manager /
 # execution_adapter / SimulatedBroker is mocked or modified.
 # ══════════════════════════════════════════════════════════════════════
+# Deterministic DIAGNOSTIC market fixture ONLY — pinned to the realistic
+# CNYRUBF price range (~12.x RUB/CNY), never referenced by production code.
 DIAG_REF_DATE = dt.date(2026, 9, 30)      # last closed daily bar in fixture
-DIAG_PRICE = 1400.0                       # daily channel Upper(10)=Lower(10)
-DIAG_LONG_BREAK = 1420.0                  # > Upper(10) → ENTER_LONG signal
+DIAG_PRICE = 12.70                        # daily high / book mid (~12.x)
+DIAG_LONG_BREAK = 12.72                   # > Upper(10) → ENTER_LONG signal
+# Daily bars H = DIAG_PRICE, L = C = DIAG_PRICE - 2*HL:
+#   * Donchian Upper(10) = 12.70 < 12.72 (LONG breakout guaranteed),
+#     Lower(10) = 12.5437 (no contradictory SHORT break);
+#   * Wilder TR per bar = max(H-L, |H-prev_close|, |L-prev_close|) = 2*HL
+#     with the frozen prev_close=(H+L+C)/3 convention → ATR14 = 2*HL
+#     exactly; HL is pinned so ATR14 == C5_ATR_TARGET (0.1563) → risk
+#     multiplier 1.0 (same shape as the Stage 5B fixture).
 DIAG_DAILY_HL = 0.07815                   # half-range → ATR14 == 0.1563
-DIAG_MARGIN_LONG = 0.0585                 # Stage 5B frozen fixture rates
-DIAG_MARGIN_SHORT = 0.0576
+DIAG_BOOK_HALF_SPREAD = 0.005             # tight bid/ask around mid 12.70
+# NOTE: there are deliberately NO diagnostic margin constants here.  ГО is
+# ALWAYS the live value from FutureBy (dlongClient/dshortClient) through the
+# real production MarginTracker — hardcoding rates is forbidden
+# (see src/margin_provider.py module docstring).
 
 
 def diag_daily_df(n=60):
-    """Deterministic OHLC: H=1400+HL, L=1400-HL, C=1400 (Stage 5B shape)."""
+    """Deterministic OHLC: H=DIAG_PRICE, L=C=DIAG_PRICE-2*HL (Stage 5B shape).
+
+    Scaled into the realistic CNYRUBF range.  Upper(10) = DIAG_PRICE
+    (12.70), Lower(10) = DIAG_PRICE - 2*HL (12.5437); Wilder TR = 2*HL
+    per bar → ATR14 == 0.1563 == C5_ATR_TARGET → risk multiplier 1.0."""
     import pandas as pd
     rows = []
     d = DIAG_REF_DATE - dt.timedelta(days=n - 1)
     for _ in range(n):
         ts = pd.Timestamp(d.isoformat(), tz="UTC")
         rows.append({"time": ts, "open": DIAG_PRICE,
-                     "high": DIAG_PRICE + DIAG_DAILY_HL,
-                     "low": DIAG_PRICE - DIAG_DAILY_HL,
-                     "close": DIAG_PRICE, "volume": 1})
+                     "high": DIAG_PRICE,
+                     "low": DIAG_PRICE - 2 * DIAG_DAILY_HL,
+                     "close": DIAG_PRICE - 2 * DIAG_DAILY_HL, "volume": 1})
         d += dt.timedelta(days=1)
     return pd.DataFrame(rows)
 
@@ -210,9 +246,10 @@ def diag_control_candle(now_msk):
                  - dt.timedelta(minutes=5))
     else:
         start = now_msk.replace(minute=m, second=0, microsecond=0)
+    tick = 0.005                          # realistic CNYRUBF 5m wick size
     return {"time": pd.Timestamp(start.astimezone(timezone.utc)),
-            "open": DIAG_LONG_BREAK, "high": DIAG_LONG_BREAK + 0.5,
-            "low": DIAG_LONG_BREAK - 0.5, "close": DIAG_LONG_BREAK,
+            "open": DIAG_LONG_BREAK, "high": DIAG_LONG_BREAK + tick,
+            "low": DIAG_LONG_BREAK - tick, "close": DIAG_LONG_BREAK,
             "volume": 1}
 
 
@@ -240,28 +277,12 @@ def install_diag_market(rt_mod, cycle_now_fn=None):
         raise AssertionError(f"C5 runtime must not request {timeframe!r}")
 
     rt_mod.load_candles = _load
-    # Tight book around mid 1400 (same shape as the Stage 5B fixture):
-    # spread 0.1 RUB ≈ 0.007% < frozen slippage limit 0.10%.
+    # Tight book around the realistic mid 12.70 (same SHAPE as the Stage 5B
+    # fixture): spread 0.01 RUB ≈ 0.079% < frozen slippage limit 0.10%.
     rt_mod.fetch_order_book = lambda *a, **k: (
-        [(DIAG_PRICE - 0.05, 100)], [(DIAG_PRICE + 0.05, 100)])
+        [(DIAG_PRICE - DIAG_BOOK_HALF_SPREAD, 100)],
+        [(DIAG_PRICE + DIAG_BOOK_HALF_SPREAD, 100)])
     return row
-
-
-class DiagMarginTracker:
-    """Boundary fake for the ГО API only — same duck-type contract the
-    Stage 5B FakeMarginTracker uses (refresh()/current)."""
-
-    def __init__(self):
-        self.current = None
-        self.refresh_calls = 0
-
-    def refresh(self):
-        from src.margin_provider import MarginRates
-        self.refresh_calls += 1
-        self.current = MarginRates(long_margin_rub=DIAG_MARGIN_LONG,
-                                   short_margin_rub=DIAG_MARGIN_SHORT,
-                                   instrument="CNYRUBF")
-        return self.current
 
 
 def build_diag_instrument(token):
@@ -346,8 +367,9 @@ def main(argv=None) -> int:
     diag_flags = (args.diag_market, args.diag_margin, args.diag_broker)
     if any(diag_flags) and not all(diag_flags):
         # The three diagnostics form ONE coherent synthetic market scenario
-        # (fixture candles @1400/1420 <-> fixture ГО <-> seeded broker).
-        # Half-synthetic runs would silently mix real and fake market data.
+        # (fixture candles @12.70/12.72 <-> live ГО from FutureBy <->
+        # seeded broker).  Half-synthetic runs would silently mix real and
+        # fake market data.
         print("FAIL CLOSED: --diag-market, --diag-margin and --diag-broker "
               "must be used together", file=sys.stderr)
         return 1
@@ -381,15 +403,20 @@ def main(argv=None) -> int:
     diag_on = bool(diag_flags[0])           # all-or-nothing (validated above)
     diag_candle = None
     if diag_on:
-        # Boundary fakes ONLY — production trading logic stays untouched.
+        # Boundary fake ONLY for market data — production trading logic and
+        # the production ГО path stay untouched.
         diag_candle = install_diag_market(rt_mod, now_fn)
         print("[smoke] DIAGNOSTIC market fake installed: "
               "src.c5_runtime.load_candles + fetch_order_book patched "
-              "(daily channel ~1400, closed 5m control candle close="
-              f"{DIAG_LONG_BREAK}, tight book around mid {DIAG_PRICE})")
-        runtime_kwargs["margin_tracker"] = DiagMarginTracker()
-        print(f"[smoke] DIAGNOSTIC margin fake injected via ctor DI: "
-              f"dlong={DIAG_MARGIN_LONG} dshort={DIAG_MARGIN_SHORT}")
+              f"(daily channel ~{DIAG_PRICE}, closed 5m control candle "
+              f"close={DIAG_LONG_BREAK}, tight book around mid "
+              f"{DIAG_PRICE})")
+        # --diag-margin: NO tracker injection — C5Runtime builds the REAL
+        # production MarginTracker (live ГО via read-only FutureBy,
+        # fail-closed on API errors).  Hardcoded rates are forbidden.
+        print("[smoke] DIAGNOSTIC margin: REAL production MarginTracker "
+              "(live ГО via read-only FutureBy dlongClient/"
+              "dshortClient) — no hardcoded rates, no fake tracker")
 
     from src.c5_runtime import C5Runtime
     runtime = C5Runtime(token, **runtime_kwargs)
@@ -423,6 +450,12 @@ def main(argv=None) -> int:
           f"qty={decision.qty}\nreason={decision.reason}")
 
     if diag_on:
+        rates = runtime.margin_tracker.current
+        if rates is not None:
+            print(f"[diag] live ГО from FutureBy (read-only): "
+                  f"dlong={rates.long_margin_rub} "
+                  f"dshort={rates.short_margin_rub} "
+                  f"instrument={rates.instrument}")
         if decision.action in ("ENTER_LONG", "ENTER_SHORT", "EXIT"):
             print(f"[diag] ORDER_SUBMIT(PAPER): "
                   f"{'BUY' if decision.action == 'ENTER_LONG' else 'SELL'} "
