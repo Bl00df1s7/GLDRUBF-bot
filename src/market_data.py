@@ -101,7 +101,23 @@ def load_candles(
 
     rows = []
     current = start_date
-    chunk = timedelta(days=90)
+    # Max request period per interval allowed by MarketData.GetCandles
+    # (INVALID_ARGUMENT 30014 "maximum request period ... exceeded" when a
+    # single from/to span goes beyond these bounds):
+    #   1m/5m/15m — 1 day, 30m/1h — 7 days, 2h — 14 days, 4h — 28 days,
+    #   day — 365 days.
+    # Chunk the request accordingly; the total history returned is unchanged.
+    max_period_days_map = {
+        "1m": 1,
+        "5m": 1,
+        "15m": 1,
+        "30m": 7,
+        "1H": 7,
+        "2H": 14,
+        "4H": 28,
+        "1d": 365,
+    }
+    chunk = timedelta(days=max_period_days_map.get(timeframe, 90))
 
     # Map timeframe string to CandleInterval (T-Invest API).
     # NOTE: deliberately NO silent fallback to another interval — an
