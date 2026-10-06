@@ -236,8 +236,17 @@ def test_a_paper_entry_executes_locally_once(state_env, market):
     assert d.action == "ENTER_LONG"
     assert d.qty == 2                      # frozen C5 sizing @ equity 1M
     assert broker.position_qty == 2
-    assert adapter.orders == [{"instrument": "CNYRUBF", "side": "BUY",
-                               "qty": 2}]
+    # Current SimulatedBroker order contract (post accounting fix): a
+    # futures BUY carries the runtime-computed ГО metadata —
+    # ``margin_per_contract`` (rate × price × size, fail-closed without
+    # it) and ``entry_price`` (execution-guard expected price).
+    assert len(adapter.orders) == 1
+    order = adapter.orders[0]
+    assert order["instrument"] == "CNYRUBF"
+    assert order["side"] == "BUY"
+    assert order["qty"] == 2
+    assert order["margin_per_contract"] == pytest.approx(83070.0)   # 1420×1000×0.0585
+    assert order["entry_price"] == pytest.approx(1400.05)           # guard ask estimate
     st = read_state(state_env)
     assert st["c5_position_direction"] == "LONG"
     assert st["last_c5_entry_control_timestamp"] == C16["time"].isoformat()
@@ -661,3 +670,118 @@ def test_l_daily_loss_blocks_entry_but_never_exit(state_env, market):
     d_exit = rt.run_cycle()
     assert d_exit.action == "EXIT"           # risk-reducing trade allowed
     assert broker.position_qty == 0
+
+
+# ══════════════════════════════════════════════════════════════════════
+# M — ПОЛНЫЙ DETERMINISTIC LIFECYCLE ENTER → HOLD → EXIT → FLAT
+#     Один экземпляр C5Runtime + один PaperExecutionAdapter/SimulatedBroker,
+#     три последовательных production run_cycle(). Меняются ТОЛЬКО внешние
+#     границы (market fixture / clock); run_cycle(), _evaluate_entry(),
+#     _evaluate_exit(), c5_core, sizing, guards, MarginTracker и
+#     SimulatedBroker — реальные, не подменены.
+#
+#     Fixture math (equity=free_cash=2_000_000, ГО rate 0.0585):
+#       risk_budget = 2M × 0.20 × ~1.0 ≈ 400k
+#       margin_per_contract @ price 1420 = 83 070 → qty_risk = 4
+#       stage_max_qty = 5                    → final qty = 4
+#       M/E = 4×83 070 / 2M ≈ 0.166 < 0.30  → guard passed
+#       required_margin = 4 × 1400×1000×0.0585 = 327 600 ≤ cash 2M
+#       → ensure_cash_for_entry проходит БЕЗ TMON-ликвидации.
+#
+#     Exit channel: все дневные бары H=L=C=1400 ⇒ Lower(5)=Upper(5)=1400.
+#     Реальное production-условие LONG-exit — close < Lower(5), а НЕ
+#     возврат цены внутрь канала (для этого fixture канал вырожден).
+#
+#     Accounting NOTE (по явной договорённости): ассерт
+#     "cash_after_exit == seed_cash" здесь ОТСУТСТВУЕТ намеренно —
+#     полная модель возврата ГО после SELL является отдельной будущей
+#     задачей broker accounting. Здесь проверяются lifecycle позиции и
+#     execution state; направление accounting-изменения cash (BUY ↓,
+#     EXIT ↑) фиксируется как monotonic sanity-check, не как инвариант.
+# ══════════════════════════════════════════════════════════════════════
+def test_m_full_lifecycle_enter_hold_exit_flat(state_env, market):
+    SEED_CASH = 2_000_000.0
+    SEED_EQUITY = 2_000_000.0
+
+    from src.execution_adapter import SimulatedBroker
+    broker = SimulatedBroker(cash=SEED_CASH, equity=SEED_EQUITY)
+
+    # ONE runtime instance and ONE adapter/broker pair for ALL cycles.
+    rt, adapter = make_runtime(market, broker)
+
+    # ── CYCLE 1 — ENTER ───────────────────────────────────────────────
+    # Control point 16:00 MSK passed (fixture now = 16:05); control
+    # candle closes at 1420 > Upper(10)=1400 → LONG breakout; sizing
+    # non-zero; execution guard passes on the fake order book.
+    C16 = candle_5m(CONTROL_DAY, 16, 0, LONG_BREAK)
+    set_candles(market, C16)
+    assert latest_closed(market)["time"] == C16["time"]
+
+    d1 = rt.run_cycle()
+
+    assert d1.action == "ENTER_LONG"
+    assert d1.qty_risk == 4                # 400k / 83 070
+    assert d1.qty > 0                      # stage cap 5 not reached → 4
+    QTY = d1.qty
+    assert len(buy_orders(adapter)) == 1   # ровно один BUY
+    buy = [o for o in adapter.orders if o["side"] == "BUY"][0]
+    assert buy["instrument"] == "CNYRUBF"
+    assert buy["side"] == "BUY"
+    assert buy["qty"] == QTY
+    assert buy["margin_per_contract"] == pytest.approx(83070.0)
+    assert buy["entry_price"] is not None
+    assert broker.position_qty == QTY      # PAPER_FILL applied locally
+    st1 = read_state(state_env)
+    assert st1["c5_position_direction"] == "LONG"
+    assert st1["c5_position_qty"] == QTY
+    assert st1["last_c5_entry_control_timestamp"] == C16["time"].isoformat()
+    cash_after_buy = broker.cash
+    assert cash_after_buy < SEED_CASH      # ГО заблокирован (BUY)
+
+    # ── CYCLE 2 — HOLD ────────────────────────────────────────────────
+    # NEW closed 5m bar (16:05→closed at 16:10) inside the exit channel
+    # (close ≥ Lower(5)=1400) → no EXIT condition; position stays LONG.
+    C1605 = candle_5m(CONTROL_DAY, 16, 5, NEUTRAL)
+    set_candles(market, C16, C1605)
+    market.holder["now"] = utc_ms(CONTROL_DAY, 16, 10)
+    assert latest_closed(market)["time"] == C1605["time"]   # NEW candle ts
+
+    d2 = rt.run_cycle()
+
+    assert d2.action == "HOLD"
+    assert broker.position_qty == QTY      # позиция сохранена
+    st2 = read_state(state_env)
+    assert st2["c5_position_direction"] == "LONG"
+    assert st2["c5_position_qty"] == QTY
+    assert len(adapter.orders) == 1        # новых BUY/SELL нет
+    assert len(buy_orders(adapter)) == 1
+    assert len(sell_orders(adapter)) == 0
+    assert broker.cash == cash_after_buy   # accounting не тронут на HOLD
+
+    # ── CYCLE 3 — EXIT ────────────────────────────────────────────────
+    # Реальное production-условие LONG-exit: close < Lower(5)=1400.
+    C1610 = candle_5m(CONTROL_DAY, 16, 10, SHORT_BREAK)
+    set_candles(market, C16, C1605, C1610)
+    market.holder["now"] = utc_ms(CONTROL_DAY, 16, 15)
+    assert latest_closed(market)["time"] == C1610["time"]   # NEW candle ts
+
+    d3 = rt.run_cycle()
+
+    # Фактическое production action name: "EXIT" (reason "EXIT_LONG").
+    assert d3.action == "EXIT"
+    assert d3.reason == "EXIT_LONG"
+    assert len(sell_orders(adapter)) == 1  # PaperExecutionAdapter.sell_cny
+    sell = sell_orders(adapter)[0]
+    assert sell["instrument"] == "CNYRUBF"
+    assert sell["side"] == "SELL"
+    assert sell["qty"] == QTY              # полный выход
+    assert len(adapter.orders) == 2        # BUY + SELL
+    assert broker.position_qty == 0        # flat в брокере
+    st3 = read_state(state_env)
+    assert st3["c5_position_qty"] == 0
+    assert st3["c5_position_direction"] is None          # flat по модели state
+    assert st3["c5_entry_price"] is None
+    assert st3["last_action"] == "EXIT_LONG"
+    # Monotonic sanity только как наблюдение, НЕ "cash == seed":
+    # полная модель возврата ГО после SELL — отдельная будущая задача.
+    assert broker.cash >= cash_after_buy
