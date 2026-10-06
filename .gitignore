@@ -1,1 +1,7 @@
-(empty)
+# Compiled Python bytecode
+__pycache__/
+*.pyc
+
+# Environment and config secrets
+.env
+.env.*
