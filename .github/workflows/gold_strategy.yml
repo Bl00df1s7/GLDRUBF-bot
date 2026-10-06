@@ -154,7 +154,12 @@ jobs:
             # 16:05 MSK control point + throwaway state file (same command
             # as documented in scripts/paper_smoke_test.py). The state file
             # is a temp path that does NOT touch the cached runtime state.
-            diag_args="--clock-epoch \"2026-10-02T16:05:00+03:00\" --fresh-state --diag-market --diag-margin --diag-broker"
+            # NOTE: no embedded quotes here — DIAG_ARGS is expanded
+            # unquoted below (intentional word-splitting), so literal
+            # quotes would end up INSIDE the argv value and break
+            # datetime.fromisoformat(). The ISO string has no spaces,
+            # so bare word-splitting is safe.
+            diag_args="--clock-epoch 2026-10-02T16:05:00+03:00 --fresh-state --diag-market --diag-margin --diag-broker"
           fi
           echo "diag_args=${diag_args}" >> "$GITHUB_OUTPUT"
 

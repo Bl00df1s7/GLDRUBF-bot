@@ -113,6 +113,13 @@ def parse_clock_epoch(value: str) -> datetime:
     offset (so 16:01 MSK == '2026-10-02T16:01:00+03:00').
     """
     v = value.strip()
+    # Defensive: a value forwarded through env/CI (e.g. DIAG_ARGS written
+    # into $GITHUB_OUTPUT with embedded quotes) may arrive double-quoted,
+    # e.g. '"2026-10-02T16:05:00+03:00"'. Strip one layer of matching
+    # surrounding quotes before parsing — fail-closed behaviour for real
+    # garbage is unchanged (ValueError still propagates).
+    if len(v) >= 2 and v[0] == v[-1] and v[0] in ("'", '"'):
+        v = v[1:-1].strip()
     try:
         return datetime.fromtimestamp(float(v), tz=timezone.utc)
     except ValueError:
