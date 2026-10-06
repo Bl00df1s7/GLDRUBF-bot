@@ -9,6 +9,13 @@ on:
   # Stage 6C: ручной запуск PAPER smoke-теста.
   # paper_smoke_test=false (по умолчанию) — обычный dry-run, ордера НЕ отправляются.
   # paper_smoke_test=true — полный PAPER прогон с AUTO_TRADING_ENABLED=true.
+  # Stage 6D: execution-proof диагностика (scripts/paper_smoke_test.py):
+  # diag_market / diag_margin / diag_broker добавляют флаги
+  # --diag-market / --diag-margin / --diag-broker к команде прогона.
+  # Флаги образуют ОДИН синтетический сценарий, поэтому работают только
+  # все вместе: partial selection = fail closed (guard внутри скрипта +
+  # проверка шага "Resolve run mode inputs" ниже). По умолчанию все три
+  # выключены → обычное поведение не меняется.
   # LIVE здесь недоступен: TRADING_MODE жёстко зафиксирован в "PAPER".
   workflow_dispatch:
     inputs:
@@ -16,6 +23,33 @@ on:
         description: >-
           Run a full PAPER smoke test with AUTO_TRADING_ENABLED=true
           (simulated orders only; LIVE is never allowed in this workflow).
+        type: boolean
+        default: false
+      diag_market:
+        description: >-
+          DIAGNOSTIC ONLY (requires paper_smoke_test=true): pass
+          --diag-market to scripts/paper_smoke_test.py — deterministic
+          fixture candles + tight order book at the network boundary.
+          Must be combined with diag_margin AND diag_broker (all-or-nothing;
+          partial selection fails closed). c5_core / sizing / guards stay REAL.
+        type: boolean
+        default: false
+      diag_margin:
+        description: >-
+          DIAGNOSTIC ONLY (requires paper_smoke_test=true): pass
+          --diag-margin — fake ГО/margin tracker injected via the existing
+          C5Runtime ctor DI hook (Stage 5B rates). Must be combined with
+          diag_market AND diag_broker (all-or-nothing; partial selection
+          fails closed).
+        type: boolean
+        default: false
+      diag_broker:
+        description: >-
+          DIAGNOSTIC ONLY (requires paper_smoke_test=true): pass
+          --diag-broker — seed the REAL PaperExecutionAdapter +
+          SimulatedBroker from a real read-only account snapshot. Must be
+          combined with diag_market AND diag_margin (all-or-nothing; partial
+          selection fails closed). LIVE execution is never affected.
         type: boolean
         default: false
 
@@ -66,10 +100,15 @@ jobs:
 
       # Stage 6C: карта входов workflow_dispatch -> env-флаги. Только PAPER;
       # LIVE не может быть выбран никогда (нет соответствующего входа).
+      # Stage 6D: плюс all-or-nothing guard для диагностических входов
+      # diag_market / diag_margin / diag_broker (см. scripts/paper_smoke_test.py).
       - name: Resolve run mode inputs
         id: run_mode
         env:
           PAPER_SMOKE_TEST: ${{ github.event.inputs.paper_smoke_test }}
+          DIAG_MARKET: ${{ github.event.inputs.diag_market }}
+          DIAG_MARGIN: ${{ github.event.inputs.diag_margin }}
+          DIAG_BROKER: ${{ github.event.inputs.diag_broker }}
         run: |
           raw="${PAPER_SMOKE_TEST:-false}"
           case "$raw" in
@@ -77,9 +116,52 @@ jobs:
             false|""|*)     auto="false" ;;
           esac
           echo "auto_trading_enabled=${auto}" >> "$GITHUB_OUTPUT"
+
+          # --- Stage 6D: нормализация диагностических входов -------------
+          norm() {
+            case "${1:-false}" in
+              true|1|yes|on) echo true ;;
+              *)             echo false ;;
+            esac
+          }
+          d_market="$(norm "$DIAG_MARKET")"
+          d_margin="$(norm "$DIAG_MARGIN")"
+          d_broker="$(norm "$DIAG_BROKER")"
+          selected=$((0))
+          [ "$d_market" = true ] && selected=$((selected+1))
+          [ "$d_margin" = true ] && selected=$((selected+1))
+          [ "$d_broker" = true ] && selected=$((selected+1))
+
+          # ALL-OR-NOTHING guard (workflow-side mirror of the script's own
+          # fail-closed check): the three diagnostics form ONE coherent
+          # synthetic scenario, so partial selection is rejected BEFORE the
+          # smoke test even starts. Scheduled runs and plain dispatches have
+          # selected=0 → untouched legacy behaviour.
+          if [ "$selected" -ne 0 ] && [ "$selected" -ne 3 ]; then
+            echo "::error::FAIL CLOSED: diag_market, diag_margin and diag_broker must be used together (all three or none). Selected: ${selected}."
+            exit 1
+          fi
+          # Diagnostics only make sense inside a full PAPER smoke run
+          # (AUTO_TRADING_ENABLED=true); otherwise nothing would execute.
+          if [ "$selected" -eq 3 ] && [ "$auto" != "true" ]; then
+            echo "::error::FAIL CLOSED: diagnostic flags require paper_smoke_test=true."
+            exit 1
+          fi
+
+          diag_args=""
+          if [ "$selected" -eq 3 ]; then
+            # Deterministic reproducible proof run: fixed clock at the
+            # 16:05 MSK control point + throwaway state file (same command
+            # as documented in scripts/paper_smoke_test.py). The state file
+            # is a temp path that does NOT touch the cached runtime state.
+            diag_args="--clock-epoch \"2026-10-02T16:05:00+03:00\" --fresh-state --diag-market --diag-margin --diag-broker"
+          fi
+          echo "diag_args=${diag_args}" >> "$GITHUB_OUTPUT"
+
           # Логирование конфигурации — намеренно БЕЗ секретов (только режимы).
           echo "TRADING_MODE=PAPER (LIVE is never allowed in this workflow)"
           echo "AUTO_TRADING_ENABLED=${auto} (paper_smoke_test=${raw:-false})"
+          echo "diagnostics: diag_market=${d_market} diag_margin=${d_margin} diag_broker=${d_broker} (all-or-nothing, selected=${selected}/3)"
 
       - name: Restore runtime state
         uses: actions/cache/restore@v4
@@ -102,13 +184,28 @@ jobs:
           # reachable from this workflow: TRADING_MODE stays hard-coded
           # to "PAPER" above.
           AUTO_TRADING_ENABLED: ${{ steps.run_mode.outputs.auto_trading_enabled }}
+          # Stage 6D: fixed diagnostic flag list built by "Resolve run mode
+          # inputs" — EMPTY unless all three diag_* inputs are selected
+          # (all-or-nothing guard in that step). Not user-controlled text.
+          DIAG_ARGS: ${{ steps.run_mode.outputs.diag_args }}
           TELEGRAM_ENABLED: "false"
           STATE_FILE: ${{ github.workspace }}/runtime/state.json
           TRADES_FILE: ${{ github.workspace }}/runtime/trades.csv
           LOG_DIR: ${{ github.workspace }}/runtime/logs
         run: |
           mkdir -p runtime/logs
-          python -m src.main
+          if [ "${AUTO_TRADING_ENABLED}" = "true" ]; then
+            # Stage 6C: полный PAPER smoke-прогон (scripts/paper_smoke_test.py).
+            # Stage 6D: DIAG_ARGS пустой, если диагностические входы не
+            # выбраны → команда ровно та же, что и раньше. Если выбраны все
+            # три — добавляются --clock-epoch/--fresh-state/--diag-* (см.
+            # шаг "Resolve run mode inputs"; частичный набор отклоняется там
+            # же, fail closed). TRADING_MODE жёстко PAPER — LIVE недостижим.
+            # shellcheck disable=SC2086  # intentional word-splitting of fixed flag list
+            python3 scripts/paper_smoke_test.py ${DIAG_ARGS:-}
+          else
+            python -m src.main
+          fi
 
       - name: Show run log
         if: always()
