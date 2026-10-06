@@ -287,8 +287,9 @@ class PaperExecutionAdapter(BaseExecutionAdapter):
         return float(getattr(self.broker, "tmon_price", 1000.0))
 
     def _apply(self, instrument: str, side: str, qty: int,
-               price_ref: float) -> ExecutionResult:
-        order = {"instrument": instrument, "side": side, "qty": int(qty)}
+               price_ref: float, **extra) -> ExecutionResult:
+        order = {"instrument": instrument, "side": side, "qty": int(qty),
+                 **extra}
         self.orders.append(order)
         self.broker.apply(order)
         logger.info("PAPER_FILL %s %s x%d", instrument, side, qty)
@@ -296,8 +297,17 @@ class PaperExecutionAdapter(BaseExecutionAdapter):
                                order_id=f"paper-{len(self.orders)}",
                                qty_executed=int(qty))
 
-    def buy_cny(self, account_id: str, qty: int) -> ExecutionResult:
-        return self._apply(C5_TARGET_TICKER, "BUY", qty, 0.0)
+    def buy_cny(self, account_id: str, qty: int,
+                margin_per_contract: Optional[float] = None,
+                entry_price: Optional[float] = None) -> ExecutionResult:
+        # ГО per contract (already computed by the runtime from the live
+        # FutureBy rate — see c5_runtime._evaluate_entry) is forwarded to
+        # SimulatedBroker as PAPER margin reservation metadata.  Passing
+        # None here means "caller has no ГО"; SimulatedBroker FAILS CLOSED
+        # on a futures BUY without it (no fallback constant allowed).
+        return self._apply(C5_TARGET_TICKER, "BUY", qty, 0.0,
+                           margin_per_contract=margin_per_contract,
+                           entry_price=entry_price)
 
     def sell_cny(self, account_id: str, qty: int) -> ExecutionResult:
         return self._apply(C5_TARGET_TICKER, "SELL", qty, 0.0)
@@ -311,8 +321,24 @@ class PaperExecutionAdapter(BaseExecutionAdapter):
                           self.get_tmon_price(account_id))
 
 
+class SimulatedBrokerError(RuntimeError):
+    """PAPER fill refused by the simulated broker (fail closed).
+
+    Raised when a futures BUY arrives without ``margin_per_contract`` in
+    the order metadata or when free cash cannot cover the ГО — the
+    broker never guesses a margin constant and never lets ``cash`` go
+    negative on a margined entry.
+    """
+
+
 class SimulatedBroker:
-    """Minimal in-memory broker used by PAPER mode and integration tests."""
+    """Minimal in-memory broker used by PAPER mode and integration tests.
+
+    Futures accounting mirrors what the real broker exposes: ``cash`` is
+    AVAILABLE/free funds, buying a contract blocks only its initial
+    margin (ГО), never the notional value; ``equity`` stays at the
+    seeded snapshot value (MTM/P&L is out of scope for this model).
+    """
 
     def __init__(self, cash: float = 0.0, tmon_qty: int = 0,
                  position_qty: int = 0, equity: float = 0.0,
@@ -323,6 +349,9 @@ class SimulatedBroker:
         self.equity = equity or cash
         self.tmon_price = tmon_price
         self.entry_price = entry_price
+        # ГО per contract blocked by the current long (set at BUY time
+        # from the runtime-computed live margin; 0.0 = unknown basis).
+        self.margin_locked_per_contract = 0.0
 
     def snapshot(self, account_id: str) -> AccountSnapshot:
         return AccountSnapshot(
@@ -338,9 +367,52 @@ class SimulatedBroker:
     def apply(self, order: dict) -> None:
         side, qty = order["side"], int(order["qty"])
         if order["instrument"] == C5_TARGET_TICKER:
+            # Futures PAPER accounting (broker semantics): buying a
+            # CNYRUBF contract NEVER costs its notional value — the
+            # exchange blocks only the initial margin (ГО).  ``cash`` is
+            # available/free funds; a BUY reserves ``qty × ГО/contract``,
+            # an EXIT releases it back.  The ГО must come from the order
+            # metadata (runtime-computed from the live FutureBy rate);
+            # fallback constants are forbidden — fail closed instead.
             delta = qty if side == "BUY" else -qty
+            if side == "BUY":
+                mpc = order.get("margin_per_contract")
+                try:
+                    total_margin = float(mpc) * qty
+                except (TypeError, ValueError):
+                    raise SimulatedBrokerError(
+                        f"PAPER futures BUY x{qty} requires "
+                        f"margin_per_contract in the order metadata, got "
+                        f"{mpc!r} — refusing to guess ГО (fail closed)")
+                if total_margin <= 0:
+                    raise SimulatedBrokerError(
+                        f"PAPER futures BUY x{qty}: non-positive total "
+                        f"margin {total_margin}")
+                if self.cash < total_margin:
+                    raise SimulatedBrokerError(
+                        f"PAPER futures BUY x{qty} rejected: cash "
+                        f"{self.cash:.2f} < required margin "
+                        f"{total_margin:.2f}")
+                self.cash -= total_margin
+                # Remember the per-contract reservation so EXIT can
+                # release exactly what was blocked (last BUY wins while
+                # flat; partial re-entries are out of scope for PAPER).
+                self.margin_locked_per_contract = total_margin / qty
+                ep = order.get("entry_price")
+                if ep is not None:
+                    self.entry_price = float(ep)
+            else:
+                # SELL releases the ГО that the long BUY blocked.  The
+                # per-contract reservation is remembered at BUY time; a
+                # legacy/unknown cost basis releases nothing rather than
+                # inventing a fallback constant (fail-safe, no free cash
+                # printed out of thin air).
+                held = abs(min(0, self.position_qty))
+                released = min(held, qty) * self.margin_locked_per_contract
+                self.cash += released
+                if self.position_qty - qty <= 0:
+                    self.margin_locked_per_contract = 0.0
             self.position_qty += delta
-            self.cash -= qty * 87_750.0 if side == "BUY" else qty * 87_750.0
         elif order["instrument"].startswith(TMON_TICKER_PREFIX):
             if side == "SELL":
                 self.tmon_qty -= qty

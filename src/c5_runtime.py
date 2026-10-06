@@ -481,8 +481,15 @@ class C5Runtime:
                          cash.operations)
             return c5_core.block_entry(decision, cash.reason)
 
-        # CNY BUY — the whole final_qty in ONE operation.
-        result = self.adapter.buy_cny(self.account_id, decision.qty)
+        # CNY BUY — the whole final_qty in ONE operation.  The live ГО per
+        # contract computed by c5_core (FutureBy rate × price × size) is
+        # forwarded to the PAPER adapter so SimulatedBroker can block the
+        # margin instead of inventing a cost basis; LIVE ignores the
+        # extra kwargs (the exchange blocks ГО itself).
+        result = self.adapter.buy_cny(
+            self.account_id, decision.qty,
+            margin_per_contract=float(decision.margin_per_contract),
+            entry_price=guard.expected_price or price)
         state["last_c5_entry_control_timestamp"] = ts
         if not result.ok:
             logger.error("CNY_ENTRY FAILED: %s", result.reason)
