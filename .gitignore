@@ -1,8 +1,7 @@
-# Python compiled files and cache
+# Python compiled files
 __pycache__/
 *.pyc
-*.pyo
-*.pyd
 
-# Testing artifacts
-.pytest_cache/
+# Environment and secrets
+.env
+.env.local

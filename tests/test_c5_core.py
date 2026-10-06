@@ -318,3 +318,42 @@ def test_block_entry_override():
         b = block_entry(d, reason)
         assert b.action == "NO_ENTRY" and b.qty == 0 and b.reason == reason
     assert run().qty > 0  # original decision untouched (purity)
+
+
+# ── Stage 6C runtime fix: FutureBy requires id_type (SDK 1.51.0) ────
+def test_get_c5_instrument_passes_id_type_ticker(monkeypatch):
+    """get_c5_instrument() must call instruments.future_by with the
+    mandatory id_type=INSTRUMENT_ID_TYPE_TICKER.
+
+    Without it the API rejects the request with
+    INVALID_ARGUMENT 30006 "Missing parameter: id_type".
+    """
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+
+    import src.instruments as instruments
+    from t_tech.invest import InstrumentIdType
+
+    captured = {}
+
+    class Instruments:
+        def future_by(self, **kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(instrument=SimpleNamespace(
+                uid="cnyrubf-uid", ticker="CNYRUBF", class_code="SPBFUT"))
+
+    class Client:
+        instruments = Instruments()
+
+    @contextmanager
+    def fake_get_client(token):
+        yield Client()
+
+    monkeypatch.setattr(instruments, "get_client", fake_get_client)
+
+    instrument = instruments.get_c5_instrument("tok")
+
+    assert captured["id_type"] == InstrumentIdType.INSTRUMENT_ID_TYPE_TICKER
+    assert captured["class_code"] == "SPBFUT"
+    assert captured["id"] == "CNYRUBF"
+    assert instrument.uid == "cnyrubf-uid"
