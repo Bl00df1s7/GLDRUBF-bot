@@ -205,11 +205,18 @@ class C5Runtime:
         never re-fetched (idempotent bootstrap; also lets integration
         tests inject boundary fakes without touching the network).
 
-        PAPER mode uses a purely local SimulatedBroker and therefore does
-        NOT require the live market-data API at bootstrap; LIVE keeps the
-        full instrument-resolution + reconcile flow.
+        Stage 6C wiring fix: the CNYRUBF instrument is resolved from the
+        REAL T-Invest API in BOTH modes. PAPER execution stays fully local
+        (PaperExecutionAdapter + SimulatedBroker — it never reaches
+        OrdersServiceApi.post_order), but the runtime still needs the real
+        instrument UID for read-only market data (daily candles, closed 5m
+        control candle, order book) and for the real broker/account state
+        and futures margin queries. Skipping resolution in PAPER used to
+        leave ``self.instrument`` as None and crash on
+        ``self.instrument.uid``. Fail-closed: unresolved instrument ⇒ no
+        adapter, no snapshot, NO EXECUTION.
         """
-        if self.instrument is None and not self.config.is_paper:
+        if self.instrument is None:
             try:
                 self.instrument = get_c5_instrument(self.token)
             except Exception as exc:
