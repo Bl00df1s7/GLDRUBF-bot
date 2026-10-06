@@ -6,7 +6,18 @@ on:
     # plus a final session check at 23:50 MSK.
     - cron: '5 0-20 * * 1-5'
     - cron: '50 20 * * 1-5'
+  # Stage 6C: ручной запуск PAPER smoke-теста.
+  # paper_smoke_test=false (по умолчанию) — обычный dry-run, ордера НЕ отправляются.
+  # paper_smoke_test=true — полный PAPER прогон с AUTO_TRADING_ENABLED=true.
+  # LIVE здесь недоступен: TRADING_MODE жёстко зафиксирован в "PAPER".
   workflow_dispatch:
+    inputs:
+      paper_smoke_test:
+        description: >-
+          Run a full PAPER smoke test with AUTO_TRADING_ENABLED=true
+          (simulated orders only; LIVE is never allowed in this workflow).
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -53,6 +64,23 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt
 
+      # Stage 6C: карта входов workflow_dispatch -> env-флаги. Только PAPER;
+      # LIVE не может быть выбран никогда (нет соответствующего входа).
+      - name: Resolve run mode inputs
+        id: run_mode
+        env:
+          PAPER_SMOKE_TEST: ${{ github.event.inputs.paper_smoke_test }}
+        run: |
+          raw="${PAPER_SMOKE_TEST:-false}"
+          case "$raw" in
+            true|1|yes|on)  auto="true" ;;
+            false|""|*)     auto="false" ;;
+          esac
+          echo "auto_trading_enabled=${auto}" >> "$GITHUB_OUTPUT"
+          # Логирование конфигурации — намеренно БЕЗ секретов (только режимы).
+          echo "TRADING_MODE=PAPER (LIVE is never allowed in this workflow)"
+          echo "AUTO_TRADING_ENABLED=${auto} (paper_smoke_test=${raw:-false})"
+
       - name: Restore runtime state
         uses: actions/cache/restore@v4
         with:
@@ -68,9 +96,12 @@ jobs:
           # (src/runtime_config.py fails closed on missing/blank mode).
           # PAPER only here; LIVE requires a separate deliberate change.
           TRADING_MODE: "PAPER"
-          # LIVE SAFETY GATE: auto-trading disabled until Stage 2D acceptance.
-          # Do not flip to "true" without a completed pre-live audit.
-          AUTO_TRADING_ENABLED: "false"
+          # Stage 6C: AUTO_TRADING_ENABLED driven by the paper_smoke_test
+          # workflow_dispatch input (default false → dry-run as before).
+          # Scheduled runs have no input → always "false". LIVE is never
+          # reachable from this workflow: TRADING_MODE stays hard-coded
+          # to "PAPER" above.
+          AUTO_TRADING_ENABLED: ${{ steps.run_mode.outputs.auto_trading_enabled }}
           TELEGRAM_ENABLED: "false"
           STATE_FILE: ${{ github.workspace }}/runtime/state.json
           TRADES_FILE: ${{ github.workspace }}/runtime/trades.csv
