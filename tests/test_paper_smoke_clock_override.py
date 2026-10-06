@@ -122,3 +122,37 @@ def test_fail_closed_non_paper_mode(captured_runtime, monkeypatch):
     monkeypatch.setenv("TRADING_MODE", "LIVE")
     assert smoke.main([]) == 1
     assert captured_runtime == {}
+
+
+# ── E: --clock-now injects the real wall clock as now_fn ────────────────
+def test_e_clock_now_injects_wall_clock(captured_runtime):
+    rc = smoke.main(["--clock-now"])
+    assert rc == 0
+    assert "now_fn" in captured_runtime
+    injected = captured_runtime["now_fn"]()
+    # must be ~now (within 60s), i.e. the real wall clock, not a fixed epoch
+    delta = abs((dt.datetime.now(dt.timezone.utc) - injected).total_seconds())
+    assert delta < 60
+    # run_cycle consumed the same value — override is effective end-to-end
+    assert captured_runtime["cycle_now"] == injected
+
+
+# ── F: --clock-epoch and --clock-now are mutually exclusive (fail closed) ─
+def test_f_epoch_and_now_conflict_fail_closed(captured_runtime):
+    rc = smoke.main(["--clock-epoch", "1790946060", "--clock-now"])
+    assert rc == 1
+    assert captured_runtime == {}          # runtime never built
+
+
+# ── G: --fresh-state points C5_STATE_FILE at a throwaway file ───────────
+def test_g_fresh_state_uses_throwaway_file(captured_runtime, monkeypatch,
+                                           tmp_path):
+    import os
+    default_state = str(tmp_path / "shared_default.json")
+    monkeypatch.setenv("C5_STATE_FILE", default_state)
+    rc = smoke.main(["--fresh-state"])
+    assert rc == 0
+    smk = os.environ["C5_STATE_FILE"]
+    assert smk and smk != default_state              # shared file untouched
+    assert "c5_smoke_state_" in smk                  # throwaway prefix
+    assert not os.path.exists(smk)                   # starts truly fresh

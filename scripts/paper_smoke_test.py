@@ -34,6 +34,15 @@ SAFETY INVARIANTS (proven by Stage 5A/5B tests, re-checked here at startup)
 
 Exit code: 0 when the cycle completes (regardless of decision), 1 on
 configuration errors (fail closed, nothing executed).
+
+DIAGNOSTIC FLAGS (test-branch convenience only; defaults keep production
+behaviour EXACTLY intact):
+  * --clock-now  — set the injected time to the REAL current wall clock.
+    Lets you run "as if it is now" inside the [16:05, ...) MSK control
+    window without typing epoch values.
+  * --fresh-state — use a throwaway idempotency/state file instead of the
+    shared default (/tmp/c5_runtime_state.json), so repeated runs at the
+    same time are not blocked as DUPLICATE_CANDLE.
 """
 from __future__ import annotations
 
@@ -41,6 +50,7 @@ import argparse
 import logging
 import os
 import sys
+import tempfile
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
@@ -77,6 +87,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Diagnostic time override passed to C5Runtime as now_fn. "
              "POSIX seconds (e.g. 1790946060) or ISO-8601 "
              "(e.g. 2026-10-02T16:01:00+03:00). Omit to use the real clock.")
+    p.add_argument(
+        "--clock-now", action="store_true",
+        help="Diagnostic convenience: inject the REAL current wall clock as "
+             "now_fn (same effect as --clock-epoch with the current epoch, "
+             "but no value to type). Use it to run inside the [16:05, ...) "
+             "MSK control window 'as if it is now'.")
+    p.add_argument(
+        "--fresh-state", action="store_true",
+        help="Use a throwaway C5_STATE_FILE for this run so repeated cycles "
+             "at the same time are not blocked as DUPLICATE_CANDLE. Does NOT "
+             "touch the shared default state file.")
     return p
 
 
@@ -98,6 +119,11 @@ def main(argv=None) -> int:
               file=sys.stderr)
         return 1
 
+    if args.clock_epoch is not None and args.clock_now:
+        print("FAIL CLOSED: --clock-epoch and --clock-now are mutually "
+              "exclusive", file=sys.stderr)
+        return 1
+
     now_fn = None
     if args.clock_epoch is not None:
         fixed = parse_clock_epoch(args.clock_epoch)
@@ -105,6 +131,19 @@ def main(argv=None) -> int:
         print(f"[smoke] DIAGNOSTIC clock override: {fixed.isoformat()} "
               f"(MSK: {now_msk.isoformat()})")
         now_fn = lambda: fixed              # noqa: E731 — injected via ctor only
+    elif args.clock_now:
+        fixed = datetime.now(timezone.utc)  # real wall clock, frozen per cycle
+        now_msk = fixed.astimezone(ZoneInfo("Europe/Moscow"))
+        print(f"[smoke] DIAGNOSTIC clock override (--clock-now): "
+              f"{fixed.isoformat()} (MSK: {now_msk.isoformat()})")
+        now_fn = lambda: fixed              # noqa: E731 — injected via ctor only
+
+    if args.fresh_state:
+        fd, path = tempfile.mkstemp(prefix="c5_smoke_state_", suffix=".json")
+        os.close(fd)
+        os.unlink(path)                     # start truly fresh; runtime recreates
+        os.environ["C5_STATE_FILE"] = path  # resolved at call time by state_store
+        print(f"[smoke] DIAGNOSTIC fresh state file: {path}")
 
     runtime_kwargs = {"config": config}
     if now_fn is not None:
