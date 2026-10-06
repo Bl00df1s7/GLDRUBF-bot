@@ -1,7 +1,1 @@
-# Python compiled files
-__pycache__/
-*.pyc
-
-# Environment and secrets
-.env
-.env.local
+(empty)
