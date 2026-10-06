@@ -351,6 +351,48 @@ class SimulatedBroker:
         self.equity = max(self.equity, 0.0)
 
 
+class PaperStartupError(RuntimeError):
+    """PAPER startup refused — the real read-only account snapshot is
+    unavailable or non-positive. Fail closed: the runtime must NOT start
+    with a zero/artificial balance (the correct reconcile then stops it
+    with EQUITY_UNAVAILABLE anyway)."""
+
+
+def _build_paper_broker(read_adapter) -> "SimulatedBroker":
+    """Seed a SimulatedBroker from the REAL read-only account snapshot.
+
+    Documented PaperExecutionAdapter contract: production paper mode uses
+    a SimulatedBroker built from a real read-only snapshot at startup.
+    ``read_adapter`` is a LiveExecutionAdapter used EXCLUSIVELY through
+    its two read-only methods — find_account() (UsersService.get_accounts)
+    and snapshot() (OperationsService.get_positions/get_portfolio +
+    OrdersService.get_orders). Neither method can physically reach
+    OrdersServiceApi.post_order(): that call site lives only inside
+    LiveExecutionAdapter._post_market_order(), which this function never
+    invokes (and which stays double-gated for LIVE runs).
+
+    Propagates any read-API/account-discovery error unchanged (fail
+    closed) and raises PaperStartupError when equity/cash are not
+    positive — never substitutes a zero or artificial balance.
+    """
+    account_id = read_adapter.find_account()
+    live_snap = read_adapter.snapshot(account_id)
+    equity = float(live_snap.equity_rub or 0.0)
+    cash = float(live_snap.free_cash_rub or 0.0)
+    if equity <= 0 or cash <= 0:
+        raise PaperStartupError(
+            f"PAPER startup fail closed: real account {account_id} "
+            f"snapshot has equity={equity} cash={cash} — refusing to "
+            "seed SimulatedBroker with a zero/artificial balance")
+    return SimulatedBroker(
+        cash=cash,
+        equity=equity,
+        tmon_qty=int(live_snap.tmon_qty or 0),
+        position_qty=int(live_snap.position_qty or 0),
+        entry_price=float(live_snap.entry_price or 0.0),
+    )
+
+
 def build_execution_adapter(token: str, instrument_uid: str, config=None):
     """Factory honoring the Stage 5A safety gate (single source of truth).
 
@@ -358,8 +400,15 @@ def build_execution_adapter(token: str, instrument_uid: str, config=None):
     omitted it is loaded from the environment via the ONE parser. There is
     NO default mode and NO default to LIVE:
 
-      * PAPER → PaperExecutionAdapter + SimulatedBroker — local state only;
-        this code path physically cannot reach OrdersServiceApi.post_order().
+      * PAPER → PaperExecutionAdapter + SimulatedBroker seeded from the
+        real read-only account snapshot (Stage 6D wiring fix — previously
+        SimulatedBroker() defaulted to cash=0/equity=0 and the correct
+        fail-closed reconcile stopped the runtime with EQUITY_UNAVAILABLE).
+        The PAPER order-flow path still physically cannot reach
+        OrdersServiceApi.post_order(): the read-only LiveExecutionAdapter
+        is used exclusively for find_account()/snapshot(); any exception
+        from that read API propagates unchanged (fail closed — no adapter,
+        no zero-balance fallback).
       * LIVE  → LiveExecutionAdapter — allowed ONLY with an explicit
         TRADING_MODE=LIVE plus AUTO_TRADING_ENABLED=true (enforced by
         load_trading_config / enforce_trading_gate in src/runtime_config.py).
@@ -374,5 +423,10 @@ def build_execution_adapter(token: str, instrument_uid: str, config=None):
     enforce_trading_gate(config)
 
     if config.is_paper:
-        return PaperExecutionAdapter(SimulatedBroker()), "PAPER"
+        # Real read-only account snapshot seeds the simulated broker.
+        # Same account discovery (_find_open_account) as LIVE ⇒ the exact
+        # same real account_id the runtime will use downstream.
+        read_adapter = LiveExecutionAdapter(token, instrument_uid)
+        broker = _build_paper_broker(read_adapter)
+        return PaperExecutionAdapter(broker), "PAPER"
     return LiveExecutionAdapter(token, instrument_uid), "LIVE"
