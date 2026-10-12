@@ -218,6 +218,81 @@ def test_t11_rate_validation():
         run(margin_rate=Decimal("0.9"))
 
 
+# ── G-1: EXIT contract split — margin_rate optional while in position ─
+def test_g1_long_exit_with_margin_rate_none():
+    bars = make_daily()
+    exit_lower = min(b.low for b in bars[-5:])
+    d = run(position=Position("LONG", 3),
+            control_bar=control(exit_lower - 0.01),
+            margin_rate=None)
+    assert d.action == "EXIT" and d.reason == "EXIT_LONG" and d.qty == 0
+
+
+def test_g1_short_exit_with_margin_rate_none():
+    bars = make_daily()
+    exit_upper = max(b.high for b in bars[-5:])
+    d = run(position=Position("SHORT", 3),
+            control_bar=control(exit_upper + 0.01),
+            margin_rate=None)
+    assert d.action == "EXIT" and d.reason == "EXIT_SHORT" and d.qty == 0
+
+
+def test_g1_hold_and_entry_signal_unchanged_with_margin_none():
+    bars = make_daily()
+    exit_lower = min(b.low for b in bars[-5:])
+    # HOLD path also proceeds without ГО (signal is price-only).
+    d = run(position=Position("LONG", 3),
+            control_bar=control(exit_lower + 0.01),
+            margin_rate=None)
+    assert d.action == "HOLD" and d.reason == "HOLD_POSITION"
+    # Entry breakout while LONG stays HOLD (entry ignored in position).
+    upper = max(b.high for b in bars[-10:])
+    d2 = run(position=Position("LONG", 3), control_bar=control(upper + 1.0),
+             margin_rate=None)
+    assert d2.action == "HOLD"
+
+
+def test_g1_exit_decision_identical_except_margin_rate():
+    """Purity pin: dropping ГО on the EXIT path changes NOTHING except
+    the diagnostic margin_rate field — signal/channel/ATR fields match."""
+    bars = make_daily()
+    exit_lower = min(b.low for b in bars[-5:])
+    kw = dict(daily_bars=bars,
+              control_bar=control(exit_lower - 0.01),
+              equity=EQUITY, free_margin=FREE_MARGIN,
+              position=Position("LONG", 3), price=PRICE)
+    with_rate = evaluate(margin_rate=RATE, **kw)
+    no_rate = evaluate(margin_rate=None, **kw)
+    assert with_rate.action == no_rate.action == "EXIT"
+    assert with_rate.reason == no_rate.reason == "EXIT_LONG"
+    for f in ("signal_price", "donchian_entry_upper", "donchian_entry_lower",
+              "donchian_exit_lower", "donchian_exit_upper", "atr14",
+              "risk_multiplier", "risk_budget", "margin_per_contract",
+              "required_margin", "m_e_ratio", "qty_risk", "qty_margin",
+              "qty_liquidity", "qty_raw", "qty"):
+        assert getattr(with_rate, f) == getattr(no_rate, f), f
+    assert no_rate.margin_rate == Decimal("0")   # diagnostic placeholder
+
+
+def test_g1_entry_fail_closed_on_missing_or_out_of_band_rate():
+    # Flat position: every bad rate still raises MarginRateError —
+    # exactly the pre-G-1 behaviour (no fallback allowed).
+    for bad in (None, Decimal("0"), Decimal("-0.05"), Decimal("NaN"),
+                Decimal("0.9")):
+        with pytest.raises(MarginRateError):
+            run(margin_rate=bad)                    # position=None → ENTRY
+    # And the band applies again even after an EXIT-path call succeeded
+    # with None (no sticky relaxation across calls):
+    bars = make_daily()
+    exit_lower = min(b.low for b in bars[-5:])
+    evaluate(margin_rate=None, daily_bars=bars,
+             control_bar=control(exit_lower - 0.01), equity=EQUITY,
+             free_margin=FREE_MARGIN, position=Position("LONG", 3),
+             price=PRICE)
+    with pytest.raises(MarginRateError):
+        run(margin_rate=None)
+
+
 # ── T12/T13: M/E limit ───────────────────────────────────────────────
 # MATHEMATICAL CONTRACT (frozen C5, spec §7/§8) — formally proven on this
 # codebase: with me_limit == RISK_BASE * ATR_CLIP_HI (0.30 == 0.20*1.5),

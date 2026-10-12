@@ -343,11 +343,11 @@ class C5Runtime:
         except (MarginApiUnavailable, c5_core.MarginRateError) as exc:
             logger.error("%s (exit sizing input invalid): %s",
                          REASON_MARGIN_API_UNAVAILABLE, exc)
-            # EXIT itself does not need ГО, but the pure Decision contract
-            # requires a valid rate; block with explicit reason, no guess.
-            state["last_processed_5m_ts"] = ts
-            return c5_core.block_entry(_noop_decision(),
-                                       REASON_MARGIN_API_UNAVAILABLE)
+            # G-1: EXIT itself does not need ГО — the EXIT/HOLD branch of
+            # c5_core.evaluate consumes no margin-derived value.  Proceed
+            # with margin_rate=None instead of blocking; the candle is NOT
+            # burned before a real exit attempt.
+            rate = None
 
         decision = c5_core.evaluate(
             daily_bars=daily,
@@ -360,20 +360,57 @@ class C5Runtime:
             now=now_msk,
         )
 
-        state["last_processed_5m_ts"] = ts
+        if decision.action != "EXIT":
+            # Non-exit candles are consumed as before; an EXIT candle is
+            # marked processed only after the sell attempt below, so a
+            # failed/unexecuted exit can be re-evaluated on the next bar
+            # without burning the exit event on a margin-API error.
+            state["last_processed_5m_ts"] = ts
 
         if decision.action == "EXIT":
             qty = abs(int(snapshot.position_qty))
             result = self.adapter.sell_cny(self.account_id, qty)
             if result.ok:
+                # Successful exit keeps the pre-G-4 idempotency exactly:
+                # the candle is marked processed and the position fields
+                # are cleared.
+                state["last_processed_5m_ts"] = ts
+                state.pop("exit_failure_reason", None)
                 state["c5_position_qty"] = 0
                 state["c5_position_direction"] = None
                 state["c5_entry_price"] = None
                 state["last_action"] = decision.reason
                 logger.info("CNY_EXIT executed: qty=%d order=%s reason=%s",
                             qty, result.order_id, decision.reason)
+                return decision
+
+            # ── G-4: failed EXIT — classify by execution certainty ────
+            # CONFIRMED rejection (the exchange provably did NOT fill
+            # the order): safe to keep the candle unburned so the next
+            # run_cycle() re-evaluates the still-valid exit signal.
+            # Status source: ExecutionResult.details["status"] when the
+            # LIVE adapter could query it; otherwise the machine-readable
+            # reason suffix ORDER_NOT_FILLED:<STATUS> (execution_adapter
+            # ._post_market_order).  Unknown/absent status ⇒ UNKNOWN
+            # outcome ⇒ do NOT auto-retry (a second SELL could duplicate
+            # an order that was in fact accepted/filled).
+            confirmed_dead = _is_confirmed_rejection(result)
+            state["exit_failure_reason"] = str(result.reason)
+            if confirmed_dead:
+                state.pop("last_processed_5m_ts", None)
+                logger.error(
+                    "CNY_EXIT FAILED (confirmed rejection): %s — candle "
+                    "%s NOT burned, exit will be re-attempted",
+                    result.reason, ts)
             else:
-                logger.error("CNY_EXIT FAILED: %s", result.reason)
+                # TRADING_BLOCKED / unknown fill outcome: burn the candle
+                # exactly as before G-4 — retrying blindly could create a
+                # duplicate SELL while broker state is not verified.
+                state["last_processed_5m_ts"] = ts
+                logger.error(
+                    "CNY_EXIT FAILED (outcome not confirmed-rejected): %s"
+                    " — no automatic re-attempt; reconcile on next start "
+                    "remains the source of truth", result.reason)
         return decision
 
     # ── ENTRY ────────────────────────────────────────────────────────
@@ -532,6 +569,40 @@ def _position_from_snapshot(snapshot):
         return None
     return c5_core.Position(direction="LONG" if qty > 0 else "SHORT",
                             qty=abs(qty))
+
+
+# ── G-4: EXIT failure classification (execution certainty) ────────────
+# Terminal statuses the T-Invest SDK reports for an order that provably
+# reached a NOT-FILLED end state (see auto_trader.wait_for_order_fill:
+# REJECTED/CANCELLED return lots_executed=0).  Anything else — NEW/NONE/
+# time_out placeholders, missing status, TRADING_BLOCKED (the adapter may
+# have raised before we could be sure nothing was posted elsewhere) — is
+# treated as UNKNOWN and must not trigger an automatic re-post.
+CONFIRMED_REJECTION_STATUSES = frozenset({
+    "EXECUTION_REPORT_STATUS_REJECTED",
+    "EXECUTION_REPORT_STATUS_CANCELLED",
+})
+
+
+def _is_confirmed_rejection(result) -> bool:
+    """True only when the execution result PROVES the order was not filled.
+
+    Sources of truth, in priority order:
+      1. ``result.details["status"]`` — set by LiveExecutionAdapter from
+         the SDK order-state it actually queried;
+      2. ``result.reason`` suffix ``ORDER_NOT_FILLED:<STATUS>`` — the
+         machine-readable code emitted by the same adapter when
+         lots_executed <= 0.
+    A reason without a recognised terminal status (unknown placeholder,
+    TRADING_BLOCKED, arbitrary error string) returns False: fail closed
+    against a potentially duplicating re-send.
+    """
+    status = str((getattr(result, "details", None) or {}).get("status") or "")
+    if not status:
+        reason = str(getattr(result, "reason", "") or "")
+        prefix = "ORDER_NOT_FILLED:"
+        status = reason[len(prefix):] if reason.startswith(prefix) else ""
+    return status in CONFIRMED_REJECTION_STATUSES
 
 
 def _noop_decision() -> c5_core.Decision:

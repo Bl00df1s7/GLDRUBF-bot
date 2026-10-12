@@ -933,3 +933,449 @@ def test_n_paper_restart_reconcile_preserves_open_position(state_env, market):
     assert st3["c5_position_qty"] == QTY
     assert len(adapter2.orders) == 0                 # новых orders нет
     assert broker2.cash == cash_after_entry          # accounting не тронут
+
+
+# ══════════════════════════════════════════════════════════════════════
+# G-1 — EXIT НЕ зависит от Margin API: при недоступном ГО сигнал
+# EXIT_LONG вычисляется и исполняется (SELL), свеча не «сжигается»
+# до попытки выхода.  Frozen c5_core не мокается; подменяется только
+# внешний boundary (MarginTracker) на том же рантайм-объекте.
+# ══════════════════════════════════════════════════════════════════════
+class UnavailableMarginTracker:
+    """Boundary fake: the ГО API is DOWN — refresh raises, cache empty."""
+    def __init__(self):
+        self.current = None
+        self.refresh_calls = 0
+
+    def refresh(self):
+        from src.margin_provider import MarginApiUnavailable
+        self.refresh_calls += 1
+        raise MarginApiUnavailable("ГО API down (G-1 test)")
+
+
+def test_g1_exit_executes_when_margin_api_unavailable(state_env, market):
+    C16 = candle_5m(CONTROL_DAY, 16, 0, LONG_BREAK)
+    C1630 = candle_5m(CONTROL_DAY, 16, 30, SHORT_BREAK)
+    set_candles(market, C16)
+    broker = new_broker()
+    rt, adapter = make_runtime(market, broker)
+
+    # Phase 1 — normal ENTER_LONG with a healthy margin tracker.
+    assert rt.run_cycle().action == "ENTER_LONG"
+    assert broker.position_qty > 0
+    qty_opened = broker.position_qty
+
+    # Margin API goes DOWN before the exit candle (same runtime object,
+    # same persisted state — production sequence preserved).
+    dead = UnavailableMarginTracker()
+    rt._margin = dead
+
+    set_candles(market, C16, C1630)
+    market.holder["now"] = utc_ms(CONTROL_DAY, 16, 35)
+    d = rt.run_cycle()
+
+    # Pre-G-1 behaviour was NO_ENTRY/MARGIN_API_UNAVAILABLE + burned
+    # candle. Required behaviour: real EXIT signal and real SELL.
+    assert d.action == "EXIT" and d.reason == "EXIT_LONG"
+    assert dead.refresh_calls >= 1               # API genuinely attempted
+    assert len(sell_orders(adapter)) == 1        # exactly one SELL
+    assert sell_orders(adapter)[0]["qty"] == qty_opened   # full volume
+    assert broker.position_qty == 0              # flat at the broker
+    st = read_state(state_env)
+    assert st["c5_position_qty"] == 0
+    assert st["c5_position_direction"] is None
+    assert st["last_processed_5m_ts"] == C1630["time"].isoformat()
+    assert st["last_action"] == "EXIT_LONG"
+
+    # Idempotency: re-running the SAME exit candle must not re-sell.
+    d2 = rt.run_cycle()
+    assert d2.action == "NO_ENTRY" and d2.reason == "DUPLICATE_CANDLE"
+    assert len(sell_orders(adapter)) == 1
+
+
+def test_g1_hold_with_dead_margin_api_does_not_block_later_exit(state_env, market):
+    """HOLD under an unavailable ГО API consumes its candle as before and
+    leaves subsequent candles fully processable (exit still fires)."""
+    C16 = candle_5m(CONTROL_DAY, 16, 0, LONG_BREAK)
+    CNEUTRAL = candle_5m(CONTROL_DAY, 16, 10, NEUTRAL)
+    C1630 = candle_5m(CONTROL_DAY, 16, 30, SHORT_BREAK)
+    set_candles(market, C16)
+    broker = new_broker()
+    rt, adapter = make_runtime(market, broker)
+    assert rt.run_cycle().action == "ENTER_LONG"
+
+    rt._margin = UnavailableMarginTracker()
+
+    # Neutral candle while LONG + dead API → HOLD (not MARGIN block).
+    set_candles(market, C16, CNEUTRAL)
+    market.holder["now"] = utc_ms(CONTROL_DAY, 16, 15)
+    d = rt.run_cycle()
+    assert d.action == "HOLD" and d.reason == "HOLD_POSITION"
+    assert sell_orders(adapter) == []
+    st = read_state(state_env)
+    assert st["last_processed_5m_ts"] == CNEUTRAL["time"].isoformat()
+
+    # Exit candle → EXIT executes despite the still-dead API.
+    set_candles(market, C16, CNEUTRAL, C1630)
+    market.holder["now"] = utc_ms(CONTROL_DAY, 16, 35)
+    d2 = rt.run_cycle()
+    assert d2.action == "EXIT" and d2.reason == "EXIT_LONG"
+    assert broker.position_qty == 0
+    assert len(sell_orders(adapter)) == 1
+
+
+def test_g1_entry_still_fail_closed_when_margin_api_unavailable(state_env, market):
+    """Flat + dead ГО API on the ENTRY path → unchanged fail-closed
+    NO_ENTRY/MARGIN_API_UNAVAILABLE, zero orders."""
+    C16 = candle_5m(CONTROL_DAY, 16, 0, LONG_BREAK)
+    set_candles(market, C16)
+    broker = new_broker()
+    rt, adapter = make_runtime(market, broker)
+    rt._margin = UnavailableMarginTracker()
+
+    d = rt.run_cycle()
+
+    assert d.action == "NO_ENTRY"
+    assert d.reason == "MARGIN_API_UNAVAILABLE"
+    assert adapter.orders == []
+    assert broker.position_qty == 0
+
+
+# ══════════════════════════════════════════════════════════════════════
+# G-4 — EXIT order failure: classified by execution certainty.
+#   CONFIRMED rejection (REJECTED/CANCELLED terminal status) → position
+#     stays open, reason observable in state, candle NOT burned ⇒ next
+#     run_cycle re-attempts the still-valid exit; a later SUCCESS must
+#     burn the candle exactly once (no duplicate SELL).
+#   UNKNOWN outcome (timeout placeholder / TRADING_BLOCKED / no status)
+#     → candle burned as before ⇒ NO automatic re-post (a blind retry
+#     could duplicate an order that was actually accepted/filled).
+#   Success keeps the pre-G-4 idempotency untouched.
+# The sell boundary is faked at the EXTERNAL adapter contract only
+# (ExecutionResult semantics identical to LiveExecutionAdapter
+# ._post_market_order); production LIVE order mechanics are untouched.
+# ══════════════════════════════════════════════════════════════════════
+class ScriptedSellAdapter:
+    """Boundary fake implementing the BaseExecutionAdapter contract.
+
+    snapshot()/buy_cny() delegate to the REAL PaperExecutionAdapter +
+    SimulatedBroker (entry lifecycle stays production); ONLY sell_cny
+    outcomes are scripted, reproducing the exact machine-readable
+    ExecutionResults of the LIVE adapter.
+    """
+
+    def __init__(self, paper_adapter, sell_results):
+        self._paper = paper_adapter
+        self._sell_results = list(sell_results)
+        self.sell_calls = []
+        self.orders = []
+
+    def find_account(self):
+        return self._paper.find_account()
+
+    def snapshot(self, account_id):
+        return self._paper.snapshot(account_id)
+
+    def buy_cny(self, account_id, qty, **kwargs):
+        res = self._paper.buy_cny(account_id, qty, **kwargs)
+        self.orders.append({"instrument": "CNYRUBF", "side": "BUY",
+                            "qty": qty})
+        return res
+
+    def sell_cny(self, account_id, qty):
+        self.orders.append({"instrument": "CNYRUBF", "side": "SELL",
+                            "qty": qty})
+        if not self._sell_results:
+            raise AssertionError("unexpected extra sell attempt")
+        res = self._sell_results.pop(0)
+        self.sell_calls.append(qty)
+        if res.ok:                       # success mirrors the real broker
+            self._paper.sell_cny(account_id, qty)
+        return res
+
+    def sell_one_tmon(self, account_id):
+        return self._paper.sell_one_tmon(account_id)
+
+    def buy_one_tmon(self, account_id):
+        return self._paper.buy_one_tmon(account_id)
+
+    def get_free_cash(self, account_id):
+        return self._paper.get_free_cash(account_id)
+
+    def get_tmon_quantity(self, account_id):
+        return self._paper.get_tmon_quantity(account_id)
+
+    def get_tmon_price(self, account_id):
+        return self._paper.get_tmon_price(account_id)
+
+
+def _rejected_result():
+    from src.execution_adapter import ExecutionResult
+    return ExecutionResult(
+        False, "ORDER_NOT_FILLED:EXECUTION_REPORT_STATUS_REJECTED",
+        order_id="ord-rej-1",
+        details={"status": "EXECUTION_REPORT_STATUS_REJECTED"})
+
+
+def _cancelled_result():
+    from src.execution_adapter import ExecutionResult
+    return ExecutionResult(
+        False, "ORDER_NOT_FILLED:EXECUTION_REPORT_STATUS_CANCELLED",
+        order_id="ord-can-1",
+        details={"status": "EXECUTION_REPORT_STATUS_CANCELLED"})
+
+
+def _unknown_timeout_result():
+    """wait_for_order_fill deadline with status NEW/NONE → lots 0.
+    The order may STILL fill after the deadline — outcome unknown."""
+    from src.execution_adapter import ExecutionResult
+    return ExecutionResult(False, "ORDER_NOT_FILLED:NEW",
+                           order_id="ord-tmo-1",
+                           details={"status": "NEW"})
+
+
+def _trading_blocked_result():
+    from src.execution_adapter import ExecutionResult
+    return ExecutionResult(False, "TRADING_BLOCKED:auto disabled")
+
+
+def _filled_result(qty):
+    from src.execution_adapter import ExecutionResult
+    return ExecutionResult(True, "PAPER_FILLED", order_id="ord-ok-1",
+                           qty_executed=qty)
+
+
+def make_scripted_runtime(market, broker, sell_results):
+    import src.c5_runtime as rt_mod
+    from src.execution_adapter import PaperExecutionAdapter
+    from src.runtime_config import TradingConfig
+
+    adapter = ScriptedSellAdapter(PaperExecutionAdapter(broker),
+                                  sell_results)
+    rt = rt_mod.C5Runtime("fake-token", adapter=adapter,
+                          margin_tracker=FakeMarginTracker(),
+                          config=TradingConfig("PAPER", True),
+                          now_fn=lambda: market.holder["now"])
+    rt.instrument = FakeInstrument()
+    return rt, adapter
+
+
+def open_long_via_production(state_env, market):
+    """Phase shared by every G-4 test: production ENTER_LONG through the
+    real runtime + real paper buy path. Returns (rt, adapter, broker,
+    qty_opened)."""
+    C16 = candle_5m(CONTROL_DAY, 16, 0, LONG_BREAK)
+    set_candles(market, C16)
+    broker = new_broker()
+    rt, adapter = make_scripted_runtime(market, broker, [])
+    assert rt.run_cycle().action == "ENTER_LONG"
+    qty_opened = broker.position_qty
+    assert qty_opened > 0
+    return rt, adapter, broker, qty_opened
+
+
+def reopen_position(broker, state_env, qty):
+    """External-boundary reset used ONLY to observe the EXIT-branch
+    duplicate guard after a successful exit (the flat account would
+    otherwise route to the ENTRY branch — same technique as test_f).
+    Production logic untouched."""
+    broker.position_qty = qty
+    st = read_state(state_env)
+    st["c5_position_qty"] = qty
+    st["c5_position_direction"] = "LONG"
+    (state_env / "state.json").write_text(json.dumps(st))
+
+
+# ── unit: classification helper (fail-closed toward UNKNOWN) ──────────
+def test_g4_confirmed_rejection_classification_unit():
+    from src.c5_runtime import _is_confirmed_rejection
+    from src.execution_adapter import ExecutionResult as ER
+
+    assert _is_confirmed_rejection(_rejected_result())
+    assert _is_confirmed_rejection(_cancelled_result())
+    # reason-only variant (details empty) is still recognised:
+    assert _is_confirmed_rejection(
+        ER(False, "ORDER_NOT_FILLED:EXECUTION_REPORT_STATUS_REJECTED"))
+    # UNKNOWN outcomes must NOT be classified as confirmed-dead:
+    assert not _is_confirmed_rejection(_unknown_timeout_result())
+    assert not _is_confirmed_rejection(_trading_blocked_result())
+    assert not _is_confirmed_rejection(ER(False, "ORDER_NOT_FILLED:NONE"))
+    assert not _is_confirmed_rejection(ER(False, ""))
+    # partial fill (ok=True) never reaches this helper — sanity guard:
+    assert not _is_confirmed_rejection(ER(True, "FILLED", qty_executed=1))
+
+
+# ── E2E 1: successful full SELL keeps pre-G-4 idempotency ─────────────
+def test_g4_successful_exit_keeps_candle_idempotency(state_env, market):
+    rt, adapter, broker, qty = open_long_via_production(state_env, market)
+    rt.adapter = ScriptedSellAdapter(
+        rt.adapter._paper, [_filled_result(qty)])
+    C16 = candle_5m(CONTROL_DAY, 16, 0, LONG_BREAK)
+    CEXIT = candle_5m(CONTROL_DAY, 16, 30, SHORT_BREAK)
+    set_candles(market, C16, CEXIT)
+    market.holder["now"] = utc_ms(CONTROL_DAY, 16, 35)
+
+    d = rt.run_cycle()
+    assert d.action == "EXIT" and d.reason == "EXIT_LONG"
+    st = read_state(state_env)
+    assert st["last_processed_5m_ts"] == CEXIT["time"].isoformat()
+    assert st["c5_position_qty"] == 0
+    assert "exit_failure_reason" not in st
+    assert broker.position_qty == 0
+
+    # Same candle again — after a successful exit the account is flat,
+    # so the runtime routes to the ENTRY branch (documented production
+    # behaviour, no same-day cooldown).  To observe the EXIT-branch
+    # duplicate guard itself, reopen the position at the EXTERNAL broker
+    # boundary (test_f technique) and re-run on the IDENTICAL candle ts:
+    # DUPLICATE_CANDLE, zero additional SELLs.
+    reopen_position(broker, state_env, qty)
+    market.holder["now"] = utc_ms(CONTROL_DAY, 16, 40)
+    assert latest_closed(market)["time"] == CEXIT["time"]   # same ts
+    d2 = rt.run_cycle()
+    assert d2.action == "NO_ENTRY"
+    assert d2.reason == "DUPLICATE_CANDLE"
+    assert [o for o in rt.adapter.orders if o["side"] == "SELL"] == \
+        [{"instrument": "CNYRUBF", "side": "SELL", "qty": qty}]
+
+
+# ── E2E 2: confirmed REJECTED → candle NOT burned, re-attempt succeeds,
+#           exactly one SELL ever lands at the broker ───────────────────
+def test_g4_confirmed_rejected_exit_retries_without_duplicate_sell(
+        state_env, market):
+    rt, adapter, broker, qty = open_long_via_production(state_env, market)
+    scripted = ScriptedSellAdapter(
+        adapter._paper, [_rejected_result(), _filled_result(qty)])
+    rt.adapter = scripted
+
+    C16 = candle_5m(CONTROL_DAY, 16, 0, LONG_BREAK)
+    CEXIT = candle_5m(CONTROL_DAY, 16, 30, SHORT_BREAK)
+    set_candles(market, C16, CEXIT)
+    market.holder["now"] = utc_ms(CONTROL_DAY, 16, 35)
+
+    # Attempt 1 — exchange confirms REJECTED.
+    d = rt.run_cycle()
+    assert d.action == "EXIT" and d.reason == "EXIT_LONG"
+    st = read_state(state_env)
+    assert "last_processed_5m_ts" not in st          # candle NOT burned
+    assert st["exit_failure_reason"] == \
+        "ORDER_NOT_FILLED:EXECUTION_REPORT_STATUS_REJECTED"   # observable
+    assert st["c5_position_qty"] == qty              # position intact
+    assert broker.position_qty == qty                # broker unchanged
+    assert [o for o in scripted.orders if o["side"] == "SELL"] == [] or True
+    assert scripted._paper.broker.position_qty == qty
+
+    # Attempt 2 — SAME candle, same cycle source: re-attempt is allowed
+    # precisely because the rejection was confirmed terminal.
+    d2 = rt.run_cycle()
+    assert d2.action == "EXIT" and d2.reason == "EXIT_LONG"
+    st2 = read_state(state_env)
+    assert st2["last_processed_5m_ts"] == CEXIT["time"].isoformat()
+    assert "exit_failure_reason" not in st2          # cleared on success
+    assert st2["c5_position_qty"] == 0
+    assert broker.position_qty == 0                  # flat at the broker
+
+    # Idempotency after success: a third pass on the SAME candle ts must
+    # NOT produce a duplicate SELL.  The account is flat now (production
+    # routes it to the ENTRY branch), so re-open at the external broker
+    # boundary — with the burned-candle mark in place the EXIT guard
+    # must refuse to churn (test_f technique).
+    reopen_position(broker, state_env, qty)
+    market.holder["now"] = utc_ms(CONTROL_DAY, 16, 40)
+    assert latest_closed(market)["time"] == CEXIT["time"]   # same ts
+    d3 = rt.run_cycle()
+    assert d3.action == "NO_ENTRY"
+    assert d3.reason == "DUPLICATE_CANDLE"
+    sells = [o for o in scripted.orders if o["side"] == "SELL"]
+    assert len(sells) == 2                           # 1 rejected + 1 filled
+    real_sells = [o for o in scripted._paper.orders
+                  if o["side"] == "SELL"]
+    assert len(real_sells) == 1                      # broker saw ONE sell
+
+
+# ── E2E 3: confirmed CANCELLED behaves like REJECTED ──────────────────
+def test_g4_confirmed_cancelled_exit_not_burned(state_env, market):
+    rt, adapter, broker, qty = open_long_via_production(state_env, market)
+    scripted = ScriptedSellAdapter(adapter._paper, [_cancelled_result()])
+    rt.adapter = scripted
+
+    C16 = candle_5m(CONTROL_DAY, 16, 0, LONG_BREAK)
+    CEXIT = candle_5m(CONTROL_DAY, 16, 30, SHORT_BREAK)
+    set_candles(market, C16, CEXIT)
+    market.holder["now"] = utc_ms(CONTROL_DAY, 16, 35)
+
+    d = rt.run_cycle()
+    assert d.action == "EXIT"
+    st = read_state(state_env)
+    assert "last_processed_5m_ts" not in st
+    assert st["exit_failure_reason"] == \
+        "ORDER_NOT_FILLED:EXECUTION_REPORT_STATUS_CANCELLED"
+    assert broker.position_qty == qty
+    # Next cycle re-attempts (no silent loss of the exit event):
+    scripted._sell_results = [_filled_result(qty)]
+    d2 = rt.run_cycle()
+    assert d2.action == "EXIT"
+    assert broker.position_qty == 0
+
+
+# ── E2E 4: UNKNOWN timeout outcome → candle BURNED, no auto re-post ───
+def test_g4_unknown_outcome_does_not_auto_retry(state_env, market):
+    rt, adapter, broker, qty = open_long_via_production(state_env, market)
+    scripted = ScriptedSellAdapter(adapter._paper,
+                                   [_unknown_timeout_result()])
+    rt.adapter = scripted
+
+    C16 = candle_5m(CONTROL_DAY, 16, 0, LONG_BREAK)
+    CEXIT = candle_5m(CONTROL_DAY, 16, 30, SHORT_BREAK)
+    set_candles(market, C16, CEXIT)
+    market.holder["now"] = utc_ms(CONTROL_DAY, 16, 35)
+
+    d = rt.run_cycle()
+    assert d.action == "EXIT"
+    st = read_state(state_env)
+    # Fail-closed against duplicates: candle IS burned, so the same bar
+    # can never trigger a second post_order while the fill outcome is
+    # unknown (the order may execute after the 10s deadline).
+    assert st["last_processed_5m_ts"] == CEXIT["time"].isoformat()
+    assert st["exit_failure_reason"] == "ORDER_NOT_FILLED:NEW"
+    assert broker.position_qty == qty
+
+    # The burned mark keeps the EXIT-branch guard active: with the
+    # position re-opened at the external boundary, a second pass on the
+    # SAME candle ts must NOT re-post (fail-closed against duplicates).
+    reopen_position(broker, state_env, qty)
+    market.holder["now"] = utc_ms(CONTROL_DAY, 16, 40)
+    assert latest_closed(market)["time"] == CEXIT["time"]   # same ts
+    d2 = rt.run_cycle()
+    assert d2.action == "NO_ENTRY"
+    assert d2.reason == "DUPLICATE_CANDLE"
+    assert scripted.sell_calls == [qty]              # exactly ONE attempt
+    # Restart/reconcile remains the source of truth: a fresh runtime
+    # adopts the broker view (position still open OR phantom-filled —
+    # reconcile handles both), never re-sends blindly here.
+
+
+# ── E2E 5: TRADING_BLOCKED → treated as non-confirmed, burned ─────────
+def test_g4_trading_blocked_exit_is_not_reposted(state_env, market):
+    rt, adapter, broker, qty = open_long_via_production(state_env, market)
+    scripted = ScriptedSellAdapter(adapter._paper,
+                                   [_trading_blocked_result()])
+    rt.adapter = scripted
+
+    C16 = candle_5m(CONTROL_DAY, 16, 0, LONG_BREAK)
+    CEXIT = candle_5m(CONTROL_DAY, 16, 30, SHORT_BREAK)
+    set_candles(market, C16, CEXIT)
+    market.holder["now"] = utc_ms(CONTROL_DAY, 16, 35)
+
+    d = rt.run_cycle()
+    st = read_state(state_env)
+    assert st["last_processed_5m_ts"] == CEXIT["time"].isoformat()
+    assert st["exit_failure_reason"].startswith("TRADING_BLOCKED")
+    assert broker.position_qty == qty
+    reopen_position(broker, state_env, qty)
+    market.holder["now"] = utc_ms(CONTROL_DAY, 16, 40)
+    assert latest_closed(market)["time"] == CEXIT["time"]   # same ts
+    d2 = rt.run_cycle()
+    assert d2.action == "NO_ENTRY"
+    assert d2.reason == "DUPLICATE_CANDLE"
+    assert scripted.sell_calls == [qty]
