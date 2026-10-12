@@ -159,11 +159,15 @@ class LiveExecutionAdapter(BaseExecutionAdapter):
             if not (equity and equity > 0):
                 equity = free_cash + abs(pos_qty) * (entry_price or 0.0)
 
-            try:
-                open_orders = len(retry_api_call(
-                    client.orders.get_orders)(account_id=account_id).orders)
-            except Exception:
-                open_orders = 0
+            # Fail closed (open_orders trustworthiness fix): a get_orders()
+            # error must NOT be masked as open_orders=0 — that would let
+            # reconcile() read an unknown state as "confirmed absence of
+            # working orders".  The exception propagates unchanged, exactly
+            # like the sibling get_positions()/get_portfolio() calls above;
+            # bootstrap() then marks reconcile FAILED and no execution is
+            # enabled (STARTUP_RECONCILE_FAILED).
+            open_orders = len(retry_api_call(
+                client.orders.get_orders)(account_id=account_id).orders)
 
         return AccountSnapshot(
             account_id=account_id,
