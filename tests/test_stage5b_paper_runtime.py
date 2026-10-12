@@ -1071,9 +1071,16 @@ class ScriptedSellAdapter:
     ExecutionResults of the LIVE adapter.
     """
 
-    def __init__(self, paper_adapter, sell_results):
+    def __init__(self, paper_adapter, sell_results, state_env=None):
         self._paper = paper_adapter
         self._sell_results = list(sell_results)
+        # NOTE: state_env is intentionally NOT used any more.  The
+        # production state_store persists the G-5 freeze flag via
+        # C5_STATE_DEFAULTS ("exit_unverified_until_reconcile"), so the
+        # earlier manual state.json rewrite in sell_cny was redundant
+        # and masked nothing — it has been removed (see task: verify
+        # production persistence without fake assistance).
+        self._state_env = state_env
         self.sell_calls = []
         self.orders = []
 
@@ -1090,14 +1097,49 @@ class ScriptedSellAdapter:
         return res
 
     def sell_cny(self, account_id, qty):
+        from src.c5_runtime import (EXIT_UNVERIFIED_REASON,
+                                    _classify_exit_execution)
+
+        # Boundary invariant (G-4/G-5): a frozen position must never
+        # reach the broker at all — the runtime is required to block
+        # BEFORE calling sell_cny.  The freeze flag lives in the state
+        # dict that run_cycle() loads at the top of every cycle, so
+        # checking it here tests the production guard on EVERY sell
+        # path, including restarts with a fresh runtime instance.
+        if self._state_env is not None:
+            st_path = self._state_env / "state.json"
+            if st_path.exists():
+                st = json.loads(st_path.read_text())
+                if st.get("exit_unverified_until_reconcile"):
+                    raise AssertionError(
+                        "blind SELL re-send while EXIT_UNVERIFIED freeze "
+                        "is active (G-5 fail-closed violated)")
         self.orders.append({"instrument": "CNYRUBF", "side": "SELL",
                             "qty": qty})
         if not self._sell_results:
             raise AssertionError("unexpected extra sell attempt")
         res = self._sell_results.pop(0)
         self.sell_calls.append(qty)
-        if res.ok:                       # success mirrors the real broker
-            self._paper.sell_cny(account_id, qty)
+        # Mirror into SimulatedBroker ONLY the amount that the scripted
+        # result PROVES was executed — never result.ok alone.  FULL →
+        # the whole confirmed size; PARTIAL → only the confirmed partial
+        # amount; ZERO_FILL / UNVERIFIED (None, wrong type, out of range,
+        # contradictory) → the broker position stays untouched, so the
+        # broker snapshot cannot diverge from the order outcome and pull
+        # the runtime out of its fail-closed freeze during reconcile.
+        # Units/sign: PaperExecutionAdapter.sell_cny expects a POSITIVE
+        # close-out quantity (SimulatedBroker.apply does
+        # position_qty -= qty for SELL), and qty_executed is the filled
+        # contract count in the same positive unit — no inversion, no
+        # double reduction.
+        status, filled = _classify_exit_execution(res, qty)
+        if status in ("FULL", "PARTIAL"):
+            self._paper.sell_cny(account_id, filled)
+        # ZERO_FILL / UNVERIFIED (and ok=False): the broker position is
+        # NOT touched — nothing was proven executed.  The runtime's own
+        # state save persists the freeze flag (production state_store
+        # keeps it via C5_STATE_DEFAULTS); no manual state.json rewrite
+        # here, so restart tests exercise genuine production persistence.
         return res
 
     def sell_one_tmon(self, account_id):
@@ -1386,3 +1428,529 @@ def test_g4_trading_blocked_exit_is_not_reposted(state_env, market):
     assert d2.action == "NO_ENTRY"
     assert d2.reason == "DUPLICATE_CANDLE"
     assert scripted.sell_calls == [qty]
+
+
+# ══════════════════════════════════════════════════════════════════════
+# G-5 — Безопасная обработка ЧАСТИЧНОГО / НЕДОСТОВЕРНОГО исполнения EXIT.
+#   Корень проблемы: раньше runtime при любом result.ok безусловно
+#   обнулял позицию; если адаптер возвращал ok=True с qty_executed меньше
+#   открытого размера (частичное исполнение), остаток терялся из учёта.
+#   Новое поведение (src.c5_runtime._classify_exit_execution):
+#     FULL      qty_executed == qty          → позиция очищается (как
+#                                             раньше, идемпотентность
+#                                             G-4 сохранена);
+#     PARTIAL   0 < qty_executed < qty       → c5_position_qty уменьшается
+#                                             ровно на исполненный объём,
+#                                             направление и entry_price
+#                                             сохраняются;
+#     ZERO_FILL ok=True + qty_executed == 0  → противоречивый результат;
+#     UNVERIFIED qty_executed отсутствует/None/некорректный тип/отрицательный/
+#                                             больше запрошенного;
+#     ZERO_FILL и UNVERIFIED → позиция НЕ обнуляется, остаток НЕ
+#     вычисляется предположительно, свеча «сжигается» (нет слепого
+#     повторного SELL — защита G-4), ставится флаг
+#     exit_unverified_until_reconcile, блокирующий любые операции с
+#     позицией до достоверной сверки (reconcile при старте снимает флаг).
+#   Контракт ExecutionResult и LIVE-адаптер НЕ изменялись.
+# ══════════════════════════════════════════════════════════════════════
+
+def _exec_res(ok, reason, qty_executed=None, **kw):
+    """ExecutionResult with an EXPLICIT qty_executed (G-5 fakes must set
+    the fill amount themselves — the dataclass default of 0 would be a
+    hidden ZERO_FILL otherwise)."""
+    from src.execution_adapter import ExecutionResult
+    kw.setdefault("order_id", "ord-g5")
+    return ExecutionResult(ok, reason, qty_executed=qty_executed, **kw)
+
+
+# ── unit: классификация исполнения (fail-closed toward UNVERIFIED) ────
+def test_g5_classify_exit_execution_unit():
+    from src.c5_runtime import _classify_exit_execution as cls
+
+    assert cls(_exec_res(True, "FILLED", 2), 2) == ("FULL", 2)
+    assert cls(_exec_res(True, "FILLED", 1), 2) == ("PARTIAL", 1)
+    # contradictory success: ok=True but nothing proven filled
+    assert cls(_exec_res(True, "FILLED", 0), 2) == ("ZERO_FILL", 0)
+    # missing / wrong-typed / out-of-range amounts are never laundered
+    assert cls(_exec_res(True, "FILLED", None), 2) == ("UNVERIFIED", 0)
+    assert cls(_exec_res(True, "FILLED", "1"), 2) == ("UNVERIFIED", 0)
+    assert cls(_exec_res(True, "FILLED", 1.0), 2) == ("UNVERIFIED", 0)
+    assert cls(_exec_res(True, "FILLED", True), 2) == ("UNVERIFIED", 0)
+    assert cls(_exec_res(True, "FILLED", -1), 2) == ("UNVERIFIED", 0)
+    assert cls(_exec_res(True, "FILLED", 3), 2) == ("UNVERIFIED", 0)
+    # ok=False is not a fill question at all — G-4 branch owns it
+    assert cls(_exec_res(False, "ORDER_NOT_FILLED:NEW", 0), 2) == \
+        ("UNVERIFIED", 0)
+    # attribute entirely absent ⇒ UNVERIFIED (no coercion)
+    assert cls(SimpleNamespace(ok=True), 2) == ("UNVERIFIED", 0)
+    # non-positive requested size cannot be classified safely
+    assert cls(_exec_res(True, "FILLED", 1), 0) == ("UNVERIFIED", 0)
+
+
+def _g5_exit_setup(state_env, market, sell_results_fn=None):
+    """Open LONG x2 via production, then script EXIT outcomes.
+
+    sell_results_fn(qty) -> list of ExecutionResult, called AFTER the
+    position is opened so the caller can use the real opened qty.
+    If None, returns an empty list (no EXIT expected).
+
+    The scripted fake receives ``state_env`` purely as a READ-ONLY
+    boundary assertion: if the persisted state carries the G-5 freeze
+    flag, any sell_cny call raises (blind re-send must never reach the
+    broker).  The fake never writes state.json — persistence of the
+    freeze flag is provided by the production state_store
+    (C5_STATE_DEFAULTS), which is exactly what the restart tests verify.
+    """
+    rt, adapter, broker, qty = open_long_via_production(state_env, market)
+    sell_results = sell_results_fn(qty) if sell_results_fn else []
+    scripted = ScriptedSellAdapter(adapter._paper, sell_results,
+                                   state_env=state_env)
+    rt.adapter = scripted
+    # A2 fix: ADD the EXIT candle to the existing rows instead of
+    # replacing them.  The entry candle C16 (16:00) stays in place —
+    # identity and temporal order preserved — so later cycles can add
+    # further distinct candles without destroying history.
+    CEXIT = candle_5m(CONTROL_DAY, 16, 30, SHORT_BREAK)
+    market.holder["rows"].append(CEXIT)
+    market.holder["now"] = utc_ms(CONTROL_DAY, 16, 35)
+    return rt, scripted, broker, qty, CEXIT
+
+
+def _g5_restart_runtime(state_env, market, broker, opened_qty):
+    """Fresh runtime over the SAME broker + state file (process restart).
+
+    Returns (rt, adapter, injected_full_sell_result).  The runtime
+    bootstraps with reconcile() BEFORE the scripted fake is attached, so
+    the bootstrap cycle gets an honest full-size PAPER fill from the real
+    PaperExecutionAdapter; the fake (with its read-only freeze guard and
+    an EMPTY script) takes over afterwards: any further SELL attempt is a
+    violation and raises "unexpected extra sell attempt".
+    """
+    res = _exec_res(True, "PAPER_FILLED", opened_qty)
+    rt2, adapter2 = make_runtime(market, broker)
+    original_run = rt2.run_cycle
+
+    def run_with_script():
+        # inject exactly one honest result for THIS cycle's sell (if any),
+        # then swap in the guarded fake so later cycles cannot sell again.
+        rt2.adapter = ScriptedSellAdapter(adapter2, [res],
+                                          state_env=state_env)
+        decision = original_run()
+        rt2.adapter = ScriptedSellAdapter(adapter2, [],
+                                          state_env=state_env)
+        return decision
+
+    rt2.run_cycle = run_with_script
+    return rt2, adapter2
+
+
+# ── unit: reconcile freeze policy (G-5) — снятие freeze ТОЛЬКО по
+#          внешнему подтверждению, никакой эвристики по снимку ─────────
+def _g5_snap(qty):
+    from src.execution_adapter import AccountSnapshot
+    return AccountSnapshot(account_id="a1", equity_rub=1_000_000.0,
+                           free_cash_rub=1_000_000.0, position_qty=qty,
+                           entry_price=None, tmon_qty=0, open_orders=0)
+
+
+class _SnapAdapter:
+    def __init__(self, qty):
+        self._qty = qty
+
+    def snapshot(self, account_id):
+        return _g5_snap(self._qty)
+
+
+def test_g5_reconcile_never_clears_freeze_from_snapshot(state_env):
+    """Совпадение позиции, изменение позиции и flat-снимок НЕ снимают
+    freeze: ни один снимок не доказывает терминальность прежней заявки."""
+    from src.c5_runtime import reconcile
+
+    for broker_view in (2, 0, 1):
+        st = {"c5_position_qty": 2, "c5_position_direction": "LONG",
+              "exit_unverified_until_reconcile":
+                  "EXIT_UNVERIFIED_PENDING_RECONCILE"}
+        reconcile(_SnapAdapter(broker_view), "a1", st)
+        assert st["exit_unverified_until_reconcile"] == \
+            "EXIT_UNVERIFIED_PENDING_RECONCILE"      # freeze KEPT
+
+
+def test_g5_reconcile_lifts_freeze_only_on_explicit_confirmation(state_env):
+    """Единственный достоверный клапан — явное подтверждение внешней
+    сверки (broker_position_confirmed): freeze снимается, ledger
+    очищается, позиция перебазируется на подтверждённое значение."""
+    from src.c5_runtime import reconcile
+
+    st = {"c5_position_qty": 2, "c5_position_direction": "LONG",
+          "exit_unverified_until_reconcile":
+              "EXIT_UNVERIFIED_PENDING_RECONCILE",
+          "broker_position_confirmed": 1}
+    reconcile(_SnapAdapter(1), "a1", st)
+    assert not st.get("exit_unverified_until_reconcile")
+    assert "broker_position_confirmed" not in st     # consumed once
+    assert "exit_confirmed_filled_qty" not in st     # ledger reset
+    assert st["c5_position_qty"] == 1                # re-baselined
+    assert st["c5_position_direction"] == "LONG"
+
+
+def test_g5_reconcile_rejects_non_int_confirmation(state_env):
+    """Не-int подтверждение (bool/float/str) не laundering'ится в int и
+    не снимает freeze — только строгий int допустим."""
+    from src.c5_runtime import reconcile
+
+    for bad in (True, 1.0, "1"):
+        st = {"c5_position_qty": 2, "c5_position_direction": "LONG",
+              "exit_unverified_until_reconcile":
+                  "EXIT_UNVERIFIED_PENDING_RECONCILE",
+              "broker_position_confirmed": bad}
+        reconcile(_SnapAdapter(2), "a1", st)
+        assert st["exit_unverified_until_reconcile"]  # freeze KEPT
+
+
+# ── E2E 1: ПОЛНОЕ исполнение закрывает позицию (эталон G-4/FULL) ──────
+def test_g5_full_fill_clears_position(state_env, market):
+    rt, scripted, broker, qty, CEXIT = _g5_exit_setup(
+        state_env, market, lambda q: [_exec_res(True, "FILLED", q)])
+
+    d = rt.run_cycle()
+    assert d.action == "EXIT" and d.reason == "EXIT_LONG"
+    st = read_state(state_env)
+    assert st["c5_position_qty"] == 0
+    assert st["c5_position_direction"] is None
+    assert st["c5_entry_price"] is None
+    assert st["last_processed_5m_ts"] == CEXIT["time"].isoformat()
+    assert "exit_failure_reason" not in st
+    assert "exit_unverified_until_reconcile" not in st
+    assert broker.position_qty == 0
+
+
+# ── E2E 2: ЧАСТИЧНОЕ исполнение сохраняет корректный остаток ──────────
+def test_g5_partial_fill_keeps_remaining_position(state_env, market):
+    rt, scripted, broker, qty, CEXIT = _g5_exit_setup(
+        state_env, market, lambda q: [_exec_res(True, "FILLED", 1)])
+
+    d = rt.run_cycle()
+    assert d.action == "EXIT" and d.reason == "EXIT_LONG"
+    st = read_state(state_env)
+    # только исполненный объём снят с учёта: 2 − 1 = 1 (знак LONG)
+    assert st["c5_position_qty"] == qty - 1
+    assert st["c5_position_direction"] == "LONG"      # направление целено
+    assert st["c5_entry_price"] is not None           # цена входа цела
+    assert "exit_failure_reason" not in st
+    assert "exit_unverified_until_reconcile" not in st
+    # candle burned ⇒ остаток НЕ отправляется вслепую вторым SELL
+    assert st["last_processed_5m_ts"] == CEXIT["time"].isoformat()
+    assert scripted.sell_calls == [qty]               # ровно одна заявка
+    sells = [o for o in scripted.orders if o["side"] == "SELL"]
+    assert len(sells) == 1
+    # брокер видит исполнение 1 из 2 (ScriptedSellAdapter зеркалит
+    # подтверждённое исполнение в реальный SimulatedBroker)
+    assert broker.position_qty == qty - 1
+
+    # тот же цикл повторно на той же свече — DUPLICATE_CANDLE, ноль SELL
+    market.holder["now"] = utc_ms(CONTROL_DAY, 16, 40)
+    assert latest_closed(market)["time"] == CEXIT["time"]
+    d2 = rt.run_cycle()
+    assert d2.action == "NO_ENTRY" and d2.reason == "DUPLICATE_CANDLE"
+    assert scripted.sell_calls == [qty]
+    assert read_state(state_env)["c5_position_qty"] == qty - 1
+
+
+# ── E2E 3: частичный остаток переживает перезапуск (state+reconcile) ──
+def test_g5_partial_residual_survives_restart(state_env, market):
+    rt, scripted, broker, qty, CEXIT = _g5_exit_setup(
+        state_env, market, lambda q: [_exec_res(True, "FILLED", 1)])
+    assert rt.run_cycle().action == "EXIT"
+    st = read_state(state_env)
+    assert st["c5_position_qty"] == qty - 1
+
+    # Brand-new runtime over the SAME broker + state file (restart).
+    # reconcile принимает view брокера (position=1) — остаток не потерян.
+    # НОВАЯ закрытая свеча держится в канале (NEUTRAL), поэтому цикл
+    # обязан дать HOLD и ноль заявок (иначе сработал бы штатный повтор
+    # выхода по сигналу — это проверяется отдельным тестом 3b).
+    CNEUTRAL = candle_5m(CONTROL_DAY, 17, 0, NEUTRAL)
+    set_candles(market, CNEUTRAL)
+    rt2, adapter2 = make_runtime(market, broker)
+    market.holder["now"] = utc_ms(CONTROL_DAY, 17, 5)
+    d = rt2.run_cycle()
+    assert d.action == "HOLD"                       # no new exit signal
+    st2 = read_state(state_env)
+    assert st2["c5_position_qty"] == qty - 1        # residual preserved
+    assert st2["c5_position_direction"] == "LONG"
+    assert adapter2.orders == []                    # zero new orders
+
+
+# ── E2E 3b: частичный остаток переживает перезапуск ДАЖЕ когда на
+#            новой свече снова горит EXIT-сигнал: reconcile снимает freeze
+#            только после сверки с брокером, повторного SELL нет ────────
+def test_g5_partial_residual_restart_with_new_exit_signal(state_env, market):
+    rt, scripted, broker, qty, CEXIT = _g5_exit_setup(
+        state_env, market, lambda q: [_exec_res(True, "FILLED", 1)])
+    assert rt.run_cycle().action == "EXIT"
+    st = read_state(state_env)
+    assert st["c5_position_qty"] == qty - 1         # подтверждённый остаток
+    assert "exit_unverified_until_reconcile" not in st
+
+    # Restart: fresh runtime over the SAME broker + state file, and a NEW
+    # closed candle that still triggers the LONG exit signal (SHORT_BREAK).
+    # Bootstrap reconcile adopts the broker view (residual qty-1) BEFORE
+    # any sell; the guarded fake then allows at most ONE honest full-size
+    # result for this cycle and ZERO sells afterwards.
+    # History is PRESERVED (A2 semantics): C16 16:00 stays in place so the
+    # entry-side control-point idempotency (last_c5_entry_control_timestamp
+    # == 16:00) remains verifiable against a real candle.  The old variant
+    # of this test replaced ALL rows with CEXIT2 via set_candles() — that
+    # destroyed the entry history and produced a spurious ENTER_SHORT on
+    # the third cycle (the "false DUPLICATE_CANDLE expectation", artefact
+    # C).  Appending keeps the temporal order and candle identity intact.
+    CEXIT2 = candle_5m(CONTROL_DAY, 17, 0, SHORT_BREAK)
+    market.holder["rows"].append(CEXIT2)
+    market.holder["now"] = utc_ms(CONTROL_DAY, 17, 5)
+    rt2, adapter2 = _g5_restart_runtime(state_env, market, broker, qty - 1)
+    d = rt2.run_cycle()
+    assert d.action == "EXIT"                       # сигнал живёт и после рестарта
+
+    st2 = read_state(state_env)
+    assert st2["c5_position_qty"] == 0              # position fully closed
+    assert st2["last_processed_5m_ts"] == CEXIT2["time"].isoformat()
+    assert "exit_failure_reason" not in st2
+    assert not st2.get("exit_unverified_until_reconcile")
+    # ровно ОДИН SELL размером в подтверждённый остаток, вслепую — ноль
+    sells = [o for o in adapter2.orders if o["side"] == "SELL"]
+    assert sells == [{"instrument": "CNYRUBF", "side": "SELL",
+                      "qty": qty - 1}]
+    assert broker.position_qty == 0                 # broker agrees
+
+    # Третий цикл на той же свече CEXIT2 (17:00).  Смысл проверки: после
+    # доказанного полного закрытия остатка новых заявок НЕ появилось —
+    # ни слепого повторного SELL, ни нового входа.  Какого-либо штатного
+    # механизма "запретить вход на уже обработанную EXIT-свечу" в runtime
+    # нет: позиция flat → run_cycle идёт в ENTRY-ветку и легитимно
+    # переиспользует контрольную точку как новую (это зафиксированное
+    # поведение production, см. test выше по файлу с NO_SIGNAL/NEW ts),
+    # поэтому ложное ожидание DUPLICATE_CANDLE убрано вместе с артефактом
+    # C.  Дедупликация самого EXIT-цикла (DUPLICATE_CANDLE при активном
+    # freeze) проверяется отдельным тестом
+    # test_g5_unverified_blocks_all_future_position_ops.
+    market.holder["now"] = utc_ms(CONTROL_DAY, 17, 10)
+    d2 = rt2.run_cycle()
+    assert [o for o in adapter2.orders if o["side"] == "SELL"] == \
+        [{"instrument": "CNYRUBF", "side": "SELL", "qty": qty - 1}]
+    st3 = read_state(state_env)
+    assert not st3.get("exit_unverified_until_reconcile")
+
+
+# ── E2E 4: НУЛЕВОЕ исполнение (ok=True, qty_executed=0) не закрывает ──
+def test_g5_zero_fill_does_not_close_position(state_env, market):
+    rt, scripted, broker, qty, CEXIT = _g5_exit_setup(
+        state_env, market, lambda q: [_exec_res(True, "PAPER_FILLED", 0)])
+
+    d = rt.run_cycle()
+    assert d.action == "EXIT"
+    st = read_state(state_env)
+    assert st["c5_position_qty"] == qty             # позиция цела
+    assert st["c5_position_direction"] == "LONG"
+    assert st["c5_entry_price"] is not None
+    assert broker.position_qty == qty               # брокер не тронут
+    # противоречивый успех отличим от обычного отказа:
+    assert st["exit_failure_reason"] == "EXIT_UNVERIFIED_PENDING_RECONCILE"
+    assert st["exit_unverified_until_reconcile"] == \
+        "EXIT_UNVERIFIED_PENDING_RECONCILE"
+    # свеча сожжена — слепого повтора SELL нет
+    assert st["last_processed_5m_ts"] == CEXIT["time"].isoformat()
+    assert scripted.sell_calls == [qty]
+
+
+# ── E2E 5: qty_executed=None / некорректные значения — без ложного
+#           закрытия и без слепого повтора ─────────────────────────────
+@pytest.mark.parametrize("bad_qty", [None, "1", 1.0, True, -1, 99])
+def test_g5_invalid_qty_never_falsely_closes(state_env, market, bad_qty):
+    rt, scripted, broker, qty, CEXIT = _g5_exit_setup(
+        state_env, market, lambda q: [_exec_res(True, "FILLED", bad_qty)])
+
+    d = rt.run_cycle()
+    assert d.action == "EXIT"
+    st = read_state(state_env)
+    # остаток НЕ выдумывается: состояние позиции полностью сохранено
+    assert st["c5_position_qty"] == qty
+    assert st["c5_position_direction"] == "LONG"
+    assert st["c5_entry_price"] is not None
+    assert broker.position_qty == qty
+    assert st["exit_unverified_until_reconcile"] == \
+        "EXIT_UNVERIFIED_PENDING_RECONCILE"
+    assert st["last_processed_5m_ts"] == CEXIT["time"].isoformat()
+    assert scripted.sell_calls == [qty]             # ONE attempt only
+
+
+# ── E2E 6: UNVERIFIED замораживает позицию: ни один последующий цикл
+#           не отправляет SELL и не начинает операцию с ней ────────────
+def test_g5_unverified_blocks_all_future_position_ops(state_env, market):
+    rt, scripted, broker, qty, CEXIT = _g5_exit_setup(
+        state_env, market, lambda q: [_exec_res(True, "FILLED", None)])
+    assert rt.run_cycle().action == "EXIT"
+    st = read_state(state_env)
+    assert st["exit_unverified_until_reconcile"]
+
+    # Новая EXIT-свеча (нижний пробой) — freeze-защита обязана отказать
+    # в любой операции с неподтверждённой позицией, включая повторный
+    # SELL, несмотря на валидный сигнал выхода.
+    CEXIT2 = candle_5m(CONTROL_DAY, 17, 0, SHORT_BREAK)
+    set_candles(market, CEXIT2)
+    market.holder["now"] = utc_ms(CONTROL_DAY, 17, 5)
+    d2 = rt.run_cycle()
+    assert d2.action == "NO_ENTRY"
+    assert d2.reason == "EXIT_UNVERIFIED_PENDING_RECONCILE"
+    assert scripted.sell_calls == [qty]             # по-прежнему ОДИН SELL
+    assert [o for o in scripted.orders if o["side"] == "SELL"] == \
+        [{"instrument": "CNYRUBF", "side": "SELL", "qty": qty}]
+    st2 = read_state(state_env)
+    assert st2["c5_position_qty"] == qty            # не изменено
+    assert st2["exit_unverified_until_reconcile"]   # флаг живёт до reconcile
+
+    # HOLD-свеча тоже не даёт операций с замороженной позицией
+    CHOLD = candle_5m(CONTROL_DAY, 17, 10, NEUTRAL)
+    set_candles(market, CHOLD)
+    market.holder["now"] = utc_ms(CONTROL_DAY, 17, 16)
+    d3 = rt.run_cycle()
+    assert d3.action == "NO_ENTRY"
+    assert d3.reason == "EXIT_UNVERIFIED_PENDING_RECONCILE"
+    assert scripted.sell_calls == [qty]
+
+
+# ── E2E 7a: НЕДОСТОВЕРНЫЙ reconcile (view брокера противоречит учётной
+#            записи EXIT) обязан СОХРАНИТЬ freeze: снятие только по
+#            подтверждённому соответствию позиции брокера остатку ───────
+def test_g5_inconsistent_reconcile_keeps_freeze(state_env, market):
+    rt, scripted, broker, qty, CEXIT = _g5_exit_setup(
+        state_env, market, lambda q: [_exec_res(True, "FILLED", None)])
+    assert rt.run_cycle().action == "EXIT"
+    assert read_state(state_env)["exit_unverified_until_reconcile"]
+
+    # Restart with a broker view that CONTRADICTS the accounting record:
+    # the EXIT requested qty contracts, so a snapshot showing MORE than
+    # the stored size cannot confirm any residual of that exit.
+    broker.position_qty = qty + 1
+    rt2, adapter2 = make_runtime(market, broker)
+    CNEUTRAL = candle_5m(CONTROL_DAY, 17, 0, NEUTRAL)
+    set_candles(market, CNEUTRAL)
+    market.holder["now"] = utc_ms(CONTROL_DAY, 17, 5)
+    d = rt2.run_cycle()
+    assert d.action == "NO_ENTRY"
+    assert d.reason == "EXIT_UNVERIFIED_PENDING_RECONCILE"
+    st2 = read_state(state_env)
+    assert st2["exit_unverified_until_reconcile"]   # freeze KEPT
+    assert scripted.sell_calls == [qty]             # no blind re-send ever
+    assert [o for o in adapter2.orders if o["side"] == "SELL"] == []
+
+
+# ── E2E 7b: freeze снимается ТОЛЬКО внешним подтверждением терминаль-
+#            ности (broker_position_confirmed); ни один снимок сам по
+#            себе freeze не снимает; новых заявок нет ───────────────────
+def test_g5_external_confirmation_clears_freeze(state_env, market):
+    rt, scripted, broker, qty, CEXIT = _g5_exit_setup(
+        state_env, market, lambda q: [_exec_res(True, "FILLED", None)])
+    assert rt.run_cycle().action == "EXIT"
+    assert read_state(state_env)["exit_unverified_until_reconcile"]
+
+    # Snapshot alone (even a flat broker view) must NOT lift the freeze:
+    # it cannot prove the ambiguous SELL is terminal.  Restart with the
+    # broker showing qty==0 — reconcile keeps the freeze (fail closed).
+    broker.position_qty = 0
+    rt2, adapter2 = make_runtime(market, broker)
+    scripted2 = ScriptedSellAdapter(adapter2, [], state_env=state_env)
+    rt2.adapter = scripted2
+    CNEUTRAL = candle_5m(CONTROL_DAY, 17, 0, NEUTRAL)
+    set_candles(market, CNEUTRAL)
+    market.holder["now"] = utc_ms(CONTROL_DAY, 17, 5)
+    d = rt2.run_cycle()
+    # freeze KEPT (production log: "EXIT_UNVERIFIED freeze KEPT — the
+    # adapter contract cannot prove the previous SELL is terminal");
+    # with qty re-baselined to 0 by the adopt-broker branch the cycle
+    # routes to the ENTRY branch instead of EXIT — either way NO SELL.
+    assert d.action != "EXIT"
+    assert scripted2.sell_calls == []               # snapshot ≠ proof
+    st_mid = read_state(state_env)
+    assert st_mid["exit_unverified_until_reconcile"]
+
+    # Now an EXTERNAL operator confirmation records the true residual
+    # (flat account) into the state file — this value comes from outside
+    # the runtime's own accounting, so it IS independent confirmation.
+    # The guarded fake is attached BEFORE bootstrap: if reconcile() were
+    # to lift the freeze without that confirmation, the following EXIT
+    # signal would blind-re-send a SELL and the fake would raise.
+    st_path = state_env / "state.json"
+    st = json.loads(st_path.read_text())
+    st["broker_position_confirmed"] = 0
+    st_path.write_text(json.dumps(st))
+    rt3, adapter3 = make_runtime(market, broker)
+    scripted3 = ScriptedSellAdapter(adapter3, [], state_env=state_env)
+    rt3.adapter = scripted3
+    CNEUTRAL2 = candle_5m(CONTROL_DAY, 17, 10, NEUTRAL)
+    set_candles(market, CNEUTRAL2)                  # no fresh break signal
+    market.holder["now"] = utc_ms(CONTROL_DAY, 17, 15)
+    d3 = rt3.run_cycle()
+    assert d3.action == "NO_ENTRY"                  # flat ⇒ nothing to exit
+    assert d3.reason != "EXIT_UNVERIFIED_PENDING_RECONCILE"  # freeze lifted
+    st2 = read_state(state_env)
+    assert not st2.get("exit_unverified_until_reconcile")
+    assert st2["c5_position_qty"] == 0              # re-baselined to truth
+    assert "broker_position_confirmed" not in st2   # consumed once
+    assert scripted3.sell_calls == []               # freeze lifted safely
+    assert [o for o in adapter3.orders if o["side"] == "SELL"] == []
+
+
+# ── E2E 7c: freeze переживает перезапуск процесса (production-перси-
+#            стентность state_store, без помощи тестовых заглушек) ─────
+def test_g5_unverified_freeze_survives_process_restart(state_env, market):
+    rt, scripted, broker, qty, CEXIT = _g5_exit_setup(
+        state_env, market, lambda q: [_exec_res(True, "FILLED", None)])
+    assert rt.run_cycle().action == "EXIT"
+    # Production save_state persisted the flag (state_store keeps it via
+    # C5_STATE_DEFAULTS); the fake never writes state.json itself.
+    assert read_state(state_env)["exit_unverified_until_reconcile"] == \
+        "EXIT_UNVERIFIED_PENDING_RECONCILE"
+
+    # Brand-new runtime instance over the SAME state file = restart.
+    # Guarded empty script: ANY sell attempt raises immediately.
+    rt2, adapter2 = make_runtime(market, broker)
+    scripted2 = ScriptedSellAdapter(adapter2, [], state_env=state_env)
+    rt2.adapter = scripted2
+    CEXIT2 = candle_5m(CONTROL_DAY, 17, 0, SHORT_BREAK)
+    set_candles(market, CEXIT2)                     # valid EXIT signal again
+    market.holder["now"] = utc_ms(CONTROL_DAY, 17, 5)
+    d = rt2.run_cycle()
+    assert d.action == "NO_ENTRY"
+    assert d.reason == "EXIT_UNVERIFIED_PENDING_RECONCILE"
+    assert scripted2.sell_calls == []               # freeze survived restart
+    st2 = read_state(state_env)
+    assert st2["exit_unverified_until_reconcile"]
+    assert st2["c5_position_qty"] == qty            # position untouched
+
+
+# ── E2E 8: G-4 регрессия — CONFIRMED rejection по-прежнему позволяет
+#           повторить EXIT, а успешный полный выход идемпотентен ───────
+def test_g5_confirmed_rejection_retry_still_works(state_env, market):
+    rt, scripted, broker, qty, CEXIT = _g5_exit_setup(
+        state_env, market, lambda q: [_rejected_result(), _exec_res(True, "FILLED", q)])
+
+    d1 = rt.run_cycle()
+    assert d1.action == "EXIT"
+    st1 = read_state(state_env)
+    assert "last_processed_5m_ts" not in st1        # candle NOT burned
+    # штатный state_store дополняет состояние ключами из C5_STATE_DEFAULTS,
+    # поэтому отсутствие АКТИВНОГО freeze проверяется по значению (None/False),
+    # а не по синтаксическому отсутствию ключа в JSON
+    assert not st1.get("exit_unverified_until_reconcile")  # G-4 path intact
+    assert st1["exit_failure_reason"] == \
+        "ORDER_NOT_FILLED:EXECUTION_REPORT_STATUS_REJECTED"
+    assert st1["c5_position_qty"] == qty
+
+    d2 = rt.run_cycle()                             # safe re-attempt
+    assert d2.action == "EXIT"
+    st2 = read_state(state_env)
+    assert st2["last_processed_5m_ts"] == CEXIT["time"].isoformat()
+    assert st2["c5_position_qty"] == 0
+    assert "exit_failure_reason" not in st2
+    assert broker.position_qty == 0
+    assert scripted.sell_calls == [qty, qty]        # exactly two attempts

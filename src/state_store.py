@@ -64,6 +64,9 @@ C5_STATE_DEFAULTS = {
     "margin_long_rate": None,
     "margin_short_rate": None,
     "reconcile_status": None,
+    # G-5: set when an EXIT execution outcome could not be verified;
+    # blocks all position operations until reconcile re-baselines state.
+    "exit_unverified_until_reconcile": None,
 }
 
 
