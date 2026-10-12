@@ -183,51 +183,61 @@ def reconcile(adapter, account_id: str, state: dict) -> "object":
     # end-state OR a live order that will execute more later), so no
     # automatic heuristic here may invent a residual.
     #
-    # Trustworthy confirmation is possible ONLY when the snapshot agrees
-    # with what the EXIT ledger already PROVED about this position:
-    #   * zero working orders — a live/pending SELL can still change the
-    #     residual after this snapshot, so today's qty proves nothing;
-    #   * expected residual = stored qty minus the CONFIRMED fills of
-    #     prior exit attempts (0 for UNVERIFIED/ZERO_FILL — nothing was
-    #     proven executed; `filled` for a confirmed PARTIAL).  The
-    #     snapshot must match that expectation exactly.
-    # Only then is the adopted broker view above a genuine re-baseline
-    # and the freeze lifts.  On any mismatch/uncertainty the freeze
-    # stays active (fail closed): no repeated SELL, no new operation
-    # with this position, including across process restarts (the flag
-    # persists via state_store.C5_STATE_DEFAULTS).
+    # G-5 (this fix): NO automatic heuristic may lift the freeze.  A
+    # single snapshot cannot prove that the previous ambiguous SELL is
+    # TERMINAL (no longer able to execute):
+    #   * broker_qty == stored size may mean "nothing filled" AND "a
+    #     working order that will fill later";
+    #   * broker_qty changed (including to zero) may be the end-state of
+    #     the old order AND a partial fill of an order that is still
+    #     alive;
+    #   * snapshot.open_orders == 0 is NOT trustworthy: the LIVE adapter
+    #     silently coerces a get_orders() exception into 0 (known
+    #     separate production defect in execution_adapter.py, out of
+    #     scope here) and SimulatedBroker.snapshot() ALWAYS reports 0 —
+    #     so a zero here is not proof of absence of working orders.
+    # The adapter contract (ExecutionResult / snapshot) carries no
+    # terminal order status usable for this confirmation, so lifting the
+    # freeze automatically would invent guarantees the API does not
+    # provide.  Fail closed: the freeze persists across cycles and
+    # process restarts (state_store.C5_STATE_DEFAULTS) until an EXPLICIT
+    # operator confirmation (manual / external reconciliation) records
+    # the true residual via state["broker_position_confirmed"] = <int>.
+    # That value is trusted as coming from OUTSIDE this runtime's own
+    # accounting, so it IS independent confirmation; once present the
+    # freeze lifts, the position re-baselines to it and the EXIT ledger
+    # resets.  A non-int value (bool/float/str included) is rejected —
+    # no coercion launders bad data into a clearance.
     if state.get("exit_unverified_until_reconcile"):
-        # The residual expectation MUST be computed against the qty that
-        # was stored BEFORE any adoption above: reconcile() may already
-        # have overwritten c5_position_qty with this same snapshot, and
-        # comparing a value to itself is NOT independent confirmation.
-        # `stored_qty` (read at the top of this function from persisted
-        # state) is the accounting baseline; the ledger subtracts only
-        # volumes that prior EXIT results PROVED were executed.
-        try:
-            expected_residual = stored_qty - int(
-                state.get("exit_confirmed_filled_qty") or 0)
-        except (TypeError, ValueError):
-            expected_residual = None      # unusable ledger ⇒ never clear
-        consistent = (not snapshot.open_orders
-                      and expected_residual is not None
-                      and broker_qty == expected_residual)
-        if consistent:
+        confirmed = state.get("broker_position_confirmed")
+        if type(confirmed) is int:
             state.pop("exit_unverified_until_reconcile", None)
             state.pop("exit_confirmed_filled_qty", None)
-            logger.warning(
-                "RECONCILE: cleared EXIT_UNVERIFIED freeze — broker view"
-                " matches the expected EXIT residual (qty=%d,"
-                " open_orders=0); position re-baselined from broker",
-                broker_qty)
+            state.pop("broker_position_confirmed", None)
+            if confirmed != broker_qty:
+                # Belt-and-braces: keep the runtime and the recorded
+                # broker truth in agreement (no divergence).
+                state["c5_position_qty"] = confirmed
+                state["c5_position_direction"] = (
+                    None if confirmed == 0 else
+                    ("LONG" if confirmed > 0 else "SHORT"))
+                logger.warning(
+                    "RECONCILE: EXIT_UNVERIFIED freeze lifted by explicit"
+                    " operator confirmation; position re-baselined to %d",
+                    confirmed)
+            else:
+                logger.warning(
+                    "RECONCILE: EXIT_UNVERIFIED freeze lifted by explicit"
+                    " operator confirmation (confirmed qty matches broker"
+                    " snapshot %d)", broker_qty)
         else:
             logger.error(
-                "RECONCILE: EXIT_UNVERIFIED freeze KEPT — broker view is"
-                " not a trustworthy confirmation of the EXIT residual"
-                " (qty=%d, expected=%r, open_orders=%s); position"
-                " operations stay frozen until a confirmed reconcile or"
-                " manual review",
-                broker_qty, expected_residual, snapshot.open_orders)
+                "RECONCILE: EXIT_UNVERIFIED freeze KEPT — the adapter"
+                " contract cannot prove the previous SELL is terminal;"
+                " manual/external broker reconciliation required before"
+                " any further position operation (qty=%d,"
+                " open_orders=%s is NOT trustworthy)",
+                broker_qty, snapshot.open_orders)
 
     # Hard validation AFTER the freeze logic: an invalid equity view
     # raises below and the caller discards these state changes (G-1:
@@ -492,6 +502,17 @@ class C5Runtime:
                 return decision
 
             if status == "PARTIAL":
+                # G-5: a freeze from an EARLIER unverified EXIT means the
+                # fate of that prior order is still unknown.  A new
+                # confirmed partial fill does NOT prove the old order is
+                # terminal, so it must not lift the freeze; the SELL was
+                # never supposed to reach the broker in this state (the
+                # _evaluate_exit guard blocks it — fail-closed belt).
+                if state.get("exit_unverified_until_reconcile"):
+                    logger.error(
+                        "CNY_EXIT PARTIAL while EXIT_UNVERIFIED freeze is"
+                        " active — freeze KEPT (partial fill does not"
+                        " prove the previous ambiguous order is terminal)")
                 # Confirmed PARTIAL fill (ok=True, 0 < qty_executed < qty):
                 # only the executed volume may be removed from the tracked
                 # position. The remainder stays open with its direction
@@ -517,7 +538,8 @@ class C5Runtime:
                     else:
                         state["last_processed_5m_ts"] = ts
                         state.pop("exit_failure_reason", None)
-                        state.pop("exit_unverified_until_reconcile", None)
+                        if not state.get("exit_unverified_until_reconcile"):
+                            state.pop("exit_unverified_until_reconcile", None)
                         # G-5 EXIT ledger: remember the CONFIRMED filled
                         # volume so a later trustworthy reconcile can
                         # compute the expected residual (stored − fills).
@@ -559,18 +581,21 @@ class C5Runtime:
             confirmed_dead = _is_confirmed_rejection(result)
             state["exit_failure_reason"] = str(
                 result.reason if not result.ok else EXIT_UNVERIFIED_REASON)
-            if status == "UNVERIFIED":
+            if status == "UNVERIFIED" or (result.ok and status == "ZERO_FILL"):
                 # G-5: adapter claimed success but the executed quantity
                 # cannot be trusted (None / wrong type / negative / over
                 # the requested size / contradictory ok=True+qty=0).
                 # The true broker residual is unknown ⇒ do NOT invent it,
                 # do NOT clear the position, and flag the state so no
-                # further operation with this position happens until a
-                # trustworthy reconcile (startup/bootstrap adopts the
-                # broker view) resolves it.  The candle is burned below
-                # exactly like an UNKNOWN G-4 outcome — a blind re-send
-                # could duplicate an order that was in fact accepted.
+                # further operation with this position happens until an
+                # EXTERNAL confirmation re-baselines it (reconcile never
+                # lifts this freeze automatically — a snapshot cannot
+                # prove the ambiguous SELL is terminal).  The candle is
+                # burned exactly like an UNKNOWN G-4 outcome — a blind
+                # re-send could duplicate an order that was in fact
+                # accepted.
                 state["exit_unverified_until_reconcile"] = EXIT_UNVERIFIED_REASON
+                state["last_processed_5m_ts"] = ts
                 logger.error(
                     "CNY_EXIT UNVERIFIED: ok=%s qty_executed=%r requested=%d"
                     " — position state frozen until reconcile; candle %s "

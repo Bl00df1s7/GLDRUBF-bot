@@ -1544,6 +1544,69 @@ def _g5_restart_runtime(state_env, market, broker, opened_qty):
     return rt2, adapter2
 
 
+# ── unit: reconcile freeze policy (G-5) — снятие freeze ТОЛЬКО по
+#          внешнему подтверждению, никакой эвристики по снимку ─────────
+def _g5_snap(qty):
+    from src.execution_adapter import AccountSnapshot
+    return AccountSnapshot(account_id="a1", equity_rub=1_000_000.0,
+                           free_cash_rub=1_000_000.0, position_qty=qty,
+                           entry_price=None, tmon_qty=0, open_orders=0)
+
+
+class _SnapAdapter:
+    def __init__(self, qty):
+        self._qty = qty
+
+    def snapshot(self, account_id):
+        return _g5_snap(self._qty)
+
+
+def test_g5_reconcile_never_clears_freeze_from_snapshot(state_env):
+    """Совпадение позиции, изменение позиции и flat-снимок НЕ снимают
+    freeze: ни один снимок не доказывает терминальность прежней заявки."""
+    from src.c5_runtime import reconcile
+
+    for broker_view in (2, 0, 1):
+        st = {"c5_position_qty": 2, "c5_position_direction": "LONG",
+              "exit_unverified_until_reconcile":
+                  "EXIT_UNVERIFIED_PENDING_RECONCILE"}
+        reconcile(_SnapAdapter(broker_view), "a1", st)
+        assert st["exit_unverified_until_reconcile"] == \
+            "EXIT_UNVERIFIED_PENDING_RECONCILE"      # freeze KEPT
+
+
+def test_g5_reconcile_lifts_freeze_only_on_explicit_confirmation(state_env):
+    """Единственный достоверный клапан — явное подтверждение внешней
+    сверки (broker_position_confirmed): freeze снимается, ledger
+    очищается, позиция перебазируется на подтверждённое значение."""
+    from src.c5_runtime import reconcile
+
+    st = {"c5_position_qty": 2, "c5_position_direction": "LONG",
+          "exit_unverified_until_reconcile":
+              "EXIT_UNVERIFIED_PENDING_RECONCILE",
+          "broker_position_confirmed": 1}
+    reconcile(_SnapAdapter(1), "a1", st)
+    assert not st.get("exit_unverified_until_reconcile")
+    assert "broker_position_confirmed" not in st     # consumed once
+    assert "exit_confirmed_filled_qty" not in st     # ledger reset
+    assert st["c5_position_qty"] == 1                # re-baselined
+    assert st["c5_position_direction"] == "LONG"
+
+
+def test_g5_reconcile_rejects_non_int_confirmation(state_env):
+    """Не-int подтверждение (bool/float/str) не laundering'ится в int и
+    не снимает freeze — только строгий int допустим."""
+    from src.c5_runtime import reconcile
+
+    for bad in (True, 1.0, "1"):
+        st = {"c5_position_qty": 2, "c5_position_direction": "LONG",
+              "exit_unverified_until_reconcile":
+                  "EXIT_UNVERIFIED_PENDING_RECONCILE",
+              "broker_position_confirmed": bad}
+        reconcile(_SnapAdapter(2), "a1", st)
+        assert st["exit_unverified_until_reconcile"]  # freeze KEPT
+
+
 # ── E2E 1: ПОЛНОЕ исполнение закрывает позицию (эталон G-4/FULL) ──────
 def test_g5_full_fill_clears_position(state_env, market):
     rt, scripted, broker, qty, CEXIT = _g5_exit_setup(
@@ -1763,29 +1826,60 @@ def test_g5_inconsistent_reconcile_keeps_freeze(state_env, market):
     assert [o for o in adapter2.orders if o["side"] == "SELL"] == []
 
 
-# ── E2E 7b: ДОСТОВЕРНЫЙ снимок (брокер = ожидаемый остаток EXIT, ноль
-#            активных заявок) снимает freeze; позиция перебазируется по
-#            view брокера; новых заявок нет ─────────────────────────────
-def test_g5_trustworthy_reconcile_clears_freeze(state_env, market):
+# ── E2E 7b: freeze снимается ТОЛЬКО внешним подтверждением терминаль-
+#            ности (broker_position_confirmed); ни один снимок сам по
+#            себе freeze не снимает; новых заявок нет ───────────────────
+def test_g5_external_confirmation_clears_freeze(state_env, market):
     rt, scripted, broker, qty, CEXIT = _g5_exit_setup(
         state_env, market, lambda q: [_exec_res(True, "FILLED", None)])
     assert rt.run_cycle().action == "EXIT"
     assert read_state(state_env)["exit_unverified_until_reconcile"]
 
-    # The unverified SELL requested qty contracts; the only broker view
-    # that CONFIRMS the outcome is a flat account (fully filled or fully
-    # rejected — either way the order is done and the residual is known).
+    # Snapshot alone (even a flat broker view) must NOT lift the freeze:
+    # it cannot prove the ambiguous SELL is terminal.  Restart with the
+    # broker showing qty==0 — reconcile keeps the freeze (fail closed).
     broker.position_qty = 0
     rt2, adapter2 = make_runtime(market, broker)
+    scripted2 = ScriptedSellAdapter(adapter2, [], state_env=state_env)
+    rt2.adapter = scripted2
     CNEUTRAL = candle_5m(CONTROL_DAY, 17, 0, NEUTRAL)
     set_candles(market, CNEUTRAL)
     market.holder["now"] = utc_ms(CONTROL_DAY, 17, 5)
     d = rt2.run_cycle()
-    assert d.action in ("HOLD", "NO_ENTRY")         # frozen state lifted
+    # freeze KEPT (production log: "EXIT_UNVERIFIED freeze KEPT — the
+    # adapter contract cannot prove the previous SELL is terminal");
+    # with qty re-baselined to 0 by the adopt-broker branch the cycle
+    # routes to the ENTRY branch instead of EXIT — either way NO SELL.
+    assert d.action != "EXIT"
+    assert scripted2.sell_calls == []               # snapshot ≠ proof
+    st_mid = read_state(state_env)
+    assert st_mid["exit_unverified_until_reconcile"]
+
+    # Now an EXTERNAL operator confirmation records the true residual
+    # (flat account) into the state file — this value comes from outside
+    # the runtime's own accounting, so it IS independent confirmation.
+    # The guarded fake is attached BEFORE bootstrap: if reconcile() were
+    # to lift the freeze without that confirmation, the following EXIT
+    # signal would blind-re-send a SELL and the fake would raise.
+    st_path = state_env / "state.json"
+    st = json.loads(st_path.read_text())
+    st["broker_position_confirmed"] = 0
+    st_path.write_text(json.dumps(st))
+    rt3, adapter3 = make_runtime(market, broker)
+    scripted3 = ScriptedSellAdapter(adapter3, [], state_env=state_env)
+    rt3.adapter = scripted3
+    CNEUTRAL2 = candle_5m(CONTROL_DAY, 17, 10, NEUTRAL)
+    set_candles(market, CNEUTRAL2)                  # no fresh break signal
+    market.holder["now"] = utc_ms(CONTROL_DAY, 17, 15)
+    d3 = rt3.run_cycle()
+    assert d3.action == "NO_ENTRY"                  # flat ⇒ nothing to exit
+    assert d3.reason != "EXIT_UNVERIFIED_PENDING_RECONCILE"  # freeze lifted
     st2 = read_state(state_env)
     assert not st2.get("exit_unverified_until_reconcile")
-    assert st2["c5_position_qty"] == 0              # broker view adopted
-    assert [o for o in adapter2.orders if o["side"] == "SELL"] == []
+    assert st2["c5_position_qty"] == 0              # re-baselined to truth
+    assert "broker_position_confirmed" not in st2   # consumed once
+    assert scripted3.sell_calls == []               # freeze lifted safely
+    assert [o for o in adapter3.orders if o["side"] == "SELL"] == []
 
 
 # ── E2E 7c: freeze переживает перезапуск процесса (production-перси-
