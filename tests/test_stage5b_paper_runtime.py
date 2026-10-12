@@ -1954,3 +1954,188 @@ def test_g5_confirmed_rejection_retry_still_works(state_env, market):
     assert "exit_failure_reason" not in st2
     assert broker.position_qty == 0
     assert scripted.sell_calls == [qty, qty]        # exactly two attempts
+
+
+# ══════════════════════════════════════════════════════════════════════
+# G-6 — Исключение адаптера ПРИ/ПОСЛЕ отправки SELL.
+#   Подтверждённый дефект: раньше self.adapter.sell_cny(...) вызывался
+#   без try/except; исключение (сетевая ошибка, таймаут после dispatch)
+#   всплывало из run_cycle() ДО save_state(state), поэтому защитное
+#   состояние НЕ сохранялось: freeze отсутствовал, свеча не была
+#   сожжена, и новый процесс мог вслепую повторить SELL.
+#   Исправление (src/c5_runtime._evaluate_exit): исключение классифици-
+#   руется как UNVERIFIED — позиция НЕ меняется (исключение не доказает
+#   ни исполнения, ни его отсутствия), candle сжигается, ставится флаг
+#   exit_unverified_until_reconcile; run_cycle сохраняет state перед
+#   возвратом, защита переживает рестарт; снятие freeze — только по
+#   явному операторскому подтверждению (type(confirmed) is int).
+# ══════════════════════════════════════════════════════════════════════
+
+class _SellRaisingAdapter:
+    """Boundary fake: BUY/snapshot делегируют реальному PaperExecutionAdapter,
+    sell_cny помечает заявку отправленной и бросает исключение — ровно то,
+    что происходит при сетевом обрыве ПОСЛЕ dispatch ордера брокеру."""
+
+    def __init__(self, paper_adapter):
+        self._paper = paper_adapter
+        self.sell_calls = []
+        self.orders = []
+
+    def find_account(self):
+        return self._paper.find_account()
+
+    def snapshot(self, account_id):
+        return self._paper.snapshot(account_id)
+
+    def buy_cny(self, account_id, qty, **kwargs):
+        res = self._paper.buy_cny(account_id, qty, **kwargs)
+        self.orders.append({"instrument": "CNYRUBF", "side": "BUY",
+                            "qty": qty})
+        return res
+
+    def sell_cny(self, account_id, qty):
+        # заявка УШЛА брокеру — исход неизвестен (exception ≠ proof)
+        self.orders.append({"instrument": "CNYRUBF", "side": "SELL",
+                            "qty": qty})
+        self.sell_calls.append(qty)
+        raise ConnectionError("simulated network drop after SELL dispatch")
+
+    def sell_one_tmon(self, account_id):
+        return self._paper.sell_one_tmon(account_id)
+
+    def buy_one_tmon(self, account_id):
+        return self._paper.buy_one_tmon(account_id)
+
+    def get_free_cash(self, account_id):
+        return self._paper.get_free_cash(account_id)
+
+    def get_tmon_quantity(self, account_id):
+        return self._paper.get_tmon_quantity(account_id)
+
+    def get_tmon_price(self, account_id):
+        return self._paper.get_tmon_price(account_id)
+
+
+def _g6_exit_setup_with_raiser(state_env, market):
+    rt, scripted, broker, qty, CEXIT = _g5_exit_setup(state_env, market)
+    raising = _SellRaisingAdapter(scripted._paper)
+    rt.adapter = raising
+    return rt, raising, broker, qty, CEXIT
+
+
+# ── E2E G-6.1: исключение при SELL не рвёт цикл и сохраняет защиту ────
+def test_g6_sell_exception_does_not_crash_and_persists_freeze(state_env,
+                                                              market):
+    rt, raising, broker, qty, CEXIT = _g6_exit_setup_with_raiser(
+        state_env, market)
+
+    d = rt.run_cycle()                       # НЕ должно бросить наружу
+
+    assert d.action == "NO_ENTRY"
+    assert d.reason == "EXIT_UNVERIFIED_PENDING_RECONCILE"
+    st = read_state(state_env)               # save_state выполнен в run_cycle
+    # позиция НЕ изменена на основании предположений:
+    assert st["c5_position_qty"] == qty
+    assert st["c5_position_direction"] == "LONG"
+    assert st["c5_entry_price"] is not None
+    assert broker.position_qty == qty        # SimulatedBroker не тронут
+    # консервативная защита как у UNVERIFIED:
+    assert st["exit_failure_reason"] == "EXIT_UNVERIFIED_PENDING_RECONCILE"
+    assert st["exit_unverified_until_reconcile"] == \
+        "EXIT_UNVERIFIED_PENDING_RECONCILE"
+    # свеча сожжена — слепого повторного SELL нет:
+    assert st["last_processed_5m_ts"] == CEXIT["time"].isoformat()
+    assert raising.sell_calls == [qty]       # ровно одна отправка
+
+
+# ── unit G-6.1b: исключение НЕ считается доказательством fill/NoFill ──
+@pytest.mark.parametrize("exc", [ConnectionError("net"),
+                                 TimeoutError("read timeout"),
+                                 RuntimeError("sdk crash")],
+                         ids=["connection", "timeout", "runtime"])
+def test_g6_sell_exception_never_mutates_position(state_env, market, exc):
+    # Отдельный runtime на каждый вид исключения (свежие state/broker):
+    # после первого UNVERIFIED включается freeze и следующие циклы
+    # вообще не должны доходить до sell_cny — это проверяет тест 7c.
+    rt, raising, broker, qty, _CEXIT = _g6_exit_setup_with_raiser(
+        state_env, market)
+
+    def _boom(account_id, q, _e=exc):
+        raising.sell_calls.append(q)
+        raise _e
+
+    raising.sell_cny = _boom                 # broker NEVER sees the order
+    d = rt.run_cycle()                       # no crash out of run_cycle
+    assert d.action == "NO_ENTRY"
+    assert d.reason == "EXIT_UNVERIFIED_PENDING_RECONCILE"
+    st = read_state(state_env)
+    assert st["c5_position_qty"] == qty      # FULL не предполагается...
+    assert broker.position_qty == qty        # ...и отсутствие fill тоже
+    assert st["exit_unverified_until_reconcile"]
+
+
+# ── E2E G-6.2: после рестарта повторный SELL не отправляется ──────────
+def test_g6_restart_after_exception_blocks_resend(state_env, market):
+    rt, raising, broker, qty, _CEXIT = _g6_exit_setup_with_raiser(
+        state_env, market)
+    assert rt.run_cycle().reason == \
+        "EXIT_UNVERIFIED_PENDING_RECONCILE"
+
+    # Brand-new runtime over the SAME state file = process restart.
+    # Guarded empty script: ANY sell attempt raises AssertionError.
+    rt2, adapter2 = make_runtime(market, broker)
+    scripted2 = ScriptedSellAdapter(adapter2, [], state_env=state_env)
+    rt2.adapter = scripted2
+    CEXIT2 = candle_5m(CONTROL_DAY, 17, 0, SHORT_BREAK)
+    set_candles(market, CEXIT2)              # свежий валидный EXIT-сигнал
+    market.holder["now"] = utc_ms(CONTROL_DAY, 17, 5)
+    d = rt2.run_cycle()
+    assert d.action == "NO_ENTRY"
+    assert d.reason == "EXIT_UNVERIFIED_PENDING_RECONCILE"
+    assert scripted2.sell_calls == []        # freeze пережил рестарт
+    st2 = read_state(state_env)
+    assert st2["exit_unverified_until_reconcile"]
+    assert st2["c5_position_qty"] == qty     # позиция не тронута
+
+
+# ── E2E G-6.3: freeze нельзя снять без явного подтверждения ───────────
+def test_g6_freeze_after_exception_requires_explicit_confirmation(
+        state_env, market):
+    from src.c5_runtime import reconcile
+
+    rt, raising, broker, qty, _CEXIT = _g6_exit_setup_with_raiser(
+        state_env, market)
+    assert rt.run_cycle().reason == \
+        "EXIT_UNVERIFIED_PENDING_RECONCILE"
+
+    # Snapshot alone (open_orders == 0, любой broker_qty) НЕ снимает freeze.
+    for view in (qty, 0, qty - 1):
+        st = read_state(state_env)
+        st.pop("broker_position_confirmed", None)
+        reconcile(_SnapAdapter(view), "a1", st)
+        assert st["exit_unverified_until_reconcile"] == \
+            "EXIT_UNVERIFIED_PENDING_RECONCILE"      # KEPT
+
+    # Не-int «подтверждение» laundering'иться не может.
+    for bad in (True, 1.0, "2"):
+        st = read_state(state_env)
+        st["broker_position_confirmed"] = bad
+        reconcile(_SnapAdapter(qty), "a1", st)
+        assert st["exit_unverified_until_reconcile"]  # KEPT
+
+    # Единственный клапан — строгий int от внешнего оператора.
+    st = read_state(state_env)
+    st["broker_position_confirmed"] = 0          # внешняя сверка: flat
+    reconcile(_SnapAdapter(0), "a1", st)
+    assert not st.get("exit_unverified_until_reconcile")
+    assert st["c5_position_qty"] == 0            # re-baselined на truth
+
+
+# ── unit G-6.4: контракт классификатора результатов не сломан ─────────
+def test_g6_classify_contract_unchanged_for_full_partial_zero(state_env):
+    from src.c5_runtime import _classify_exit_execution as cls
+
+    assert cls(_exec_res(True, "FILLED", 2), 2) == ("FULL", 2)
+    assert cls(_exec_res(True, "FILLED", 1), 2) == ("PARTIAL", 1)
+    assert cls(_exec_res(True, "FILLED", 0), 2) == ("ZERO_FILL", 0)
+    assert cls(_exec_res(True, "FILLED", None), 2) == ("UNVERIFIED", 0)
