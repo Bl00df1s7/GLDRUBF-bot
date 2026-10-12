@@ -149,7 +149,8 @@ def _validate_inputs(
     equity: float,
     price: float,
     contract_size: Decimal,
-    margin_rate: Decimal,
+    margin_rate: Optional[Decimal],
+    require_margin: bool = True,
 ) -> None:
     n = max(C5_ENTRY_DONCHIAN, C5_EXIT_DONCHIAN)
     if len(daily_bars) < n + 1:
@@ -188,11 +189,16 @@ def _validate_inputs(
     if not (isinstance(contract_size, Decimal) and contract_size > 0):
         raise DataError(f"contract_size must be a positive Decimal, got {contract_size!r}")
 
-    rate = _parse_rate(margin_rate)
-    if not (Decimal("0") < rate < Decimal(str(0.5))):
-        raise MarginRateError(
-            f"{REASON_MARGIN_API}: rate {rate} outside valid band (0, 0.5)"
-        )
+    # G-1: the ГО band is an ENTRY/sizing requirement only.  When a
+    # position exists the EXIT/HOLD branch never consumes margin-derived
+    # values, so ``margin_rate=None`` is legal there (require_margin=False).
+    # ENTRY keeps the strict fail-closed validation unchanged.
+    if require_margin:
+        rate = _parse_rate(margin_rate)
+        if not (Decimal("0") < rate < Decimal(str(0.5))):
+            raise MarginRateError(
+                f"{REASON_MARGIN_API}: rate {rate} outside valid band (0, 0.5)"
+            )
 
 
 def _parse_rate(margin_rate) -> Decimal:
@@ -291,7 +297,7 @@ def evaluate(
     free_margin: float,
     position: Optional[Position],
     price: float,
-    margin_rate: Decimal,
+    margin_rate: Optional[Decimal],
     contract_size: Decimal = Decimal(str(C5_CONTRACT_SIZE_CNY)),
     now: Optional[datetime] = None,
     # external (deployment-stage) risk parameters — injectable per §5
@@ -305,12 +311,18 @@ def evaluate(
     Raises ``DataError`` / ``MarginRateError`` on invalid inputs — the
     module never repairs bad data.  Callers translate ``MarginRateError``
     into ``NO_ENTRY / MARGIN_API_UNAVAILABLE`` (no fallback allowed).
+
+    G-1 contract split: ``margin_rate`` is REQUIRED while flat (ENTRY
+    path: validation band + sizing consume it) and MAY be ``None`` when
+    a position exists (EXIT/HOLD path computes no margin-derived value).
     """
+    in_position = position is not None
     _validate_inputs(
         daily_bars=daily_bars, control_bar=control_bar, equity=equity,
         price=price, contract_size=contract_size, margin_rate=margin_rate,
+        require_margin=not in_position,
     )
-    rate = _parse_rate(margin_rate)
+    rate = _parse_rate(margin_rate) if margin_rate is not None else Decimal("0")
 
     window_n = C5_ENTRY_DONCHIAN
     window_m = C5_EXIT_DONCHIAN

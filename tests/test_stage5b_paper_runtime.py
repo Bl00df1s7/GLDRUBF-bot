@@ -933,3 +933,109 @@ def test_n_paper_restart_reconcile_preserves_open_position(state_env, market):
     assert st3["c5_position_qty"] == QTY
     assert len(adapter2.orders) == 0                 # новых orders нет
     assert broker2.cash == cash_after_entry          # accounting не тронут
+
+
+# ══════════════════════════════════════════════════════════════════════
+# G-1 — EXIT НЕ зависит от Margin API: при недоступном ГО сигнал
+# EXIT_LONG вычисляется и исполняется (SELL), свеча не «сжигается»
+# до попытки выхода.  Frozen c5_core не мокается; подменяется только
+# внешний boundary (MarginTracker) на том же рантайм-объекте.
+# ══════════════════════════════════════════════════════════════════════
+class UnavailableMarginTracker:
+    """Boundary fake: the ГО API is DOWN — refresh raises, cache empty."""
+    def __init__(self):
+        self.current = None
+        self.refresh_calls = 0
+
+    def refresh(self):
+        from src.margin_provider import MarginApiUnavailable
+        self.refresh_calls += 1
+        raise MarginApiUnavailable("ГО API down (G-1 test)")
+
+
+def test_g1_exit_executes_when_margin_api_unavailable(state_env, market):
+    C16 = candle_5m(CONTROL_DAY, 16, 0, LONG_BREAK)
+    C1630 = candle_5m(CONTROL_DAY, 16, 30, SHORT_BREAK)
+    set_candles(market, C16)
+    broker = new_broker()
+    rt, adapter = make_runtime(market, broker)
+
+    # Phase 1 — normal ENTER_LONG with a healthy margin tracker.
+    assert rt.run_cycle().action == "ENTER_LONG"
+    assert broker.position_qty > 0
+    qty_opened = broker.position_qty
+
+    # Margin API goes DOWN before the exit candle (same runtime object,
+    # same persisted state — production sequence preserved).
+    dead = UnavailableMarginTracker()
+    rt._margin = dead
+
+    set_candles(market, C16, C1630)
+    market.holder["now"] = utc_ms(CONTROL_DAY, 16, 35)
+    d = rt.run_cycle()
+
+    # Pre-G-1 behaviour was NO_ENTRY/MARGIN_API_UNAVAILABLE + burned
+    # candle. Required behaviour: real EXIT signal and real SELL.
+    assert d.action == "EXIT" and d.reason == "EXIT_LONG"
+    assert dead.refresh_calls >= 1               # API genuinely attempted
+    assert len(sell_orders(adapter)) == 1        # exactly one SELL
+    assert sell_orders(adapter)[0]["qty"] == qty_opened   # full volume
+    assert broker.position_qty == 0              # flat at the broker
+    st = read_state(state_env)
+    assert st["c5_position_qty"] == 0
+    assert st["c5_position_direction"] is None
+    assert st["last_processed_5m_ts"] == C1630["time"].isoformat()
+    assert st["last_action"] == "EXIT_LONG"
+
+    # Idempotency: re-running the SAME exit candle must not re-sell.
+    d2 = rt.run_cycle()
+    assert d2.action == "NO_ENTRY" and d2.reason == "DUPLICATE_CANDLE"
+    assert len(sell_orders(adapter)) == 1
+
+
+def test_g1_hold_with_dead_margin_api_does_not_block_later_exit(state_env, market):
+    """HOLD under an unavailable ГО API consumes its candle as before and
+    leaves subsequent candles fully processable (exit still fires)."""
+    C16 = candle_5m(CONTROL_DAY, 16, 0, LONG_BREAK)
+    CNEUTRAL = candle_5m(CONTROL_DAY, 16, 10, NEUTRAL)
+    C1630 = candle_5m(CONTROL_DAY, 16, 30, SHORT_BREAK)
+    set_candles(market, C16)
+    broker = new_broker()
+    rt, adapter = make_runtime(market, broker)
+    assert rt.run_cycle().action == "ENTER_LONG"
+
+    rt._margin = UnavailableMarginTracker()
+
+    # Neutral candle while LONG + dead API → HOLD (not MARGIN block).
+    set_candles(market, C16, CNEUTRAL)
+    market.holder["now"] = utc_ms(CONTROL_DAY, 16, 15)
+    d = rt.run_cycle()
+    assert d.action == "HOLD" and d.reason == "HOLD_POSITION"
+    assert sell_orders(adapter) == []
+    st = read_state(state_env)
+    assert st["last_processed_5m_ts"] == CNEUTRAL["time"].isoformat()
+
+    # Exit candle → EXIT executes despite the still-dead API.
+    set_candles(market, C16, CNEUTRAL, C1630)
+    market.holder["now"] = utc_ms(CONTROL_DAY, 16, 35)
+    d2 = rt.run_cycle()
+    assert d2.action == "EXIT" and d2.reason == "EXIT_LONG"
+    assert broker.position_qty == 0
+    assert len(sell_orders(adapter)) == 1
+
+
+def test_g1_entry_still_fail_closed_when_margin_api_unavailable(state_env, market):
+    """Flat + dead ГО API on the ENTRY path → unchanged fail-closed
+    NO_ENTRY/MARGIN_API_UNAVAILABLE, zero orders."""
+    C16 = candle_5m(CONTROL_DAY, 16, 0, LONG_BREAK)
+    set_candles(market, C16)
+    broker = new_broker()
+    rt, adapter = make_runtime(market, broker)
+    rt._margin = UnavailableMarginTracker()
+
+    d = rt.run_cycle()
+
+    assert d.action == "NO_ENTRY"
+    assert d.reason == "MARGIN_API_UNAVAILABLE"
+    assert adapter.orders == []
+    assert broker.position_qty == 0

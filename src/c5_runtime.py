@@ -343,11 +343,11 @@ class C5Runtime:
         except (MarginApiUnavailable, c5_core.MarginRateError) as exc:
             logger.error("%s (exit sizing input invalid): %s",
                          REASON_MARGIN_API_UNAVAILABLE, exc)
-            # EXIT itself does not need ГО, but the pure Decision contract
-            # requires a valid rate; block with explicit reason, no guess.
-            state["last_processed_5m_ts"] = ts
-            return c5_core.block_entry(_noop_decision(),
-                                       REASON_MARGIN_API_UNAVAILABLE)
+            # G-1: EXIT itself does not need ГО — the EXIT/HOLD branch of
+            # c5_core.evaluate consumes no margin-derived value.  Proceed
+            # with margin_rate=None instead of blocking; the candle is NOT
+            # burned before a real exit attempt.
+            rate = None
 
         decision = c5_core.evaluate(
             daily_bars=daily,
@@ -360,11 +360,17 @@ class C5Runtime:
             now=now_msk,
         )
 
-        state["last_processed_5m_ts"] = ts
+        if decision.action != "EXIT":
+            # Non-exit candles are consumed as before; an EXIT candle is
+            # marked processed only after the sell attempt below, so a
+            # failed/unexecuted exit can be re-evaluated on the next bar
+            # without burning the exit event on a margin-API error.
+            state["last_processed_5m_ts"] = ts
 
         if decision.action == "EXIT":
             qty = abs(int(snapshot.position_qty))
             result = self.adapter.sell_cny(self.account_id, qty)
+            state["last_processed_5m_ts"] = ts
             if result.ok:
                 state["c5_position_qty"] = 0
                 state["c5_position_direction"] = None
