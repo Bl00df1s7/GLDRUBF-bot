@@ -1090,20 +1090,24 @@ class ScriptedSellAdapter:
         return res
 
     def sell_cny(self, account_id, qty):
+        from src.c5_runtime import _classify_exit_execution
+
         self.orders.append({"instrument": "CNYRUBF", "side": "SELL",
                             "qty": qty})
         if not self._sell_results:
             raise AssertionError("unexpected extra sell attempt")
         res = self._sell_results.pop(0)
         self.sell_calls.append(qty)
-        if res.ok:                       # success mirrors the real broker
-            filled = getattr(res, "qty_executed", 0) or 0
-            if 0 < filled < qty:
-                # PARTIAL confirmed fill: only the executed volume reaches
-                # the broker (the rest of the order is assumed cancelled).
-                self._paper.sell_cny(account_id, filled)
-            else:
-                self._paper.sell_cny(account_id, qty)
+        # Mirror into SimulatedBroker ONLY the amount that the scripted
+        # result PROVES was executed — never result.ok alone.  FULL →
+        # the whole confirmed size; PARTIAL → only the confirmed partial
+        # amount; ZERO_FILL / UNVERIFIED (None, wrong type, out of range,
+        # contradictory) → the broker position stays untouched, so the
+        # broker snapshot cannot diverge from the order outcome and pull
+        # the runtime out of its fail-closed freeze during reconcile.
+        status, filled = _classify_exit_execution(res, qty)
+        if status in ("FULL", "PARTIAL"):
+            self._paper.sell_cny(account_id, filled)
         return res
 
     def sell_one_tmon(self, account_id):
