@@ -1097,7 +1097,13 @@ class ScriptedSellAdapter:
         res = self._sell_results.pop(0)
         self.sell_calls.append(qty)
         if res.ok:                       # success mirrors the real broker
-            self._paper.sell_cny(account_id, qty)
+            filled = getattr(res, "qty_executed", 0) or 0
+            if 0 < filled < qty:
+                # PARTIAL confirmed fill: only the executed volume reaches
+                # the broker (the rest of the order is assumed cancelled).
+                self._paper.sell_cny(account_id, filled)
+            else:
+                self._paper.sell_cny(account_id, qty)
         return res
 
     def sell_one_tmon(self, account_id):
@@ -1445,9 +1451,15 @@ def test_g5_classify_exit_execution_unit():
     assert cls(_exec_res(True, "FILLED", 1), 0) == ("UNVERIFIED", 0)
 
 
-def _g5_exit_setup(state_env, market, sell_results):
-    """Open LONG x2 via production, then script EXIT outcomes."""
+def _g5_exit_setup(state_env, market, sell_results_fn=None):
+    """Open LONG x2 via production, then script EXIT outcomes.
+
+    sell_results_fn(qty) -> list of ExecutionResult, called AFTER the
+    position is opened so the caller can use the real opened qty.
+    If None, returns an empty list (no EXIT expected).
+    """
     rt, adapter, broker, qty = open_long_via_production(state_env, market)
+    sell_results = sell_results_fn(qty) if sell_results_fn else []
     scripted = ScriptedSellAdapter(adapter._paper, sell_results)
     rt.adapter = scripted
     C16 = candle_5m(CONTROL_DAY, 16, 0, LONG_BREAK)
@@ -1460,7 +1472,7 @@ def _g5_exit_setup(state_env, market, sell_results):
 # ── E2E 1: ПОЛНОЕ исполнение закрывает позицию (эталон G-4/FULL) ──────
 def test_g5_full_fill_clears_position(state_env, market):
     rt, scripted, broker, qty, CEXIT = _g5_exit_setup(
-        state_env, market, [_exec_res(True, "FILLED", qty)])
+        state_env, market, lambda q: [_exec_res(True, "FILLED", q)])
 
     d = rt.run_cycle()
     assert d.action == "EXIT" and d.reason == "EXIT_LONG"
@@ -1477,7 +1489,7 @@ def test_g5_full_fill_clears_position(state_env, market):
 # ── E2E 2: ЧАСТИЧНОЕ исполнение сохраняет корректный остаток ──────────
 def test_g5_partial_fill_keeps_remaining_position(state_env, market):
     rt, scripted, broker, qty, CEXIT = _g5_exit_setup(
-        state_env, market, [_exec_res(True, "FILLED", 1)])
+        state_env, market, lambda q: [_exec_res(True, "FILLED", 1)])
 
     d = rt.run_cycle()
     assert d.action == "EXIT" and d.reason == "EXIT_LONG"
@@ -1509,7 +1521,7 @@ def test_g5_partial_fill_keeps_remaining_position(state_env, market):
 # ── E2E 3: частичный остаток переживает перезапуск (state+reconcile) ──
 def test_g5_partial_residual_survives_restart(state_env, market):
     rt, scripted, broker, qty, CEXIT = _g5_exit_setup(
-        state_env, market, [_exec_res(True, "FILLED", 1)])
+        state_env, market, lambda q: [_exec_res(True, "FILLED", 1)])
     assert rt.run_cycle().action == "EXIT"
     st = read_state(state_env)
     assert st["c5_position_qty"] == qty - 1
@@ -1529,7 +1541,7 @@ def test_g5_partial_residual_survives_restart(state_env, market):
 # ── E2E 4: НУЛЕВОЕ исполнение (ok=True, qty_executed=0) не закрывает ──
 def test_g5_zero_fill_does_not_close_position(state_env, market):
     rt, scripted, broker, qty, CEXIT = _g5_exit_setup(
-        state_env, market, [_exec_res(True, "PAPER_FILLED", 0)])
+        state_env, market, lambda q: [_exec_res(True, "PAPER_FILLED", 0)])
 
     d = rt.run_cycle()
     assert d.action == "EXIT"
@@ -1552,7 +1564,7 @@ def test_g5_zero_fill_does_not_close_position(state_env, market):
 @pytest.mark.parametrize("bad_qty", [None, "1", 1.0, True, -1, 99])
 def test_g5_invalid_qty_never_falsely_closes(state_env, market, bad_qty):
     rt, scripted, broker, qty, CEXIT = _g5_exit_setup(
-        state_env, market, [_exec_res(True, "FILLED", bad_qty)])
+        state_env, market, lambda q: [_exec_res(True, "FILLED", bad_qty)])
 
     d = rt.run_cycle()
     assert d.action == "EXIT"
@@ -1572,7 +1584,7 @@ def test_g5_invalid_qty_never_falsely_closes(state_env, market, bad_qty):
 #           не отправляет SELL и не начинает операцию с ней ────────────
 def test_g5_unverified_blocks_all_future_position_ops(state_env, market):
     rt, scripted, broker, qty, CEXIT = _g5_exit_setup(
-        state_env, market, [_exec_res(True, "FILLED", None)])
+        state_env, market, lambda q: [_exec_res(True, "FILLED", None)])
     assert rt.run_cycle().action == "EXIT"
     st = read_state(state_env)
     assert st["exit_unverified_until_reconcile"]
@@ -1607,7 +1619,7 @@ def test_g5_unverified_blocks_all_future_position_ops(state_env, market):
 #           позицию по view брокера (единственный источник истины) ─────
 def test_g5_reconcile_clears_unverified_freeze(state_env, market):
     rt, scripted, broker, qty, CEXIT = _g5_exit_setup(
-        state_env, market, [_exec_res(True, "FILLED", None)])
+        state_env, market, lambda q: [_exec_res(True, "FILLED", None)])
     assert rt.run_cycle().action == "EXIT"
     assert read_state(state_env)["exit_unverified_until_reconcile"]
 
@@ -1630,7 +1642,7 @@ def test_g5_reconcile_clears_unverified_freeze(state_env, market):
 #           повторить EXIT, а успешный полный выход идемпотентен ───────
 def test_g5_confirmed_rejection_retry_still_works(state_env, market):
     rt, scripted, broker, qty, CEXIT = _g5_exit_setup(
-        state_env, market, [_rejected_result(), _exec_res(True, "FILLED", qty)])
+        state_env, market, lambda q: [_rejected_result(), _exec_res(True, "FILLED", q)])
 
     d1 = rt.run_cycle()
     assert d1.action == "EXIT"
