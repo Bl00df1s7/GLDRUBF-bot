@@ -481,7 +481,36 @@ class C5Runtime:
 
         if decision.action == "EXIT":
             qty = abs(int(snapshot.position_qty))
-            result = self.adapter.sell_cny(self.account_id, qty)
+            try:
+                result = self.adapter.sell_cny(self.account_id, qty)
+            except Exception as exc:
+                # G-6 defect fix: an adapter exception after the SELL was
+                # dispatched leaves the fill outcome UNKNOWN — it proves
+                # neither execution nor non-execution.  Fail closed exactly
+                # like the UNVERIFIED branch below: the position is NOT
+                # modified on assumptions, the candle is burned so no blind
+                # re-send can duplicate a possibly-live order, and the
+                # EXIT_UNVERIFIED freeze blocks every further position
+                # operation until an EXPLICIT operator confirmation lifts
+                # it (reconcile never clears it automatically).  Without
+                # this guard the exception propagated out of run_cycle()
+                # BEFORE save_state(), so the protective state did not
+                # survive a restart and the next process could re-send
+                # the SELL blindly.  run_cycle() always saves state after
+                # _evaluate_exit returns, so returning here persists the
+                # freeze (verified by tests/test_stage5b_paper_runtime.py
+                # G-6 regression tests).
+                logger.error(
+                    "CNY_EXIT EXCEPTION from adapter after dispatch: %r —"
+                    " outcome unknown; position untouched, candle %s"
+                    " burned, EXIT_UNVERIFIED freeze set until explicit"
+                    " reconciliation", exc, ts, exc_info=True)
+                state["exit_failure_reason"] = EXIT_UNVERIFIED_REASON
+                state["exit_unverified_until_reconcile"] = \
+                    EXIT_UNVERIFIED_REASON
+                state["last_processed_5m_ts"] = ts
+                return c5_core.block_entry(_noop_decision(),
+                                           REASON_EXIT_UNVERIFIED)
             status, filled = _classify_exit_execution(result, qty)
             if not result.ok:
                 # G-4 path unchanged: ok=False carries no trustworthy
