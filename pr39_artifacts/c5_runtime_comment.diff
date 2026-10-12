@@ -1,0 +1,27 @@
+diff --git a/src/c5_runtime.py b/src/c5_runtime.py
+index cbf0390..46dddbf 100644
+--- a/src/c5_runtime.py
++++ b/src/c5_runtime.py
+@@ -191,11 +191,17 @@ def reconcile(adapter, account_id: str, state: dict) -> "object":
+     #   * broker_qty changed (including to zero) may be the end-state of
+     #     the old order AND a partial fill of an order that is still
+     #     alive;
+-    #   * snapshot.open_orders == 0 is NOT trustworthy: the LIVE adapter
+-    #     silently coerces a get_orders() exception into 0 (known
+-    #     separate production defect in execution_adapter.py, out of
+-    #     scope here) and SimulatedBroker.snapshot() ALWAYS reports 0 —
+-    #     so a zero here is not proof of absence of working orders.
++    #   * snapshot.open_orders == 0 is still NOT sufficient proof for
++    #     lifting the freeze: SimulatedBroker.snapshot() ALWAYS reports 0
++    #     (no simulated order book), so a zero there is not a broker
++    #     confirmation.  For the LIVE adapter the trustworthiness was
++    #     fixed separately (PR #37): a get_orders() error now propagates
++    #     out of snapshot() instead of being masked as open_orders = 0,
++    #     so startup reconcile FAILS CLOSED (bootstrap marks it FAILED
++    #     and no execution is enabled — STARTUP_RECONCILE_FAILED).  A
++    #     LIVE zero is therefore a CONFIRMED absence of working orders,
++    #     but terminality of the previous ambiguous SELL still cannot be
++    #     proven from a single snapshot, so the freeze rule above holds.
+     # The adapter contract (ExecutionResult / snapshot) carries no
+     # terminal order status usable for this confirmation, so lifting the
+     # freeze automatically would invent guarantees the API does not
