@@ -154,7 +154,11 @@ class FakeLiveClient:
 
     def __init__(self, response, orders_error=None):
         self.operations = FakeOperationsService(response)
-        self.orders = FakeOrdersService(error=orders_error)
+        # Success path must return the SDK-shaped GetOrdersResponse
+        # (response.orders); without it get_orders() returned None and
+        # snapshot() crashed with AttributeError on .orders.
+        self.orders = FakeOrdersService(response=response.orders,
+                                        error=orders_error)
 
 
 @contextmanager
