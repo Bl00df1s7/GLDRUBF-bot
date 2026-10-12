@@ -987,10 +987,17 @@ def test_g1_exit_executes_when_margin_api_unavailable(state_env, market):
     assert st["last_processed_5m_ts"] == C1630["time"].isoformat()
     assert st["last_action"] == "EXIT_LONG"
 
-    # Idempotency: re-running the SAME exit candle must not re-sell.
+    # Post-exit contract (G-1): after a successful EXIT the account is flat,
+    # so the runtime routes the next cycle to the ENTRY branch (documented
+    # production behaviour — same as test_f_exit_branch_is_candle_idempotent
+    # and G4 tests). With the ГО API still down, ENTRY must stay fail-closed
+    # with MARGIN_API_UNAVAILABLE, and no duplicate SELL may appear.
+    # Exit-candle idempotency itself is covered by
+    # test_f_exit_branch_is_candle_idempotent / G4 (position reopened).
     d2 = rt.run_cycle()
-    assert d2.action == "NO_ENTRY" and d2.reason == "DUPLICATE_CANDLE"
-    assert len(sell_orders(adapter)) == 1
+    assert d2.action == "NO_ENTRY" and d2.reason == "MARGIN_API_UNAVAILABLE"
+    assert len(sell_orders(adapter)) == 1        # exactly one SELL total
+    assert broker.position_qty == 0              # still flat at the broker
 
 
 def test_g1_hold_with_dead_margin_api_does_not_block_later_exit(state_env, market):
