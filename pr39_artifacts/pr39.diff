@@ -1,0 +1,227 @@
+diff --git a/config/__pycache__/__init__.cpython-312.pyc b/config/__pycache__/__init__.cpython-312.pyc
+deleted file mode 100644
+index eec33fa..0000000
+Binary files a/config/__pycache__/__init__.cpython-312.pyc and /dev/null differ
+diff --git a/config/__pycache__/settings.cpython-312.pyc b/config/__pycache__/settings.cpython-312.pyc
+deleted file mode 100644
+index ce3d645..0000000
+Binary files a/config/__pycache__/settings.cpython-312.pyc and /dev/null differ
+diff --git a/scripts/__pycache__/paper_smoke_test.cpython-312.pyc b/scripts/__pycache__/paper_smoke_test.cpython-312.pyc
+deleted file mode 100644
+index 71fcf22..0000000
+Binary files a/scripts/__pycache__/paper_smoke_test.cpython-312.pyc and /dev/null differ
+diff --git a/src/__pycache__/api_retry.cpython-312.pyc b/src/__pycache__/api_retry.cpython-312.pyc
+deleted file mode 100644
+index bb98f6d..0000000
+Binary files a/src/__pycache__/api_retry.cpython-312.pyc and /dev/null differ
+diff --git a/src/__pycache__/auto_trader.cpython-312.pyc b/src/__pycache__/auto_trader.cpython-312.pyc
+deleted file mode 100644
+index 65dbd76..0000000
+Binary files a/src/__pycache__/auto_trader.cpython-312.pyc and /dev/null differ
+diff --git a/src/__pycache__/c5_runtime.cpython-312.pyc b/src/__pycache__/c5_runtime.cpython-312.pyc
+deleted file mode 100644
+index b75da88..0000000
+Binary files a/src/__pycache__/c5_runtime.cpython-312.pyc and /dev/null differ
+diff --git a/src/__pycache__/cash_manager.cpython-312.pyc b/src/__pycache__/cash_manager.cpython-312.pyc
+deleted file mode 100644
+index 0be7f24..0000000
+Binary files a/src/__pycache__/cash_manager.cpython-312.pyc and /dev/null differ
+diff --git a/src/__pycache__/client_factory.cpython-312.pyc b/src/__pycache__/client_factory.cpython-312.pyc
+deleted file mode 100644
+index 2f3f4f1..0000000
+Binary files a/src/__pycache__/client_factory.cpython-312.pyc and /dev/null differ
+diff --git a/src/__pycache__/execution_adapter.cpython-312.pyc b/src/__pycache__/execution_adapter.cpython-312.pyc
+deleted file mode 100644
+index 12286b4..0000000
+Binary files a/src/__pycache__/execution_adapter.cpython-312.pyc and /dev/null differ
+diff --git a/src/__pycache__/execution_guard.cpython-312.pyc b/src/__pycache__/execution_guard.cpython-312.pyc
+deleted file mode 100644
+index fc780b2..0000000
+Binary files a/src/__pycache__/execution_guard.cpython-312.pyc and /dev/null differ
+diff --git a/src/__pycache__/indicators.cpython-312.pyc b/src/__pycache__/indicators.cpython-312.pyc
+deleted file mode 100644
+index 719aac6..0000000
+Binary files a/src/__pycache__/indicators.cpython-312.pyc and /dev/null differ
+diff --git a/src/__pycache__/instruments.cpython-312.pyc b/src/__pycache__/instruments.cpython-312.pyc
+deleted file mode 100644
+index 8377272..0000000
+Binary files a/src/__pycache__/instruments.cpython-312.pyc and /dev/null differ
+diff --git a/src/__pycache__/lock.cpython-312.pyc b/src/__pycache__/lock.cpython-312.pyc
+deleted file mode 100644
+index 52337a8..0000000
+Binary files a/src/__pycache__/lock.cpython-312.pyc and /dev/null differ
+diff --git a/src/__pycache__/main.cpython-312.pyc b/src/__pycache__/main.cpython-312.pyc
+deleted file mode 100644
+index ab2e157..0000000
+Binary files a/src/__pycache__/main.cpython-312.pyc and /dev/null differ
+diff --git a/src/__pycache__/margin_provider.cpython-312.pyc b/src/__pycache__/margin_provider.cpython-312.pyc
+deleted file mode 100644
+index 9d201a7..0000000
+Binary files a/src/__pycache__/margin_provider.cpython-312.pyc and /dev/null differ
+diff --git a/src/__pycache__/market_data.cpython-312.pyc b/src/__pycache__/market_data.cpython-312.pyc
+deleted file mode 100644
+index c5bedac..0000000
+Binary files a/src/__pycache__/market_data.cpython-312.pyc and /dev/null differ
+diff --git a/src/__pycache__/observability.cpython-312.pyc b/src/__pycache__/observability.cpython-312.pyc
+deleted file mode 100644
+index 7cb9290..0000000
+Binary files a/src/__pycache__/observability.cpython-312.pyc and /dev/null differ
+diff --git a/src/__pycache__/position_monitor.cpython-312.pyc b/src/__pycache__/position_monitor.cpython-312.pyc
+deleted file mode 100644
+index 86d8122..0000000
+Binary files a/src/__pycache__/position_monitor.cpython-312.pyc and /dev/null differ
+diff --git a/src/__pycache__/preflight.cpython-312.pyc b/src/__pycache__/preflight.cpython-312.pyc
+deleted file mode 100644
+index 6574324..0000000
+Binary files a/src/__pycache__/preflight.cpython-312.pyc and /dev/null differ
+diff --git a/src/__pycache__/protection.cpython-312.pyc b/src/__pycache__/protection.cpython-312.pyc
+deleted file mode 100644
+index 43ceee8..0000000
+Binary files a/src/__pycache__/protection.cpython-312.pyc and /dev/null differ
+diff --git a/src/__pycache__/risk_manager.cpython-312.pyc b/src/__pycache__/risk_manager.cpython-312.pyc
+deleted file mode 100644
+index 45feeb7..0000000
+Binary files a/src/__pycache__/risk_manager.cpython-312.pyc and /dev/null differ
+diff --git a/src/__pycache__/runtime_config.cpython-312.pyc b/src/__pycache__/runtime_config.cpython-312.pyc
+deleted file mode 100644
+index 05c7425..0000000
+Binary files a/src/__pycache__/runtime_config.cpython-312.pyc and /dev/null differ
+diff --git a/src/__pycache__/state_store.cpython-312.pyc b/src/__pycache__/state_store.cpython-312.pyc
+deleted file mode 100644
+index 00936af..0000000
+Binary files a/src/__pycache__/state_store.cpython-312.pyc and /dev/null differ
+diff --git a/src/__pycache__/stop_orders.cpython-312.pyc b/src/__pycache__/stop_orders.cpython-312.pyc
+deleted file mode 100644
+index a3d64e8..0000000
+Binary files a/src/__pycache__/stop_orders.cpython-312.pyc and /dev/null differ
+diff --git a/src/__pycache__/strategy.cpython-312.pyc b/src/__pycache__/strategy.cpython-312.pyc
+deleted file mode 100644
+index b1eea15..0000000
+Binary files a/src/__pycache__/strategy.cpython-312.pyc and /dev/null differ
+diff --git a/src/__pycache__/telegram_bot.cpython-312.pyc b/src/__pycache__/telegram_bot.cpython-312.pyc
+deleted file mode 100644
+index ea33793..0000000
+Binary files a/src/__pycache__/telegram_bot.cpython-312.pyc and /dev/null differ
+diff --git a/src/__pycache__/trade_logger.cpython-312.pyc b/src/__pycache__/trade_logger.cpython-312.pyc
+deleted file mode 100644
+index d835fa4..0000000
+Binary files a/src/__pycache__/trade_logger.cpython-312.pyc and /dev/null differ
+diff --git a/src/c5_runtime.py b/src/c5_runtime.py
+index cbf0390..46dddbf 100644
+--- a/src/c5_runtime.py
++++ b/src/c5_runtime.py
+@@ -191,11 +191,17 @@ def reconcile(adapter, account_id: str, state: dict) -> "object":
+     #   * broker_qty changed (including to zero) may be the end-state of
+     #     the old order AND a partial fill of an order that is still
+     #     alive;
+-    #   * snapshot.open_orders == 0 is NOT trustworthy: the LIVE adapter
+-    #     silently coerces a get_orders() exception into 0 (known
+-    #     separate production defect in execution_adapter.py, out of
+-    #     scope here) and SimulatedBroker.snapshot() ALWAYS reports 0 —
+-    #     so a zero here is not proof of absence of working orders.
++    #   * snapshot.open_orders == 0 is still NOT sufficient proof for
++    #     lifting the freeze: SimulatedBroker.snapshot() ALWAYS reports 0
++    #     (no simulated order book), so a zero there is not a broker
++    #     confirmation.  For the LIVE adapter the trustworthiness was
++    #     fixed separately (PR #37): a get_orders() error now propagates
++    #     out of snapshot() instead of being masked as open_orders = 0,
++    #     so startup reconcile FAILS CLOSED (bootstrap marks it FAILED
++    #     and no execution is enabled — STARTUP_RECONCILE_FAILED).  A
++    #     LIVE zero is therefore a CONFIRMED absence of working orders,
++    #     but terminality of the previous ambiguous SELL still cannot be
++    #     proven from a single snapshot, so the freeze rule above holds.
+     # The adapter contract (ExecutionResult / snapshot) carries no
+     # terminal order status usable for this confirmation, so lifting the
+     # freeze automatically would invent guarantees the API does not
+diff --git a/src/strategies/__pycache__/__init__.cpython-312.pyc b/src/strategies/__pycache__/__init__.cpython-312.pyc
+deleted file mode 100644
+index 48d20fc..0000000
+Binary files a/src/strategies/__pycache__/__init__.cpython-312.pyc and /dev/null differ
+diff --git a/src/strategies/__pycache__/base.cpython-312.pyc b/src/strategies/__pycache__/base.cpython-312.pyc
+deleted file mode 100644
+index 275fec8..0000000
+Binary files a/src/strategies/__pycache__/base.cpython-312.pyc and /dev/null differ
+diff --git a/src/strategies/__pycache__/c5_core.cpython-312.pyc b/src/strategies/__pycache__/c5_core.cpython-312.pyc
+deleted file mode 100644
+index 22ad33c..0000000
+Binary files a/src/strategies/__pycache__/c5_core.cpython-312.pyc and /dev/null differ
+diff --git a/src/strategies/__pycache__/c5_signals.cpython-312.pyc b/src/strategies/__pycache__/c5_signals.cpython-312.pyc
+deleted file mode 100644
+index 60a21f1..0000000
+Binary files a/src/strategies/__pycache__/c5_signals.cpython-312.pyc and /dev/null differ
+diff --git a/tests/__pycache__/__init__.cpython-312.pyc b/tests/__pycache__/__init__.cpython-312.pyc
+deleted file mode 100644
+index 001235d..0000000
+Binary files a/tests/__pycache__/__init__.cpython-312.pyc and /dev/null differ
+diff --git a/tests/__pycache__/test_api_retry.cpython-312-pytest-7.4.4.pyc b/tests/__pycache__/test_api_retry.cpython-312-pytest-7.4.4.pyc
+deleted file mode 100644
+index 7233ee4..0000000
+Binary files a/tests/__pycache__/test_api_retry.cpython-312-pytest-7.4.4.pyc and /dev/null differ
+diff --git a/tests/__pycache__/test_auto_trader.cpython-312-pytest-7.4.4.pyc b/tests/__pycache__/test_auto_trader.cpython-312-pytest-7.4.4.pyc
+deleted file mode 100644
+index 7ae08c1..0000000
+Binary files a/tests/__pycache__/test_auto_trader.cpython-312-pytest-7.4.4.pyc and /dev/null differ
+diff --git a/tests/__pycache__/test_c5_core.cpython-312-pytest-7.4.4.pyc b/tests/__pycache__/test_c5_core.cpython-312-pytest-7.4.4.pyc
+deleted file mode 100644
+index e3237b4..0000000
+Binary files a/tests/__pycache__/test_c5_core.cpython-312-pytest-7.4.4.pyc and /dev/null differ
+diff --git a/tests/__pycache__/test_c5_core.cpython-312-pytest-9.1.1.pyc b/tests/__pycache__/test_c5_core.cpython-312-pytest-9.1.1.pyc
+deleted file mode 100644
+index 096c061..0000000
+Binary files a/tests/__pycache__/test_c5_core.cpython-312-pytest-9.1.1.pyc and /dev/null differ
+diff --git a/tests/__pycache__/test_paper_smoke_clock_override.cpython-312-pytest-7.4.4.pyc b/tests/__pycache__/test_paper_smoke_clock_override.cpython-312-pytest-7.4.4.pyc
+deleted file mode 100644
+index 4626930..0000000
+Binary files a/tests/__pycache__/test_paper_smoke_clock_override.cpython-312-pytest-7.4.4.pyc and /dev/null differ
+diff --git a/tests/__pycache__/test_position_monitor.cpython-312-pytest-7.4.4.pyc b/tests/__pycache__/test_position_monitor.cpython-312-pytest-7.4.4.pyc
+deleted file mode 100644
+index 2dc8e98..0000000
+Binary files a/tests/__pycache__/test_position_monitor.cpython-312-pytest-7.4.4.pyc and /dev/null differ
+diff --git a/tests/__pycache__/test_reliability.cpython-312-pytest-7.4.4.pyc b/tests/__pycache__/test_reliability.cpython-312-pytest-7.4.4.pyc
+deleted file mode 100644
+index 4fbcb54..0000000
+Binary files a/tests/__pycache__/test_reliability.cpython-312-pytest-7.4.4.pyc and /dev/null differ
+diff --git a/tests/__pycache__/test_risk_manager.cpython-312-pytest-7.4.4.pyc b/tests/__pycache__/test_risk_manager.cpython-312-pytest-7.4.4.pyc
+deleted file mode 100644
+index bf3733b..0000000
+Binary files a/tests/__pycache__/test_risk_manager.cpython-312-pytest-7.4.4.pyc and /dev/null differ
+diff --git a/tests/__pycache__/test_stage2d_runtime.cpython-312-pytest-7.4.4.pyc b/tests/__pycache__/test_stage2d_runtime.cpython-312-pytest-7.4.4.pyc
+deleted file mode 100644
+index 03945d4..0000000
+Binary files a/tests/__pycache__/test_stage2d_runtime.cpython-312-pytest-7.4.4.pyc and /dev/null differ
+diff --git a/tests/__pycache__/test_stage5a_paper_gate.cpython-312-pytest-7.4.4.pyc b/tests/__pycache__/test_stage5a_paper_gate.cpython-312-pytest-7.4.4.pyc
+deleted file mode 100644
+index 89af7a0..0000000
+Binary files a/tests/__pycache__/test_stage5a_paper_gate.cpython-312-pytest-7.4.4.pyc and /dev/null differ
+diff --git a/tests/__pycache__/test_stage5a_paper_gate.cpython-312-pytest-9.1.1.pyc b/tests/__pycache__/test_stage5a_paper_gate.cpython-312-pytest-9.1.1.pyc
+deleted file mode 100644
+index b96e0a3..0000000
+Binary files a/tests/__pycache__/test_stage5a_paper_gate.cpython-312-pytest-9.1.1.pyc and /dev/null differ
+diff --git a/tests/__pycache__/test_stage5b_paper_runtime.cpython-312-pytest-7.4.4.pyc b/tests/__pycache__/test_stage5b_paper_runtime.cpython-312-pytest-7.4.4.pyc
+deleted file mode 100644
+index 5b9eea8..0000000
+Binary files a/tests/__pycache__/test_stage5b_paper_runtime.cpython-312-pytest-7.4.4.pyc and /dev/null differ
+diff --git a/tests/__pycache__/test_stage5b_paper_runtime.cpython-312-pytest-9.1.1.pyc b/tests/__pycache__/test_stage5b_paper_runtime.cpython-312-pytest-9.1.1.pyc
+deleted file mode 100644
+index 9bda881..0000000
+Binary files a/tests/__pycache__/test_stage5b_paper_runtime.cpython-312-pytest-9.1.1.pyc and /dev/null differ
+diff --git a/tests/__pycache__/test_stage5b_paper_runtime.cpython-312.pyc b/tests/__pycache__/test_stage5b_paper_runtime.cpython-312.pyc
+deleted file mode 100644
+index 2837bf7..0000000
+Binary files a/tests/__pycache__/test_stage5b_paper_runtime.cpython-312.pyc and /dev/null differ
+diff --git a/tests/__pycache__/test_stop_orders.cpython-312-pytest-7.4.4.pyc b/tests/__pycache__/test_stop_orders.cpython-312-pytest-7.4.4.pyc
+deleted file mode 100644
+index e92922d..0000000
+Binary files a/tests/__pycache__/test_stop_orders.cpython-312-pytest-7.4.4.pyc and /dev/null differ
+diff --git a/tests/__pycache__/test_strategy.cpython-312-pytest-7.4.4.pyc b/tests/__pycache__/test_strategy.cpython-312-pytest-7.4.4.pyc
+deleted file mode 100644
+index f024d11..0000000
+Binary files a/tests/__pycache__/test_strategy.cpython-312-pytest-7.4.4.pyc and /dev/null differ
+diff --git a/tests/__pycache__/test_trade_logger.cpython-312-pytest-7.4.4.pyc b/tests/__pycache__/test_trade_logger.cpython-312-pytest-7.4.4.pyc
+deleted file mode 100644
+index fd8b970..0000000
+Binary files a/tests/__pycache__/test_trade_logger.cpython-312-pytest-7.4.4.pyc and /dev/null differ
+diff --git a/tests/__pycache__/test_trading_schedule.cpython-312-pytest-7.4.4.pyc b/tests/__pycache__/test_trading_schedule.cpython-312-pytest-7.4.4.pyc
+deleted file mode 100644
+index b83796a..0000000
+Binary files a/tests/__pycache__/test_trading_schedule.cpython-312-pytest-7.4.4.pyc and /dev/null differ
