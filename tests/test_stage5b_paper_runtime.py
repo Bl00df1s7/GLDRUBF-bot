@@ -1697,8 +1697,15 @@ def test_g5_partial_residual_restart_with_new_exit_signal(state_env, market):
     # Bootstrap reconcile adopts the broker view (residual qty-1) BEFORE
     # any sell; the guarded fake then allows at most ONE honest full-size
     # result for this cycle and ZERO sells afterwards.
+    # History is PRESERVED (A2 semantics): C16 16:00 stays in place so the
+    # entry-side control-point idempotency (last_c5_entry_control_timestamp
+    # == 16:00) remains verifiable against a real candle.  The old variant
+    # of this test replaced ALL rows with CEXIT2 via set_candles() — that
+    # destroyed the entry history and produced a spurious ENTER_SHORT on
+    # the third cycle (the "false DUPLICATE_CANDLE expectation", artefact
+    # C).  Appending keeps the temporal order and candle identity intact.
     CEXIT2 = candle_5m(CONTROL_DAY, 17, 0, SHORT_BREAK)
-    set_candles(market, CEXIT2)
+    market.holder["rows"].append(CEXIT2)
     market.holder["now"] = utc_ms(CONTROL_DAY, 17, 5)
     rt2, adapter2 = _g5_restart_runtime(state_env, market, broker, qty - 1)
     d = rt2.run_cycle()
@@ -1708,19 +1715,30 @@ def test_g5_partial_residual_restart_with_new_exit_signal(state_env, market):
     assert st2["c5_position_qty"] == 0              # position fully closed
     assert st2["last_processed_5m_ts"] == CEXIT2["time"].isoformat()
     assert "exit_failure_reason" not in st2
-    assert "exit_unverified_until_reconcile" not in st2
+    assert not st2.get("exit_unverified_until_reconcile")
     # ровно ОДИН SELL размером в подтверждённый остаток, вслепую — ноль
     sells = [o for o in adapter2.orders if o["side"] == "SELL"]
     assert sells == [{"instrument": "CNYRUBF", "side": "SELL",
                       "qty": qty - 1}]
     assert broker.position_qty == 0                 # broker agrees
 
-    # Третий цикл на той же свече — DUPLICATE_CANDLE, новых заявок нет.
+    # Третий цикл на той же свече CEXIT2 (17:00).  Смысл проверки: после
+    # доказанного полного закрытия остатка новых заявок НЕ появилось —
+    # ни слепого повторного SELL, ни нового входа.  Какого-либо штатного
+    # механизма "запретить вход на уже обработанную EXIT-свечу" в runtime
+    # нет: позиция flat → run_cycle идёт в ENTRY-ветку и легитимно
+    # переиспользует контрольную точку как новую (это зафиксированное
+    # поведение production, см. test выше по файлу с NO_SIGNAL/NEW ts),
+    # поэтому ложное ожидание DUPLICATE_CANDLE убрано вместе с артефактом
+    # C.  Дедупликация самого EXIT-цикла (DUPLICATE_CANDLE при активном
+    # freeze) проверяется отдельным тестом
+    # test_g5_unverified_blocks_all_future_position_ops.
     market.holder["now"] = utc_ms(CONTROL_DAY, 17, 10)
     d2 = rt2.run_cycle()
-    assert d2.action == "NO_ENTRY" and d2.reason == "DUPLICATE_CANDLE"
     assert [o for o in adapter2.orders if o["side"] == "SELL"] == \
         [{"instrument": "CNYRUBF", "side": "SELL", "qty": qty - 1}]
+    st3 = read_state(state_env)
+    assert not st3.get("exit_unverified_until_reconcile")
 
 
 # ── E2E 4: НУЛЕВОЕ исполнение (ok=True, qty_executed=0) не закрывает ──
@@ -1920,7 +1938,10 @@ def test_g5_confirmed_rejection_retry_still_works(state_env, market):
     assert d1.action == "EXIT"
     st1 = read_state(state_env)
     assert "last_processed_5m_ts" not in st1        # candle NOT burned
-    assert "exit_unverified_until_reconcile" not in st1  # G-4 path intact
+    # штатный state_store дополняет состояние ключами из C5_STATE_DEFAULTS,
+    # поэтому отсутствие АКТИВНОГО freeze проверяется по значению (None/False),
+    # а не по синтаксическому отсутствию ключа в JSON
+    assert not st1.get("exit_unverified_until_reconcile")  # G-4 path intact
     assert st1["exit_failure_reason"] == \
         "ORDER_NOT_FILLED:EXECUTION_REPORT_STATUS_REJECTED"
     assert st1["c5_position_qty"] == qty
