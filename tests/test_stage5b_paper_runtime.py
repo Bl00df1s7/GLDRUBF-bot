@@ -1506,9 +1506,12 @@ def _g5_exit_setup(state_env, market, sell_results_fn=None):
     scripted = ScriptedSellAdapter(adapter._paper, sell_results,
                                    state_env=state_env)
     rt.adapter = scripted
-    C16 = candle_5m(CONTROL_DAY, 16, 0, LONG_BREAK)
+    # A2 fix: ADD the EXIT candle to the existing rows instead of
+    # replacing them.  The entry candle C16 (16:00) stays in place —
+    # identity and temporal order preserved — so later cycles can add
+    # further distinct candles without destroying history.
     CEXIT = candle_5m(CONTROL_DAY, 16, 30, SHORT_BREAK)
-    set_candles(market, C16, CEXIT)
+    market.holder["rows"].append(CEXIT)
     market.holder["now"] = utc_ms(CONTROL_DAY, 16, 35)
     return rt, scripted, broker, qty, CEXIT
 

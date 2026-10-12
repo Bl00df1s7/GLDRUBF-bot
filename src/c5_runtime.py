@@ -197,8 +197,15 @@ def reconcile(adapter, account_id: str, state: dict) -> "object":
     # with this position, including across process restarts (the flag
     # persists via state_store.C5_STATE_DEFAULTS).
     if state.get("exit_unverified_until_reconcile"):
+        # The residual expectation MUST be computed against the qty that
+        # was stored BEFORE any adoption above: reconcile() may already
+        # have overwritten c5_position_qty with this same snapshot, and
+        # comparing a value to itself is NOT independent confirmation.
+        # `stored_qty` (read at the top of this function from persisted
+        # state) is the accounting baseline; the ledger subtracts only
+        # volumes that prior EXIT results PROVED were executed.
         try:
-            expected_residual = int(state.get("c5_position_qty") or 0) - int(
+            expected_residual = stored_qty - int(
                 state.get("exit_confirmed_filled_qty") or 0)
         except (TypeError, ValueError):
             expected_residual = None      # unusable ledger ⇒ never clear
