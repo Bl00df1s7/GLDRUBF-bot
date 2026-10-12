@@ -239,13 +239,28 @@ class C5Runtime:
         if self._margin is None:
             self._margin = MarginTracker(self.token, C5_TARGET_TICKER)
 
+        # G-1: the two failure classes are deliberately separated.
+        # ReconcileError / any other critical state-recovery error ⇒
+        # broker view is untrusted ⇒ bootstrap fails, NO EXECUTION.
+        # MarginApiUnavailable AFTER a successful reconcile ⇒ the open
+        # position is reliably restored from the broker snapshot and
+        # EXIT/HOLD need no ГО; only ENTRY stays fail-closed
+        # (_evaluate_entry always does a mandatory refresh()).
         try:
             snapshot = reconcile(self.adapter, self.account_id, state)
-            self._margin.refresh()
-        except (ReconcileError, MarginApiUnavailable) as exc:
-            logger.error("RECONCILE/MARGIN failure — trading NOT enabled: %s", exc)
+        except Exception as exc:
+            logger.error("RECONCILE failure — trading NOT enabled: %s", exc)
             state["reconcile_status"] = "FAILED"
             return None
+
+        try:
+            self._margin.refresh()
+        except MarginApiUnavailable as exc:
+            logger.warning(
+                "MARGIN API unavailable at startup: %s — EXIT/HOLD remain "
+                "enabled (position restored from broker snapshot); ENTRY "
+                "stays fail-closed until a fresh margin check succeeds.",
+                exc)
         return snapshot
 
     @property
