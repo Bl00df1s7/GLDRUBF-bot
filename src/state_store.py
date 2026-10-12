@@ -67,7 +67,17 @@ C5_STATE_DEFAULTS = {
     # G-5: set when an EXIT execution outcome could not be verified;
     # blocks all position operations until reconcile re-baselines state.
     "exit_unverified_until_reconcile": None,
+    # G-7: durable SELL intent marker, written to disk BEFORE sell_cny() is
+    # called. Non-None means an exit order send may or may not have reached
+    # the broker; re-sending SELL is blocked until explicit operator
+    # resolution (see c5_runtime.resolve_pending_sell_intent).
+    "exit_pending_sell_intent": None,
 }
+
+
+class StateSaveError(IOError):
+    """G-7: raised by save_state_strict() when a state write did not
+    complete reliably. Callers must treat this as 'durability not proven'."""
 
 
 def _ensure_c5_keys(state: dict) -> dict:
@@ -196,19 +206,86 @@ def load_state() -> dict:
         })
 
 
-def save_state(state: dict) -> None:
-    """Save state to file."""
-    try:
-        path = state_file_path()
-        # Ensure directory exists
-        state_dir = os.path.dirname(path)
-        if state_dir and not os.path.exists(state_dir):
-            os.makedirs(state_dir, exist_ok=True)
+def _atomic_write_state(state: dict) -> None:
+    """
+    G-7: atomically persist state.
 
-        with open(path, "w") as f:
-            json.dump(state, f, indent=2, default=str)
-    except IOError as e:
+    Serialize first (so a non-serializable payload never truncates the
+    existing file), then write to a temp file in the SAME directory,
+    flush + fsync, and os.replace() over the target. A failure before
+    os.replace leaves the previous valid state untouched; a failure at
+    any step raises OSError/IOError for the caller to handle.
+
+    Note on durability: after a successful os.replace() we fsync the
+    directory; if that final fsync fails, the new content is visible via
+    the path but its durability across a hard crash is uncertain (the
+    old version is NOT guaranteed to still be there). Callers must treat
+    any raise from this function as 'durability not proven'.
+    """
+    payload = json.dumps(state, indent=2, default=str)
+    path = state_file_path()
+    state_dir = os.path.dirname(path) or "."
+    if not os.path.exists(state_dir):
+        os.makedirs(state_dir, exist_ok=True)
+
+    tmp_path = None
+    try:
+        fd = os.open(
+            tmp_path := f"{path}.tmp.{os.getpid()}.{id(payload)}",
+            os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+            0o644,
+        )
+        try:
+            with os.fdopen(fd, "w") as f:
+                f.write(payload)
+                f.flush()
+                os.fsync(f.fileno())
+        except BaseException:
+            # File object closed (fd consumed); clean up the temp file.
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+        os.replace(tmp_path, path)
+        tmp_path = None  # replaced successfully; nothing left to clean
+    finally:
+        if tmp_path is not None:
+            # Failure before os.replace(): temp file may exist, remove it.
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+    # Directory fsync AFTER replace (durability of the rename itself).
+    # If this fails, the replacement already happened - propagate so the
+    # strict caller knows durability is unproven, but do not attempt any
+    # cleanup (there is nothing to clean).
+    dir_fd = os.open(state_dir, os.O_RDONLY)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+
+
+def save_state(state: dict) -> None:
+    """Save state to file (best-effort contract preserved for consumers)."""
+    try:
+        _atomic_write_state(state)
+    except (IOError, OSError) as e:
         print(f"⚠️ State save error: {e}")
+
+
+def save_state_strict(state: dict) -> None:
+    """
+    G-7: durable save for SELL-critical writes. Raises StateSaveError when
+    the write did not complete reliably (including the post-replace
+    directory-fsync uncertainty). Never returns silently on failure.
+    """
+    try:
+        _atomic_write_state(state)
+    except (IOError, OSError) as e:
+        raise StateSaveError(f"State save failed: {e}") from e
 
 
 def check_candle_already_processed(state: dict, candle_data: dict) -> bool:

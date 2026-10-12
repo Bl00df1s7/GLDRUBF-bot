@@ -57,7 +57,13 @@ from src.runtime_config import (
     enforce_trading_gate,
     load_trading_config,
 )
-from src.state_store import load_state, save_state
+from src.state_store import (
+    StateSaveError,
+    _mask_account_id as _mask_account_id_local,
+    load_state,
+    save_state,
+    save_state_strict,
+)
 from src.strategies import c5_core
 
 logger = logging.getLogger("golden_bot.c5_runtime")
@@ -84,6 +90,9 @@ REASON_TRADING_BLOCKED = "TRADING_BLOCKED_BY_CONFIG"
 # "order provably dead".
 REASON_EXIT_UNVERIFIED = "EXIT_UNVERIFIED_PENDING_RECONCILE"
 EXIT_UNVERIFIED_REASON = REASON_EXIT_UNVERIFIED
+# G-7: the durable SELL-intent marker could not be persisted BEFORE
+# dispatch — fail closed, the order was NOT sent.
+REASON_SELL_INTENT_PERSIST_FAILED = "SELL_INTENT_PERSIST_FAILED"
 
 
 def _now_utc() -> datetime:
@@ -214,6 +223,20 @@ def reconcile(adapter, account_id: str, state: dict) -> "object":
     # freeze lifts, the position re-baselines to it and the EXIT ledger
     # resets.  A non-int value (bool/float/str included) is rejected —
     # no coercion launders bad data into a clearance.
+    # G-7: an unfinished SELL-intent marker means we cannot prove the
+    # exit order never reached the broker.  A regular broker snapshot
+    # (even one that matches the stored size) NEVER clears it — same
+    # fail-closed rule as the freeze above.  It survives reconcile
+    # untouched and blocks any further SELL dispatch in _evaluate_exit
+    # until resolve_pending_sell_intent() (explicit operator action) or
+    # a proven-terminal result removes it.
+    if state.get("exit_pending_sell_intent") and \
+            not state.get("exit_unverified_until_reconcile"):
+        logger.error(
+            "RECONCILE: pending SELL intent %s kept — broker snapshot is"
+            " NOT proof the ambiguous exit order never reached the broker;"
+            " explicit operator resolution required",
+            state["exit_pending_sell_intent"])
     if state.get("exit_unverified_until_reconcile"):
         confirmed = state.get("broker_position_confirmed")
         if type(confirmed) is int:
@@ -253,6 +276,35 @@ def reconcile(adapter, account_id: str, state: dict) -> "object":
 
     state["reconcile_status"] = "OK"
     return snapshot
+
+
+def resolve_pending_sell_intent(state: dict, *, candle_ts: str,
+                                qty: int) -> bool:
+    """G-7 EXPLICIT operator resolution of a pending SELL intent marker.
+
+    Deliberately narrow: it clears ONLY the marker whose candle timestamp
+    AND requested quantity match exactly what is on disk.  A plain broker
+    snapshot or a coinciding position size NEVER calls this function and
+    NEVER lifts the block (same principle as the G-5 EXIT_UNVERIFIED
+    freeze).  The operator must first verify at the broker terminal which
+    fate the ambiguous SELL actually had; only then may this be used.
+    """
+    marker = state.get("exit_pending_sell_intent")
+    if not isinstance(marker, dict):
+        return False
+    if str(marker.get("candle_ts")) != str(candle_ts) \
+            or int(marker.get("qty") or 0) != int(qty):
+        logger.error(
+            "SELL_INTENT_RESOLVE refused: requested (ts=%r, qty=%r) does"
+            " not match the pending marker (ts=%r, qty=%r) — no implicit"
+            " or partial clearance is allowed",
+            candle_ts, qty, marker.get("candle_ts"), marker.get("qty"))
+        return False
+    state.pop("exit_pending_sell_intent", None)
+    logger.warning(
+        "SELL_INTENT resolved explicitly by operator for candle %s qty %d",
+        candle_ts, qty)
+    return True
 
 
 class C5Runtime:
@@ -361,6 +413,36 @@ class C5Runtime:
                           candles_count=7 * 288, timeframe=C5_CONTROL_TIMEFRAME)
         return latest_closed_5m(df, now_utc), df
 
+    def _finalize_exit_state(self, state) -> None:
+        """G-7: durably persist the post-dispatch EXIT outcome.
+
+        The SELL has already been handed to the adapter at this point, so
+        losing the resulting state on a write failure could allow a blind
+        re-send after a restart.  A strict save is attempted; if it fails
+        we retry once (transient errors are common) and then fall back to
+        the best-effort writer — which still performs the atomic replace
+        — while logging loudly that durability is NOT proven.  Whatever
+        remains on disk in that worst case is either the new terminal
+        state or the previously saved intent marker; both keep the next
+        process from re-sending blindly (the marker blocks dispatch, see
+        the G-7 guard in _evaluate_exit).
+        """
+        try:
+            save_state_strict(state)
+        except StateSaveError as exc:
+            logger.error(
+                "G-7: post-dispatch EXIT state save failed (%r) — one"
+                " strict retry", exc)
+            try:
+                save_state_strict(state)
+            except StateSaveError as exc2:
+                logger.critical(
+                    "G-7: EXIT final state durability NOT PROVEN (%r);"
+                    " falling back to best-effort atomic write; pending"
+                    " SELL-intent marker (if any) stays authoritative on"
+                    " the last successful write", exc2)
+                save_state(state)
+
     # ── one full cycle ───────────────────────────────────────────────
     def run_cycle(self) -> c5_core.Decision:
         # STAGE 5A SAFETY GATE — evaluated BEFORE anything that can reach
@@ -437,6 +519,24 @@ class C5Runtime:
             return c5_core.block_entry(_noop_decision(),
                                        REASON_EXIT_UNVERIFIED)
 
+        # G-7: a SELL-intent marker survived on disk. That means an exit
+        # order send of THIS runtime is not proven terminal — after a
+        # crash/restart we cannot tell whether the broker received it.
+        # Re-sending blindly could duplicate a live/filled order, so ALL
+        # SELL dispatch is blocked until explicit operator resolution
+        # (resolve_pending_sell_intent) or a proven-terminal result below
+        # clears it. The candle is burned exactly like the G-5/G-6 guards.
+        pending = state.get("exit_pending_sell_intent")
+        if isinstance(pending, dict):
+            logger.error(
+                "SELL_INTENT_PENDING: unfinished exit operation %s found"
+                " on disk; re-send BLOCKED until explicit operator"
+                " resolution. Candle %s burned to prevent blind re-send.",
+                pending, ts)
+            state["last_processed_5m_ts"] = ts
+            return c5_core.block_entry(_noop_decision(),
+                                       REASON_EXIT_UNVERIFIED)
+
         daily = self.fetch_daily_bars(now_msk)
         if len(daily) < max(c5_core.C5_EXIT_DONCHIAN,
                            c5_core.C5_ENTRY_DONCHIAN) + 1:
@@ -481,6 +581,46 @@ class C5Runtime:
 
         if decision.action == "EXIT":
             qty = abs(int(snapshot.position_qty))
+
+            # G-7: durably record the SELL intent BEFORE dispatch. The
+            # marker carries everything needed for a safe post-restart
+            # assessment: status, instrument, account, direction, the
+            # candle that triggered the exit and the requested contract
+            # quantity. If this write fails the order is NOT sent — we
+            # would rather miss one exit than duplicate an untracked one.
+            # NOTE: `state` here is the same dict run_cycle() saves at the
+            # end of the cycle, so any later successful save also persists
+            # (or clears) this marker — no orphan can survive a confirmed
+            # terminal outcome while the final save succeeded.
+            intent = {
+                "status": "SELL_IN_FLIGHT",
+                "side": "SELL",
+                "instrument": C5_TARGET_TICKER,
+                "account_id_masked": _mask_account_id_local(self.account_id),
+                "direction": position.direction,
+                "candle_ts": ts,
+                "qty": qty,
+                "created_at": now_utc.isoformat(),
+            }
+            state["exit_pending_sell_intent"] = intent
+            try:
+                save_state_strict(state)
+            except StateSaveError as exc:
+                # Pre-dispatch failure: the order was provably NOT sent
+                # (sell_cny has not been called yet). Roll the in-memory
+                # marker back, burn nothing, keep the candle unprocessed —
+                # the next cycle retries the persist-and-send atom. The
+                # on-disk previous state never contained the marker (the
+                # strict save failed), so there is nothing to clean there.
+                state.pop("exit_pending_sell_intent", None)
+                logger.error(
+                    "%s: durable SELL intent could not be persisted (%r)"
+                    " — SELL NOT dispatched, position untouched, candle"
+                    " %s NOT burned", REASON_SELL_INTENT_PERSIST_FAILED,
+                    exc, ts)
+                return c5_core.block_entry(
+                    _noop_decision(), REASON_SELL_INTENT_PERSIST_FAILED)
+
             try:
                 result = self.adapter.sell_cny(self.account_id, qty)
             except Exception as exc:
@@ -509,6 +649,18 @@ class C5Runtime:
                 state["exit_unverified_until_reconcile"] = \
                     EXIT_UNVERIFIED_REASON
                 state["last_processed_5m_ts"] = ts
+                # G-7: sell_cny raised BEFORE returning anything — the
+                # request never left this process (dispatch boundary, see
+                # tests/test_stage5b_paper_runtime.py: ScriptedSellAdapter
+                # records calls only AFTER the adapter returns/raises).
+                # The intent therefore did NOT reach the broker and the
+                # marker would be misleading; the far stronger G-5/G-6
+                # EXIT_UNVERIFIED freeze governs from here (it survives
+                # restarts and blocks every position operation until
+                # explicit operator confirmation via
+                # broker_position_confirmed). run_cycle()'s final
+                # save_state persists both changes together.
+                state.pop("exit_pending_sell_intent", None)
                 return c5_core.block_entry(_noop_decision(),
                                            REASON_EXIT_UNVERIFIED)
             status, filled = _classify_exit_execution(result, qty)
@@ -532,6 +684,12 @@ class C5Runtime:
                 state["c5_position_direction"] = None
                 state["c5_entry_price"] = None
                 state["last_action"] = decision.reason
+                # G-7: terminal CONFIRMED outcome — resolve the durable
+                # intent and persist the COMPLETE final state strictly
+                # (after every field update, so a successful save can
+                # never leave a stale marker or a stale position size).
+                state.pop("exit_pending_sell_intent", None)
+                self._finalize_exit_state(state)
                 logger.info("CNY_EXIT executed: qty=%d order=%s reason=%s",
                             qty, result.order_id, decision.reason)
                 return decision
@@ -583,6 +741,12 @@ class C5Runtime:
                         state["c5_position_qty"] = remaining_signed
                         state["c5_position_direction"] = direction
                         state["last_action"] = decision.reason
+                        # G-7: confirmed PARTIAL — the dispatched order
+                        # reached a terminal confirmed state for the sent
+                        # volume; resolve the intent and persist the full
+                        # residual state strictly (see FULL branch note).
+                        state.pop("exit_pending_sell_intent", None)
+                        self._finalize_exit_state(state)
                         logger.warning(
                             "CNY_EXIT PARTIAL: %d/%d filled order=%s "
                             "reason=%s — remaining %d kept under "
@@ -631,6 +795,11 @@ class C5Runtime:
                 # accepted.
                 state["exit_unverified_until_reconcile"] = EXIT_UNVERIFIED_REASON
                 state["last_processed_5m_ts"] = ts
+                # G-7: the order WAS handed to the broker adapter and its
+                # fate is unproven — KEEP the marker on disk (finalized
+                # strictly below) so even a restart that somehow loses the
+                # freeze still sees the unfinished operation.
+                self._finalize_exit_state(state)
                 logger.error(
                     "CNY_EXIT UNVERIFIED: ok=%s qty_executed=%r requested=%d"
                     " — position state frozen until reconcile; candle %s "
@@ -638,6 +807,12 @@ class C5Runtime:
                     result.ok, getattr(result, "qty_executed", None),
                     qty, ts)
             elif confirmed_dead:
+                # G-7: exchange PROVABLY rejected/cancelled the order —
+                # no execution happened (existing G-4 contract), so the
+                # intent is terminal and may be cleared; the candle stays
+                # unburned and a safe re-attempt is allowed.
+                state.pop("exit_pending_sell_intent", None)
+                self._finalize_exit_state(state)
                 state.pop("last_processed_5m_ts", None)
                 logger.error(
                     "CNY_EXIT FAILED (confirmed rejection): %s — candle "
@@ -647,6 +822,9 @@ class C5Runtime:
                 # TRADING_BLOCKED / unknown fill outcome: burn the candle
                 # exactly as before G-4 — retrying blindly could create a
                 # duplicate SELL while broker state is not verified.
+                # G-7: outcome not proven terminal — KEEP the marker and
+                # persist it strictly.
+                self._finalize_exit_state(state)
                 state["last_processed_5m_ts"] = ts
                 logger.error(
                     "CNY_EXIT FAILED (outcome not confirmed-rejected): %s"
