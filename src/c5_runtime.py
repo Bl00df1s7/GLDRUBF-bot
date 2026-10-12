@@ -174,15 +174,57 @@ def reconcile(adapter, account_id: str, state: dict) -> "object":
         elif state.get("c5_position_direction") not in ("LONG", "SHORT"):
             state["c5_position_direction"] = "LONG" if broker_qty > 0 else "SHORT"
 
-    # G-5: reconcile is the single trustworthy re-baseline of the broker
-    # position. If a previous EXIT ended UNVERIFIED (residual unknown),
-    # the broker view adopted above resolves that ambiguity — clear the
-    # freeze flag only now, never before.
-    if state.pop("exit_unverified_until_reconcile", None):
-        logger.warning(
-            "RECONCILE: cleared EXIT_UNVERIFIED freeze — position state"
-            " re-baselined from broker view (%d)", broker_qty)
+    # G-5 defect fix: the EXIT_UNVERIFIED freeze must NEVER be cleared
+    # just because reconcile() ran.  The freeze exists precisely because
+    # an SELL outcome was NOT verified — the runtime does not know how
+    # much of the position actually closed.  A single broker snapshot
+    # cannot resolve that ambiguity (qty unchanged may mean "nothing
+    # filled" OR a fill still in flight; qty changed may be a partial
+    # end-state OR a live order that will execute more later), so no
+    # automatic heuristic here may invent a residual.
+    #
+    # Trustworthy confirmation is possible ONLY when the snapshot agrees
+    # with what the EXIT ledger already PROVED about this position:
+    #   * zero working orders — a live/pending SELL can still change the
+    #     residual after this snapshot, so today's qty proves nothing;
+    #   * expected residual = stored qty minus the CONFIRMED fills of
+    #     prior exit attempts (0 for UNVERIFIED/ZERO_FILL — nothing was
+    #     proven executed; `filled` for a confirmed PARTIAL).  The
+    #     snapshot must match that expectation exactly.
+    # Only then is the adopted broker view above a genuine re-baseline
+    # and the freeze lifts.  On any mismatch/uncertainty the freeze
+    # stays active (fail closed): no repeated SELL, no new operation
+    # with this position, including across process restarts (the flag
+    # persists via state_store.C5_STATE_DEFAULTS).
+    if state.get("exit_unverified_until_reconcile"):
+        try:
+            expected_residual = int(state.get("c5_position_qty") or 0) - int(
+                state.get("exit_confirmed_filled_qty") or 0)
+        except (TypeError, ValueError):
+            expected_residual = None      # unusable ledger ⇒ never clear
+        consistent = (not snapshot.open_orders
+                      and expected_residual is not None
+                      and broker_qty == expected_residual)
+        if consistent:
+            state.pop("exit_unverified_until_reconcile", None)
+            state.pop("exit_confirmed_filled_qty", None)
+            logger.warning(
+                "RECONCILE: cleared EXIT_UNVERIFIED freeze — broker view"
+                " matches the expected EXIT residual (qty=%d,"
+                " open_orders=0); position re-baselined from broker",
+                broker_qty)
+        else:
+            logger.error(
+                "RECONCILE: EXIT_UNVERIFIED freeze KEPT — broker view is"
+                " not a trustworthy confirmation of the EXIT residual"
+                " (qty=%d, expected=%r, open_orders=%s); position"
+                " operations stay frozen until a confirmed reconcile or"
+                " manual review",
+                broker_qty, expected_residual, snapshot.open_orders)
 
+    # Hard validation AFTER the freeze logic: an invalid equity view
+    # raises below and the caller discards these state changes (G-1:
+    # failed reconcile ⇒ NO EXECUTION, freeze untouched in the file).
     if snapshot.equity_rub is None or snapshot.equity_rub <= 0:
         raise ReconcileError("EQUITY_UNAVAILABLE during reconcile")
 
@@ -431,6 +473,9 @@ class C5Runtime:
                 state["last_processed_5m_ts"] = ts
                 state.pop("exit_failure_reason", None)
                 state.pop("exit_unverified_until_reconcile", None)
+                # EXIT ledger resets with the closed position (the whole
+                # open size is confirmed executed — nothing to re-baseline).
+                state.pop("exit_confirmed_filled_qty", None)
                 state["c5_position_qty"] = 0
                 state["c5_position_direction"] = None
                 state["c5_entry_price"] = None
@@ -466,6 +511,11 @@ class C5Runtime:
                         state["last_processed_5m_ts"] = ts
                         state.pop("exit_failure_reason", None)
                         state.pop("exit_unverified_until_reconcile", None)
+                        # G-5 EXIT ledger: remember the CONFIRMED filled
+                        # volume so a later trustworthy reconcile can
+                        # compute the expected residual (stored − fills).
+                        state["exit_confirmed_filled_qty"] = int(
+                            state.get("exit_confirmed_filled_qty") or 0) + filled
                         state["c5_position_qty"] = remaining_signed
                         state["c5_position_direction"] = direction
                         state["last_action"] = decision.reason
