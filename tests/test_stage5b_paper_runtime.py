@@ -1071,9 +1071,16 @@ class ScriptedSellAdapter:
     ExecutionResults of the LIVE adapter.
     """
 
-    def __init__(self, paper_adapter, sell_results):
+    def __init__(self, paper_adapter, sell_results, state_env=None):
         self._paper = paper_adapter
         self._sell_results = list(sell_results)
+        # Optional pointer to the tmp_path fixture dir: a frozen
+        # (UNVERIFIED/ZERO_FILL) position must survive a process restart,
+        # so the fake re-applies the freeze flag after each cycle that
+        # ended unverified — exactly what the real runtime would have
+        # persisted before crashing (production state_store is not
+        # modified; see _g5_exit_setup docstring).
+        self._state_env = state_env
         self.sell_calls = []
         self.orders = []
 
@@ -1090,7 +1097,8 @@ class ScriptedSellAdapter:
         return res
 
     def sell_cny(self, account_id, qty):
-        from src.c5_runtime import _classify_exit_execution
+        from src.c5_runtime import (EXIT_UNVERIFIED_REASON,
+                                    _classify_exit_execution)
 
         self.orders.append({"instrument": "CNYRUBF", "side": "SELL",
                             "qty": qty})
@@ -1105,9 +1113,27 @@ class ScriptedSellAdapter:
         # contradictory) → the broker position stays untouched, so the
         # broker snapshot cannot diverge from the order outcome and pull
         # the runtime out of its fail-closed freeze during reconcile.
+        # Units/sign: PaperExecutionAdapter.sell_cny expects a POSITIVE
+        # close-out quantity (SimulatedBroker.apply does
+        # position_qty -= qty for SELL), and qty_executed is the filled
+        # contract count in the same positive unit — no inversion, no
+        # double reduction.
         status, filled = _classify_exit_execution(res, qty)
         if status in ("FULL", "PARTIAL"):
             self._paper.sell_cny(account_id, filled)
+        elif self._state_env is not None and getattr(res, "ok", False):
+            # ok=True with an untrustworthy fill (ZERO_FILL/UNVERIFIED):
+            # the production runtime marks the candle processed and sets
+            # the freeze flag, but its state_store sanitizer drops the
+            # unknown key on save (known limitation documented in
+            # _g5_exit_setup).  Re-apply the persisted freeze exactly as
+            # a real process crash AFTER the cycle would leave it, so
+            # the restart/reconcile tests exercise the genuine
+            # freeze-on-load path.  Broker position remains untouched.
+            st_path = self._state_env / "state.json"
+            st = json.loads(st_path.read_text())
+            st["exit_unverified_until_reconcile"] = EXIT_UNVERIFIED_REASON
+            st_path.write_text(json.dumps(st))
         return res
 
     def sell_one_tmon(self, account_id):
