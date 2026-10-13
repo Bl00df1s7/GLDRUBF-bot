@@ -231,6 +231,13 @@ def sell_orders(adapter):
             and o["instrument"] == "CNYRUBF"]
 
 
+def exit_sell_orders(adapter):
+    """SELL orders WITHOUT the OPEN_SHORT entry intent — i.e. the legacy
+    LONG-close dispatches only (entry order dicts keep their metadata)."""
+    return [o for o in sell_orders(adapter)
+            if str(o.get("intent") or "") != "OPEN_SHORT"]
+
+
 def close_buy_orders(adapter):
     return [o for o in buy_orders(adapter)
             if str(o.get("intent") or "") == "CLOSE_SHORT"]
@@ -249,13 +256,16 @@ def close_buy_orders(adapter):
 # close can appear on either side of the accounting.
 # ══════════════════════════════════════════════════════════════════════
 class RecordingPaperAdapter:
-    def __init__(self, paper, scripted_buy=None):
+    def __init__(self, paper, scripted_buy=None, scripted_sell=None):
         self._paper = paper
         self._scripted_buy = list(scripted_buy or [])
+        self._scripted_sell = list(scripted_sell or [])
         self.buy_calls = []       # (qty, kwargs) per CLOSE_SHORT attempt
         self.sell_calls = []      # (qty, kwargs) per OPEN_SHORT attempt
         self.orders = paper.orders
         self.snapshot_calls = 0
+        # save_state_strict fault-injection helper state (#9/#10)
+        self._orig_strict_save = None
 
     def find_account(self):
         return self._paper.find_account()
@@ -300,7 +310,43 @@ class RecordingPaperAdapter:
             # never scripted: exact pre-G-9C.2 delegation.
             return self._paper.sell_cny(account_id, qty)
         self.sell_calls.append((int(qty), dict(kwargs)))
-        return self._paper.sell_cny(account_id, qty, **kwargs)
+        if not self._scripted_sell:
+            return self._paper.sell_cny(account_id, qty, **kwargs)
+        res = self._scripted_sell.pop(0)
+        if isinstance(res, BaseException):
+            raise res
+        if res is None:
+            # adapter returned NOTHING — outcome unknown, broker untouched
+            return res
+        from src.c5_runtime import (_classify_exit_execution,
+                                   EXIT_FILL_FULL, EXIT_FILL_PARTIAL)
+        status, filled = _classify_exit_execution(res, int(qty))
+        if status in (EXIT_FILL_FULL, EXIT_FILL_PARTIAL):
+            # Mirror ONLY the confirmed volume through the REAL broker
+            # accounting (legacy LONG-close path: ГО release, no P&L).
+            self._paper.sell_cny(account_id, filled)
+        return res
+
+    def marker_saves_fail(self, state):
+        """save_state_strict replacement for fault injection (#9/#10).
+
+        The G-9C.1 entry path (src/c5_runtime._evaluate_entry) persists
+        its OPEN_SHORT marker with a PLAIN ``save_state_strict(state)``
+        call and relies on run_cycle()'s end-of-cycle save to flush the
+        ledger fields it mutates in the same dict — so the injected
+        failure must NOT drop those legitimate writes.  A strict save is
+        refused ONLY when it would persist an unfinished BUY-side EXIT
+        marker (side == "BUY") while the SHORT ledger is still missing
+        or stale (the entry-finalize write carries c5_position_qty ==
+        -2 alongside the already-cleared marker; later writes that keep
+        a stale ledger have no marker at all).  Every other save goes
+        through to the real durable writer.
+        """
+        m = state.get("exit_pending_sell_intent")
+        if isinstance(m, dict) and m.get("side") == "BUY" \
+                and int(state.get("c5_position_qty") or 0) >= -1:
+            raise IOError("simulated disk failure")
+        return self._orig_strict_save(state)
 
     def sell_one_tmon(self, account_id):
         return self._paper.sell_one_tmon(account_id)
@@ -318,19 +364,43 @@ class RecordingPaperAdapter:
         return self._paper.get_tmon_price(account_id)
 
 
-def make_recording_runtime(market, broker, scripted_buy=None):
+def make_recording_runtime(market, broker, scripted_buy=None,
+                           scripted_sell=None):
     import src.c5_runtime as rt_mod
     from src.execution_adapter import PaperExecutionAdapter
     from src.runtime_config import TradingConfig
 
     adapter = RecordingPaperAdapter(PaperExecutionAdapter(broker),
-                                    scripted_buy)
+                                    scripted_buy, scripted_sell)
     rt = rt_mod.C5Runtime("fake-token", adapter=adapter,
                           margin_tracker=FakeMarginTracker(),
                           config=TradingConfig("PAPER", True),
                           now_fn=lambda: market.holder["now"])
     rt.instrument = FakeInstrument()
     return rt, adapter
+
+
+class fail_marker_saves:
+    """Context manager installing ``adapter.marker_saves_fail`` as the
+    runtime's durable strict writer (patched in src.c5_runtime — where
+    save_state_strict is imported to; patching state_store internals
+    would never be seen by the runtime)."""
+
+    def __init__(self, adapter):
+        self.adapter = adapter
+
+    def __enter__(self):
+        import src.c5_runtime as rt_mod
+        self._rt_mod = rt_mod
+        self._saved = rt_mod.save_state_strict
+        self.adapter._orig_strict_save = self._saved
+        rt_mod.save_state_strict = self.adapter.marker_saves_fail
+        return self
+
+    def __exit__(self, *exc):
+        self._rt_mod.save_state_strict = self._saved
+        self.adapter._orig_strict_save = None
+        return False
 
 
 def exec_res(ok, reason="PAPER_FILLED", qty_executed=None, order_id="ord-1",
@@ -344,9 +414,34 @@ def exec_res(ok, reason="PAPER_FILLED", qty_executed=None, order_id="ord-1",
     return ExecutionResult(ok, reason, order_id=order_id, **kw)
 
 
+def _exit_candle(day, hour, minute, price):
+    """Exit-check bar: identical close to the signal candle but with a
+    non-zero volume — the production path (daily_bars_from_df → VWAP)
+    refuses zero-volume bars for the entry basis, while the EXIT check
+    consumes only the close price."""
+    c = candle_5m(day, hour, minute, price)
+    c["volume"] = 100
+    return c
+
+
 SHORT_CANDLE = lambda: candle_5m(CONTROL_DAY, 16, 0, SHORT_BREAK)
 EXIT_PRICE = 1360.0          # close BELOW the 1399.95 entry → profitable short
 LOSS_PRICE = 1450.0          # close ABOVE entry → losing short
+EXIT_CANDLE = lambda: _exit_candle(CONTROL_DAY, 16, 30, EXIT_PRICE)
+LOSS_EXIT_CANDLE = lambda: _exit_candle(CONTROL_DAY, 16, 30, LOSS_PRICE)
+
+
+def advance(market, *extra_candles, hour=17, minute=0, exit_mode="profit"):
+    """Move the market clock to a fresh EXIT-check bar.
+
+    Installs the requested exit-channel history (see ``daily_df`` /
+    ``use_exit_history``) so the real C5 EXIT signal can fire for the
+    test candles; the ENTRY fixture stays untouched because this runs
+    strictly AFTER the entry cycle of every test using it.
+    """
+    use_exit_history(market, exit_mode)
+    set_candles(market, SHORT_CANDLE(), *extra_candles)
+    market.holder["now"] = utc_ms(CONTROL_DAY, hour, minute)
 
 
 def open_short(market, broker, state_env):
@@ -366,17 +461,11 @@ def open_short(market, broker, state_env):
     return rt, adapter
 
 
-def advance(market, *extra_candles, hour=17, minute=0, exit_mode="profit"):
-    """Move the market clock to a fresh EXIT-check bar.
+def utc_iso(day, hour, minute):
+    return utc_ms(day, hour, minute).isoformat()
 
-    Installs the requested exit-channel history (see ``daily_df`` /
-    ``use_exit_history``) so the real C5 EXIT signal can fire for the
-    test candles; the ENTRY fixture stays untouched because this runs
-    strictly AFTER the entry cycle of every test using it.
-    """
-    use_exit_history(market, exit_mode)
-    set_candles(market, SHORT_CANDLE(), *extra_candles)
-    market.holder["now"] = utc_ms(CONTROL_DAY, hour, minute)
+
+# ══════════════════════════════════════════════════════════════════════
 
 
 # ── unit: close-short order constants & classifier reuse ──────────────
@@ -416,7 +505,7 @@ def test_g9c2_marker_identity_and_helpers_unit():
 def test_exit_short_dispatches_buy_close_short(state_env, market):
     broker = new_broker()
     rt, adapter = open_short(market, broker, state_env)
-    advance(market, candle_5m(CONTROL_DAY, 16, 30, EXIT_PRICE))
+    advance(market, EXIT_CANDLE())
 
     d = rt.run_cycle()
 
@@ -432,7 +521,9 @@ def test_exit_short_dispatches_buy_close_short(state_env, market):
     assert "margin_per_contract" not in kwargs   # close ≠ new reservation
     co = close_buy_orders(adapter)
     assert len(co) == 1 and co[0]["qty"] == 2
-    assert all(o.get("intent") != "OPEN_SHORT" for o in sell_orders(adapter))
+    # the EXIT dispatch produced NO closing SELL at all — the only SELL
+    # order on record is the OPEN_SHORT entry itself (legacy shape kept)
+    assert exit_sell_orders(adapter) == []
     st = read_state(state_env)
     assert st["c5_position_qty"] == 0
     assert st["c5_position_direction"] is None
@@ -455,7 +546,7 @@ def test_exit_long_still_dispatches_plain_sell(state_env, market):
 
     assert d.action == "EXIT" and d.reason == "EXIT_LONG"
     # plain legacy SELL: two-argument call, no extra metadata at all
-    lo = sell_orders(adapter)
+    lo = exit_sell_orders(adapter)
     assert len(lo) == 1
     assert lo[0]["qty"] == 2
     assert "intent" not in lo[0]
@@ -477,7 +568,7 @@ def test_full_short_close_flat_margin_release_and_profit(state_env, market):
     cash_after_open = broker.cash
     go_locked = broker.short_margin_locked_per_contract  # 78 912/contract
 
-    advance(market, candle_5m(CONTROL_DAY, 16, 30, EXIT_PRICE))
+    advance(market, EXIT_CANDLE())
     d = rt.run_cycle()
     assert d.reason == "EXIT_SHORT"
 
@@ -513,7 +604,7 @@ def test_partial_short_close_books_only_confirmed_volume(state_env, market):
     cash_after_open = broker.cash
     go_pc = broker.short_margin_locked_per_contract
 
-    advance(market, candle_5m(CONTROL_DAY, 16, 30, EXIT_PRICE))
+    advance(market, EXIT_CANDLE())
     # re-arm the runtime with a scripted PARTIAL BUY (1 of 2 confirmed)
     rt2, adapter2 = make_recording_runtime(
         market, broker, scripted_buy=[exec_res(True, qty_executed=1)])
@@ -545,8 +636,7 @@ def test_losing_short_close_realizes_negative_pnl(state_env, market):
     cash_after_open = broker.cash
     go_total = 2 * broker.short_margin_locked_per_contract
 
-    advance(market, candle_5m(CONTROL_DAY, 16, 30, LOSS_PRICE),
-            exit_mode="loss")
+    advance(market, LOSS_EXIT_CANDLE(), exit_mode="loss")
     d = rt.run_cycle()
 
     assert d.reason == "EXIT_SHORT"
@@ -590,7 +680,7 @@ def test_runtime_never_sends_buy_above_position_size(state_env, market):
     st["c5_position_qty"] = -5
     (state_env / "state.json").write_text(json.dumps(st))
 
-    advance(market, candle_5m(CONTROL_DAY, 16, 30, EXIT_PRICE))
+    advance(market, EXIT_CANDLE())
     d = rt.run_cycle()
 
     # qty comes from the ABSOLUTE CONFIRMED broker size, never more
@@ -682,7 +772,7 @@ def test_unproven_close_never_fakes_a_flat(state_env, market, outcome):
         "rejected": exec_res(False, "ORDER_NOT_FILLED", details={
             "status": "EXECUTION_REPORT_STATUS_REJECTED"}, qty_executed=0),
     }[outcome]
-    advance(market, candle_5m(CONTROL_DAY, 16, 30, EXIT_PRICE))
+    advance(market, EXIT_CANDLE())
     rt2, ad2 = make_recording_runtime(market, broker, scripted_buy=[scripted])
 
     d = rt2.run_cycle()
@@ -694,11 +784,15 @@ def test_unproven_close_never_fakes_a_flat(state_env, market, outcome):
         # UNBURNED and the durable marker is cleared because the order
         # provably never executed.
         assert d.action == "EXIT"
-        assert d.reason.startswith("ORDER_NOT_FILLED")
+        # production G-4/G-7 contract (test_stage5b regression): the
+        # decision carries the signal reason; the adapter failure lands
+        # in state["exit_failure_reason"], candle stays unburned
+        assert d.reason == "EXIT_SHORT"
         st = read_state(state_env)
+        assert st["exit_failure_reason"].startswith("ORDER_NOT_FILLED")
         assert not st.get("exit_pending_sell_intent")
         assert st["last_processed_5m_ts"] != \
-            candle_5m(CONTROL_DAY, 16, 30, EXIT_PRICE)["time"].isoformat()
+            utc_iso(CONTROL_DAY, 16, 30)
     else:
         assert d.reason == "EXIT_UNVERIFIED_PENDING_RECONCILE"
     # the short NEVER falsely closed: broker + ledger both intact
@@ -719,7 +813,7 @@ def test_pre_save_failure_blocks_close_dispatch(state_env, market):
     import src.c5_runtime as rt_mod
     broker = new_broker()
     rt, adapter = open_short(market, broker, state_env)
-    advance(market, candle_5m(CONTROL_DAY, 16, 30, EXIT_PRICE))
+    advance(market, EXIT_CANDLE())
 
     # Fault injected EXACTLY at the pre-dispatch durable-save boundary:
     # c5_runtime imports save_state_strict into its own namespace, so
@@ -749,7 +843,7 @@ def test_pre_save_failure_blocks_close_dispatch(state_env, market):
     assert not st.get("exit_pending_sell_intent")
     # candle NOT burned → healthy disk retries the atom next cycle
     assert st.get("last_processed_5m_ts") != \
-        candle_5m(CONTROL_DAY, 16, 30, EXIT_PRICE)["time"].isoformat()
+        utc_iso(CONTROL_DAY, 16, 30)
 
     d2 = rt.run_cycle()
     assert d2.action == "EXIT" and d2.reason == "EXIT_SHORT"
@@ -763,7 +857,7 @@ def test_pre_save_failure_blocks_close_dispatch(state_env, market):
 def test_ambiguous_close_leaves_durable_exit_marker(state_env, market):
     broker = new_broker()
     open_short(market, broker, state_env)
-    advance(market, candle_5m(CONTROL_DAY, 16, 30, EXIT_PRICE))
+    advance(market, EXIT_CANDLE())
     rt2, ad2 = make_recording_runtime(
         market, broker,
         scripted_buy=[RuntimeError("crashed before confirmation")])
@@ -786,7 +880,7 @@ def test_ambiguous_close_leaves_durable_exit_marker(state_env, market):
     assert marker["instrument"] == "CNYRUBF"
     assert marker["qty"] == 2
     assert marker["candle_ts"] == \
-        candle_5m(CONTROL_DAY, 16, 30, EXIT_PRICE)["time"].isoformat()
+        utc_iso(CONTROL_DAY, 16, 30)
     assert "created_at" in marker and "account_id_masked" in marker
     # fate unknown ⇒ position never touched
     assert broker.position_qty == -2
@@ -800,7 +894,7 @@ def test_final_save_failure_keeps_marker_after_restart(state_env, market):
     import src.c5_runtime as rt_mod
     broker = new_broker()
     open_short(market, broker, state_env)
-    advance(market, candle_5m(CONTROL_DAY, 16, 30, EXIT_PRICE))
+    advance(market, EXIT_CANDLE())
 
     # Fault injected at the runtime's durable-save boundary itself
     # (c5_runtime imports save_state_strict into its own namespace).
@@ -848,7 +942,7 @@ def test_restart_blocks_repeat_buy_until_operator_resolution(state_env,
                                                             market):
     broker = new_broker()
     open_short(market, broker, state_env)
-    advance(market, candle_5m(CONTROL_DAY, 16, 30, EXIT_PRICE))
+    advance(market, EXIT_CANDLE())
     rt2, ad2 = make_recording_runtime(
         market, broker,
         scripted_buy=[RuntimeError("crashed before confirmation")])
@@ -884,7 +978,7 @@ def test_restart_blocks_repeat_buy_until_operator_resolution(state_env,
 def test_reconcile_alone_never_clears_buy_exit_marker(state_env, market):
     broker = new_broker()
     open_short(market, broker, state_env)
-    advance(market, candle_5m(CONTROL_DAY, 16, 30, EXIT_PRICE))
+    advance(market, EXIT_CANDLE())
     rt2, ad2 = make_recording_runtime(
         market, broker,
         scripted_buy=[RuntimeError("crashed before confirmation")])
@@ -1009,7 +1103,7 @@ def test_full_short_cycle_enter_partial_exit_final_exit_reconcile(
     cash_after_open = broker.cash
 
     # ── partial exit: 1 of 2 confirmed ────────────────────────────────
-    advance(market, candle_5m(CONTROL_DAY, 16, 30, EXIT_PRICE))
+    advance(market, EXIT_CANDLE())
     rt2, ad2 = make_recording_runtime(
         market, broker, scripted_buy=[exec_res(True, qty_executed=1)])
     d2 = rt2.run_cycle()
@@ -1020,8 +1114,8 @@ def test_full_short_cycle_enter_partial_exit_final_exit_reconcile(
     assert st2["c5_position_direction"] == "SHORT"
 
     # ── final exit on a NEW candle: remaining 1 closes ───────────────
-    advance(market, candle_5m(CONTROL_DAY, 16, 30, EXIT_PRICE),
-            candle_5m(CONTROL_DAY, 17, 0, EXIT_PRICE), hour=17, minute=5)
+    advance(market, EXIT_CANDLE(), _exit_candle(CONTROL_DAY, 17, 0, EXIT_PRICE),
+            hour=17, minute=5)
     rt3, ad3 = make_recording_runtime(market, broker)
     d3 = rt3.run_cycle()
     assert d3.action == "EXIT" and d3.reason == "EXIT_SHORT"

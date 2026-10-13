@@ -22,7 +22,7 @@ import os
 from dataclasses import dataclass, field
 from typing import Optional
 
-from config.settings import C5_CLASS_CODE, C5_TARGET_TICKER
+from config.settings import C5_CLASS_CODE, C5_CONTRACT_SIZE_CNY, C5_TARGET_TICKER
 from src.client_factory import get_client
 from src.market_data import quotation_to_float
 
