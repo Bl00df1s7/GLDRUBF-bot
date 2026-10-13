@@ -178,9 +178,13 @@ class RecordingPaperAdapter:
     exception / None → the broker state is NOT touched at all, so no
     phantom position can appear on either side."""
 
-    def __init__(self, paper, scripted_sell=None):
+    def __init__(self, paper, scripted_sell=None, default_sell_raises=None):
         self._paper = paper
         self._scripted = list(scripted_sell or [])
+        # Optional exception raised on any UNSCRIPTED OPEN_SHORT dispatch
+        # (fault injection: simulate a send that never reaches the real
+        # broker — durable marker must survive, position must not change).
+        self._default_sell_raises = default_sell_raises
         self.sell_calls = []      # (qty, kwargs) per opening-sell attempt
         self.orders = paper.orders
         self.snapshot_calls = 0
@@ -204,7 +208,12 @@ class RecordingPaperAdapter:
             return self._paper.sell_cny(account_id, qty)
         self.sell_calls.append((int(qty), dict(kwargs)))
         if not self._scripted:
-            raise AssertionError("unexpected extra OPEN_SHORT sell attempt")
+            # Default (unscripted) OPEN_SHORT dispatch: the REAL broker
+            # executes it exactly as production PaperExecutionAdapter
+            # would — full fill of the requested qty with ГО reserved.
+            # Tests inject scripted_sell=[...] to force partial/zero/
+            # ambiguous outcomes instead.
+            return self._paper.sell_cny(account_id, qty, **kwargs)
         res = self._scripted.pop(0)
         if isinstance(res, BaseException):
             raise res

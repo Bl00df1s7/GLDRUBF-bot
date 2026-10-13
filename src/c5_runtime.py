@@ -1544,6 +1544,12 @@ def _classify_entry_execution(result, qty):
     """
     if type(qty) is not int or qty <= 0:
         return ENTRY_FILL_UNVERIFIED, 0
+    # G-9C: a None (or otherwise result-less) adapter response proves
+    # NOTHING — it must never be treated as a failure-with-reason nor as
+    # a fill.  Classify it UNVERIFIED so the caller keeps the durable
+    # marker and blocks until explicit resolution.
+    if result is None:
+        return ENTRY_FILL_UNVERIFIED, 0
     if not getattr(result, "ok", False):
         return ENTRY_FILL_FAILED, 0
     raw = getattr(result, "qty_executed", None)
