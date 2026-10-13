@@ -1088,9 +1088,18 @@ class ScriptedSellAdapter:
     """
 
     def __init__(self, paper_adapter, sell_results, state_env=None,
-                 runtime=None):
+                 runtime=None, marker_owner=False):
         self._paper = paper_adapter
         self._sell_results = list(sell_results)
+        # G-7: when True, this fake represents the broker side of the SAME
+        # process that created the durable SELL-intent marker (the restart
+        # helpers build the new runtime first and attach the fake to it
+        # afterwards).  The legitimate first dispatch is then proven by
+        # the per-process in-flight flag + live in-memory marker of the
+        # CURRENTLY running runtime (registry fallback below), exactly as
+        # in the production flow.  A blind re-send after a crash/failed
+        # final save NEVER sets the in-process flag, so it still raises.
+        self._marker_owner = marker_owner
         # NOTE: state_env is intentionally NOT used any more.  The
         # production state_store persists the G-5 freeze flag via
         # C5_STATE_DEFAULTS ("exit_unverified_until_reconcile"), so the
@@ -1110,6 +1119,10 @@ class ScriptedSellAdapter:
         self._rt = runtime
         self.sell_calls = []
         self.orders = []
+        # G-7: observable from the very first moment (the pre-guard may
+        # block a cycle BEFORE bootstrap, so snapshot() is never called
+        # and the attribute must still exist for assertions).
+        self.snapshot_calls = []
 
     def find_account(self):
         return self._paper.find_account()
@@ -1167,9 +1180,26 @@ class ScriptedSellAdapter:
                         getattr(rt, "_last_state", {}).get(
                             "exit_pending_sell_intent")
                         if rt is not None else None)
-                    marker_matches = (isinstance(live_marker, dict)
-                                      and live_marker == pending)
-                    if not (in_flight or marker_matches):
+                    # Content match alone is NOT proof of legitimacy:
+                    # the dispatch must also correspond to THIS cycle's
+                    # real data — same candle_ts as the marker, still-
+                    # unresolved intent status and the quantity actually
+                    # being sent.  candle_ts comes from the runtime's own
+                    # per-cycle ledger view (_last_state survives the
+                    # strict pre-dispatch save; load_state() below reads
+                    # exactly what is durable on disk).
+                    marker_candle_is_latest = bool(
+                        rt is not None
+                        and st.get("last_processed_5m_ts") !=
+                        pending.get("candle_ts"))
+                    dispatch_consistent = bool(
+                        in_flight
+                        and isinstance(live_marker, dict)
+                        and live_marker == pending
+                        and live_marker.get("status") == "SELL_IN_FLIGHT"
+                        and int(live_marker.get("qty") or -1) == int(qty)
+                        and marker_candle_is_latest)
+                    if not dispatch_consistent:
                         raise AssertionError(
                             "blind SELL re-send while a durable unfinished "
                             "SELL-intent marker is on disk (G-7 fail-closed "

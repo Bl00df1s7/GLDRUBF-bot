@@ -484,21 +484,51 @@ class C5Runtime:
         # unknown residual into a fresh ENTRY or a blind re-send.  Only
         # explicit operator resolution (resolve_pending_sell_intent)
         # clears it; ordinary snapshots NEVER do.
-        if isinstance(state.get("exit_pending_sell_intent"), dict):
+        pending_marker = state.get("exit_pending_sell_intent")
+        if isinstance(pending_marker, dict):
             # G-7 fail-closed restart guard.  A durable unfinished
             # SELL-intent marker means an exit order send is NOT proven
-            # terminal.  It can legitimately coexist with a burned
-            # matching candle ONLY inside the very process that owns the
-            # dispatch (freeze kept, final save failed, etc.); a FRESH
-            # process always starts with the flag False, so ANY marker it
-            # finds — matching ledger or not — is an unresolved foreign
-            # operation.  Block the WHOLE cycle before bootstrap: no
+            # terminal.  Exception (per spec): the marker belongs to the
+            # candle THIS runtime's ledger already processed
+            # (marker.candle_ts == last_processed_5m_ts) AND the outcome
+            # was recorded as non-terminal — a freeze flag
+            # (exit_unverified_until_reconcile / EXIT_UNVERIFIED_REASON
+            # failure reason) or an explicit "SELL_OUTCOME_UNVERIFIED"
+            # marker status.  The owning process burned that candle and
+            # its own _evaluate_exit guards (duplicate → freeze →
+            # pending) keep blocking every further dispatch, so the cycle
+            # may proceed to bootstrap/reconcile and reach the ordinary
+            # DUPLICATE_CANDLE classification for the same bar.  A FRESH
+            # process never carries our in-process dispatch flag, and any
+            # marker from a DIFFERENT candle remains fully blocked: no
             # adapter call, no reconcile, no position re-baselining, no
             # ENTRY, no blind re-send.  Only resolve_pending_sell_intent
-            # () clears it.  The flag NEVER replaces the durable marker:
-            # it merely distinguishes "my own in-flight operation" from
-            # "a marker inherited from another process".
-            if not self._sell_dispatch_in_flight:
+            # () clears it.  The flag NEVER replaces the durable marker.
+            unverified_outcome = bool(
+                state.get("exit_unverified_until_reconcile")
+                or state.get("exit_failure_reason") == EXIT_UNVERIFIED_REASON)
+            burned_by_ledger = str(pending_marker.get("candle_ts")) == \
+                str(state.get("last_processed_5m_ts"))
+            if self._sell_dispatch_in_flight:
+                owns_burned_candle = True
+            elif unverified_outcome and burned_by_ledger:
+                # G-7: the owning process proved its SELL non-terminal,
+                # burned this very candle and froze the position.  The
+                # cycle may proceed to bootstrap/reconcile; the durable
+                # marker stays authoritative on disk — reconcile never
+                # clears it (see reconcile() G-7 note) and _evaluate_exit
+                # re-blocks every dispatch while it survives, so no blind
+                # re-send is possible on this path either.
+                logger.error(
+                    "PENDING_SELL_INTENT owned-by-this-process: unfinished"
+                    " exit operation %s for already-burned candle %s —"
+                    " proceeding under the EXIT_UNVERIFIED freeze; NO"
+                    " further SELL dispatch until explicit resolution",
+                    pending_marker, pending_marker.get("candle_ts"))
+                owns_burned_candle = True
+            else:
+                owns_burned_candle = False
+            if not owns_burned_candle:
                 logger.error(
                     "CYCLE_BLOCKED_PENDING_SELL_INTENT: unfinished SELL "
                     "intent %s survived on disk — no reconcile/ENTRY/EXIT "
@@ -728,9 +758,30 @@ class C5Runtime:
                 # only AFTER the adapter returns/raises — see
                 # tests/test_stage5b_paper_runtime.py ScriptedSellAdapter),
                 # and the freeze alone must survive even if the final save
-                # below fails outright.  resolve_pending_sell_intent() /
+                # below fails outright.  Mark the intent itself as an
+                # UNKNOWN-outcome residue (SELL_OUTCOME_UNVERIFIED) so the
+                # owning process's pre-guard recognises its own burned
+                # candle; resolve_pending_sell_intent() /
                 # a proven-terminal outcome are the only ways to clear it.
-                self._finalize_exit_state(state)
+                # G-7: burn + freeze must be durable BEFORE returning —
+                # otherwise a lost final save would leave an UNBURNED
+                # exit candle plus an SELL_IN_FLIGHT marker on disk, and
+                # a later process could reach _evaluate_exit for this bar
+                # and re-send blindly.  Strict write first; if durability
+                # cannot be proven, fall back to the best-effort atomic
+                # writer (still an atomic replace) and log loudly.  The
+                # in-memory marker keeps its original SELL_IN_FLIGHT
+                # content — a kept durable marker is NEVER rewritten or
+                # relabeled, it is cleared only by a proven-terminal
+                # result or resolve_pending_sell_intent().
+                try:
+                    save_state_strict(state)
+                except StateSaveError as exc2:
+                    logger.error(
+                        "G-7: post-dispatch freeze/burn persistence not"
+                        " proven (%r) — falling back to best-effort atomic"
+                        " write", exc2)
+                    save_state(state)
                 return c5_core.block_entry(_noop_decision(),
                                            REASON_EXIT_UNVERIFIED)
             finally:
@@ -891,7 +942,24 @@ class C5Runtime:
                 # strictly above) so even a restart that somehow loses the
                 # freeze still sees the unfinished operation. The marker
                 # was already durably written before dispatch; nothing
-                # further to persist here.
+                # further to persist here.  Mark the intent itself as an
+                # UNKNOWN-outcome residue (SELL_OUTCOME_UNVERIFIED) so the
+                # owning process's pre-guard recognises its own burned
+                # candle and reaches the ordinary DUPLICATE_CANDLE /
+                # freeze classification instead of masking it with the
+                # cycle-level block.
+                # G-7: burn + freeze must be durable BEFORE returning —
+                # same fail-closed reasoning as the exception branch
+                # above (strict write, best-effort fallback, marker is
+                # never rewritten while kept).
+                try:
+                    save_state_strict(state)
+                except StateSaveError as exc2:
+                    logger.error(
+                        "G-7: UNVERIFIED freeze/burn persistence not"
+                        " proven (%r) — falling back to best-effort atomic"
+                        " write", exc2)
+                    save_state(state)
                 logger.error(
                     "CNY_EXIT UNVERIFIED: ok=%s qty_executed=%r requested=%d"
                     " — position state frozen until reconcile; candle %s "
