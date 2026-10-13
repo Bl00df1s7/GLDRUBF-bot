@@ -928,10 +928,15 @@ def test_ambiguous_close_leaves_durable_exit_marker(state_env, market):
     assert marker["side"] == "BUY"
     assert marker["direction"] == "SHORT"
     assert marker["intent"] == "CLOSE_SHORT"
-    # G-9C.2: a fresh process seeing this durable marker on disk is
-    # blocked at the cycle level (run_cycle pre-guard) BEFORE any
-    # relabeling — the on-disk status stays the pre-dispatch label.
-    assert marker["status"] == "BUY_IN_FLIGHT"
+    # LAYER split (G-9C.2): the DURABLE-MARKER layer records the
+    # UNKNOWN-fate residue status written by the owning process right
+    # after the unproven dispatch — the shared restart-guard status
+    # SELL_OUTCOME_UNVERIFIED (never the pre-dispatch BUY_IN_FLIGHT
+    # label; no separate BUY_OUTCOME_UNVERIFIED class exists because the
+    # run_cycle restart guard keys on this one common status).  The
+    # freeze FLAG lives in another layer (state below); the signal
+    # reason (EXIT_SHORT) in a third.
+    assert marker["status"] == "SELL_OUTCOME_UNVERIFIED"
     assert marker["instrument"] == "CNYRUBF"
     assert marker["qty"] == 2
     assert marker["candle_ts"] == \
@@ -947,6 +952,7 @@ def test_final_save_failure_keeps_marker_after_restart(state_env, market):
     pre-dispatch durable marker (already on disk) survives, and a
     restarted process must not re-send the BUY."""
     import src.c5_runtime as rt_mod
+    import src.state_store as ss_mod
     broker = new_broker()
     open_short(market, broker, state_env)
     advance(market, EXIT_CANDLE())
@@ -962,10 +968,39 @@ def test_final_save_failure_keeps_marker_after_restart(state_env, market):
     def fail_after_marker(state):
         calls["n"] += 1
         if calls["n"] >= 2:      # marker pre-save OK, ALL later strict saves fail
-            raise IOError("disk died after marker")
+            # G-9C.2: raise the runtime's OWN durable-write contract
+            # (StateSaveError), exactly like production disk failures do
+            # — a raw IOError would bypass the except-StateSaveError
+            # fallback code this test is meant to exercise.
+            raise rt_mod.StateSaveError("disk died after marker")
         return original(state)
 
+    # The UNVERIFIED finalize path catches StateSaveError and falls back
+    # to the BEST-EFFORT writer; when THAT write also fails it only
+    # prints a warning and returns — so both durable boundaries must be
+    # failed for the "final save failure" scenario to be real.  The
+    # runtime imported BOTH writers into its own namespace (from-import),
+    # hence the patches are applied there too.  The best-effort fault is
+    # keyed on the UNKNOWN-fate marker status, which is present ONLY in
+    # the guarded fallback context inside _evaluate_exit; run_cycle()'s
+    # ordinary end-of-cycle flush re-saves the same dict AFTER
+    # _evaluate_exit has popped the marker (confirmed-terminal branch)
+    # or without touching it — that legitimate flush must still reach
+    # the real writer, exactly as production's swallow-and-warn contract
+    # expects.
+    original_best_effort = rt_mod.save_state
+    best_calls = {"n": 0}
+
+    def fail_best_effort(state):
+        best_calls["n"] += 1
+        m = state.get("exit_pending_sell_intent")
+        if isinstance(m, dict) and \
+                m.get("status") == "SELL_OUTCOME_UNVERIFIED":
+            raise IOError("disk fully dead after marker")
+        return original_best_effort(state)
+
     rt_mod.save_state_strict = fail_after_marker
+    rt_mod.save_state = fail_best_effort
     try:
         rt2, ad2 = make_recording_runtime(
             market, broker,
@@ -973,13 +1008,24 @@ def test_final_save_failure_keeps_marker_after_restart(state_env, market):
         d = rt2.run_cycle()
     finally:
         rt_mod.save_state_strict = original
+        rt_mod.save_state = original_best_effort
 
+    assert calls["n"] >= 2                       # marker saved, later saves hit
+    assert best_calls["n"] >= 1                  # the fallback was actually tried
     assert d.reason == "EXIT_UNVERIFIED_PENDING_RECONCILE"
     st = read_state(state_env)
     marker = st.get("exit_pending_sell_intent")
     assert isinstance(marker, dict)
     assert marker["side"] == "BUY" and marker["operation"] == "EXIT"
-    assert marker["status"] == "BUY_IN_FLIGHT"    # pre-dispatch label kept
+    # LAYER split: the durable marker keeps its UNKNOWN-fate residue
+    # status (relabeled strictly BEFORE dispatch returned); what the
+    # failed final saves could not durably prove is the FREEZE FLAG and
+    # the burned-candle ledger — separate layers, separately asserted.
+    assert marker["status"] == "SELL_OUTCOME_UNVERIFIED"
+    assert st.get("exit_unverified_until_reconcile") != \
+        "EXIT_UNVERIFIED_PENDING_RECONCILE"      # freeze NOT on disk
+    assert st.get("last_processed_5m_ts") != \
+        utc_iso(CONTROL_DAY, 16, 30)             # candle NOT durably burned
     assert broker.position_qty == -2              # UNVERIFIED never closed
 
     # restart: fresh process sees the unfinished BUY-EXIT → full block
