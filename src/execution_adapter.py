@@ -291,20 +291,31 @@ class PaperExecutionAdapter(BaseExecutionAdapter):
         return float(getattr(self.broker, "tmon_price", 1000.0))
 
     def _apply(self, instrument: str, side: str, qty: int,
-               price_ref: float, **extra) -> ExecutionResult:
+               price_ref: float, fill_qty=None, **extra) -> ExecutionResult:
+        # ``fill_qty`` (G-9C) lets tests/fakes simulate a PARTIAL fill of
+        # an order SENT with ``qty`` contracts: the broker applies the
+        # whole dispatched order (its position/margin accounting mirrors
+        # what the exchange does for that order), while the execution
+        # report carries ONLY the confirmed executed volume.  Default:
+        # full fill — identical to the pre-G-9C behaviour.
+        if fill_qty is None:
+            fill_qty = qty
+        fill_qty = int(fill_qty)
         order = {"instrument": instrument, "side": side, "qty": int(qty),
                  **extra}
         self.orders.append(order)
         self.broker.apply(order)
-        logger.info("PAPER_FILL %s %s x%d", instrument, side, qty)
+        logger.info("PAPER_FILL %s %s x%d (executed %d)",
+                    instrument, side, qty, fill_qty)
         return ExecutionResult(True, "PAPER_FILLED",
                                order_id=f"paper-{len(self.orders)}",
-                               qty_executed=int(qty))
+                               qty_executed=fill_qty)
 
     def buy_cny(self, account_id: str, qty: int,
                 margin_per_contract: Optional[float] = None,
                 entry_price: Optional[float] = None,
-                intent: Optional[str] = None) -> ExecutionResult:
+                intent: Optional[str] = None,
+                fill_qty=None) -> ExecutionResult:
         # ГО per contract (already computed by the runtime from the live
         # FutureBy rate — see c5_runtime._evaluate_entry) is forwarded to
         # SimulatedBroker as PAPER margin reservation metadata.  Passing
@@ -313,6 +324,7 @@ class PaperExecutionAdapter(BaseExecutionAdapter):
         # ``intent`` (G-9C) is an OPTIONAL order-metadata tag only — old
         # callers that omit it keep working unchanged.
         return self._apply(C5_TARGET_TICKER, "BUY", qty, 0.0,
+                           fill_qty=fill_qty,
                            margin_per_contract=margin_per_contract,
                            entry_price=entry_price,
                            **({"intent": intent} if intent else {}))
@@ -320,7 +332,8 @@ class PaperExecutionAdapter(BaseExecutionAdapter):
     def sell_cny(self, account_id: str, qty: int,
                  margin_per_contract: Optional[float] = None,
                  entry_price: Optional[float] = None,
-                 intent: Optional[str] = None) -> ExecutionResult:
+                 intent: Optional[str] = None,
+                 fill_qty=None) -> ExecutionResult:
         # Legacy EXIT path (closing a LONG) keeps the exact two-argument
         # call signature — no extra metadata, identical order dict shape.
         # G-9C: opening a SHORT is ALSO a SELL of CNYRUBF contracts; the
@@ -335,7 +348,8 @@ class PaperExecutionAdapter(BaseExecutionAdapter):
             extra["margin_per_contract"] = margin_per_contract
         if entry_price is not None:
             extra["entry_price"] = entry_price
-        return self._apply(C5_TARGET_TICKER, "SELL", qty, 0.0, **extra)
+        return self._apply(C5_TARGET_TICKER, "SELL", qty, 0.0,
+                           fill_qty=fill_qty, **extra)
 
     def sell_one_tmon(self, account_id: str) -> ExecutionResult:
         return self._apply(TMON_TICKER_PREFIX, "SELL", 1,
@@ -377,6 +391,9 @@ class SimulatedBroker:
         # ГО per contract blocked by the current long (set at BUY time
         # from the runtime-computed live margin; 0.0 = unknown basis).
         self.margin_locked_per_contract = 0.0
+        # G-9C: symmetric field for the short side — ГО per contract
+        # blocked by an OPEN_SHORT sell (0.0 = no short basis known).
+        self.short_margin_locked_per_contract = 0.0
 
     def snapshot(self, account_id: str) -> AccountSnapshot:
         return AccountSnapshot(
