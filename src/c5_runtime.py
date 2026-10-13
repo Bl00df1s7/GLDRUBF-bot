@@ -1310,8 +1310,30 @@ class C5Runtime:
             # point is burned exactly like the pre-G-9C behaviour (a
             # market-order re-send on the same bar could duplicate an
             # accepted-but-unreported order); NO position is created.
+            # G-9C belt: a proven rejection must also RESOLVE the durable
+            # OPEN_SHORT intent — leaving it in flight would block every
+            # later entry under the false assumption that a SELL may have
+            # reached the broker, while the rejected outcome IS proven.
             state["last_c5_entry_control_timestamp"] = ts
             logger.error("CNY_ENTRY FAILED: %s", result.reason)
+            if entry_intent is not None:
+                state.pop("exit_pending_sell_intent", None)
+                try:
+                    save_state_strict(state)
+                except StateSaveError as exc:
+                    logger.error(
+                        "G-9C: FAILED-entry marker resolution not proven"
+                        " (%r) — one strict retry", exc)
+                    try:
+                        save_state_strict(state)
+                    except StateSaveError as exc2:
+                        logger.critical(
+                            "G-9C: FAILED-entry marker persistence NOT"
+                            " PROVEN (%r); falling back to best-effort"
+                            " atomic write; the marker stays authoritative"
+                            " and keeps blocking until explicit"
+                            " resolution", exc2)
+                        save_state(state)
             return c5_core.block_entry(decision,
                                        f"EXECUTION_FAILED:{result.reason}")
 

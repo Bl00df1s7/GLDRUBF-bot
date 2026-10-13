@@ -332,7 +332,10 @@ def test_short_entry_dispatches_sell_with_open_short_intent(state_env,
     # ГО per contract from c5_core: short rate × signal price × contract
     # size = 0.0576 × 1370 × 1000 (rate×price×size — NOT the guard price)
     assert kwargs["margin_per_contract"] == pytest.approx(78_912.0)
-    assert kwargs["entry_price"] == pytest.approx(1400.05)           # guard ask estimate
+    # execution_guard walks the side WE TRADE AGAINST: for SHORT it sells
+    # into BIDS → expected price is the bid-side VWAP 1399.95, NOT the ask
+    # (src/execution_guard.py: `book = asks if direction == "LONG" else bids`).
+    assert kwargs["entry_price"] == pytest.approx(1399.95)
     # NO BUY was ever attempted for a short entry
     assert buy_orders(adapter) == []
     st = read_state(state_env)
@@ -383,11 +386,16 @@ def test_confirmed_short_open_negative_position_and_margin_reservation(
     d = rt.run_cycle()
 
     assert d.action == "ENTER_SHORT"
-    # broker truth: NEGATIVE position, ГО reserved, basis recorded
+    # broker truth: NEGATIVE position, ГО reserved, basis recorded.
+    # The reservation basis is decision.margin_per_contract computed by
+    # c5_core from the SIGNAL price (1370 × 1000 × 0.0576 = 78 912), NOT
+    # from the guard VWAP — same formula as the forwarded order metadata.
     assert broker.position_qty == -2
-    assert broker.short_margin_locked_per_contract == pytest.approx(79_870.0)
-    assert broker.cash == pytest.approx(1_000_000 - 2 * 79_870.0)
-    assert broker.entry_price == pytest.approx(1400.05)
+    assert broker.short_margin_locked_per_contract == pytest.approx(78_912.0)
+    assert broker.cash == pytest.approx(1_000_000 - 2 * 78_912.0)
+    # entry basis forwarded by the runtime = guard expected price on the
+    # side we trade against (bids for a SELL) → 1399.95
+    assert broker.entry_price == pytest.approx(1399.95)
     # runtime truth agrees with the broker snapshot (no divergence)
     st = read_state(state_env)
     assert st["c5_position_qty"] == -2
@@ -396,7 +404,7 @@ def test_confirmed_short_open_negative_position_and_margin_reservation(
     so = sell_orders(paper)
     assert len(so) == 1
     assert so[0]["intent"] == "OPEN_SHORT"
-    assert so[0]["margin_per_contract"] == pytest.approx(79_870.0)
+    assert so[0]["margin_per_contract"] == pytest.approx(78_912.0)
 
 
 def test_short_open_without_margin_metadata_fails_closed():
@@ -474,9 +482,11 @@ def test_unproven_short_fill_creates_no_position(state_env, market,
         # ok=False is a proven rejection: EXECUTION_FAILED reason
         assert d.reason.startswith("EXECUTION_FAILED")
     elif outcome == "none":
-        # getattr(None, "ok", False) → nothing confirmed executed; the
-        # runtime classifies it FAILED and must NOT invent a position.
-        assert d.reason.startswith("EXECUTION_FAILED")
+        # G-9C contract: a None adapter response proves NEITHER execution
+        # NOR non-execution — _classify_entry_execution() maps it to
+        # UNVERIFIED (not FAILED), so no position is invented and the
+        # durable ENTRY marker stays until explicit resolution.
+        assert d.reason == "ENTRY_UNVERIFIED_PENDING_RECONCILE"
     else:
         assert d.reason == "ENTRY_UNVERIFIED_PENDING_RECONCILE"
 
@@ -736,12 +746,28 @@ def test_short_entry_over_existing_long_blocked_by_runtime(state_env,
                                                            market):
     """End-to-end: ENTER_SHORT can never flip an open LONG — the runtime
     routes a live position to the EXIT branch and the broker refuses any
-    reversal; zero SELL reaches the broker as an OPEN_SHORT."""
+    reversal WHILE THE LONG IS STILL OPEN; zero SELL reaches the broker
+    as an OPEN_SHORT."""
     set_candles(market, candle_5m(CONTROL_DAY, 16, 0, LONG_BREAK))
     broker = new_broker()
     rt, adapter = make_recording_runtime(market, broker)
     assert rt.run_cycle().action == "ENTER_LONG"
     assert broker.position_qty == 2
+    cash_with_long = broker.cash
+    go_locked = broker.margin_locked_per_contract
+
+    # WHILE THE LONG IS STILL OPEN: a direct OPEN_SHORT order must be
+    # refused by the broker fail-closed — position, cash and ГО
+    # reservation all stay byte-identical (no accidental reversal).
+    from src.execution_adapter import SimulatedBrokerError
+    with pytest.raises(SimulatedBrokerError):
+        broker.apply({"instrument": "CNYRUBF", "side": "SELL", "qty": 2,
+                      "margin_per_contract": 79_000.0,
+                      "entry_price": 1370.0, "intent": "OPEN_SHORT"})
+    assert broker.position_qty == 2             # LONG intact, not flipped
+    assert broker.cash == cash_with_long        # nothing reserved/released
+    assert broker.margin_locked_per_contract == go_locked
+    assert broker.short_margin_locked_per_contract == 0.0
 
     # new closed 5m bar whose close breaks BELOW Lower(10); the frozen
     # core evaluates this as an EXIT of the LONG (never a reversal), and
@@ -755,10 +781,3 @@ def test_short_entry_over_existing_long_blocked_by_runtime(state_env,
     assert broker.position_qty == 0
     # no OPEN_SHORT-tagged order was EVER dispatched while long
     assert all(o.get("intent") != "OPEN_SHORT" for o in adapter.orders)
-    # and the broker itself would refuse a direct reversal attempt
-    from src.execution_adapter import SimulatedBrokerError
-    with pytest.raises(SimulatedBrokerError):
-        broker.apply({"instrument": "CNYRUBF", "side": "SELL", "qty": 2,
-                      "margin_per_contract": 79_000.0,
-                      "entry_price": 1370.0, "intent": "OPEN_SHORT"})
-    assert broker.position_qty == 0             # refusal changed nothing
