@@ -1062,6 +1062,22 @@ def test_g1_entry_still_fail_closed_when_margin_api_unavailable(state_env, marke
 # (ExecutionResult semantics identical to LiveExecutionAdapter
 # ._post_market_order); production LIVE order mechanics are untouched.
 # ══════════════════════════════════════════════════════════════════════
+# Registry of the currently-live scripted runtimes.  Appended by
+# open_long_via_production; replaced by restart scenarios before the
+# guarded cycle runs.  Serves as the ScriptedSellAdapter fallback for the
+# G-7 boundary check so every exit path in the suite is guarded without
+# touching ~20 constructor call sites.
+_LIVE_RUNTIMES = []
+
+
+@pytest.fixture(autouse=True)
+def _reset_live_runtimes():
+    # keep the G-7 boundary-check registry scoped to one test
+    _LIVE_RUNTIMES.clear()
+    yield
+    _LIVE_RUNTIMES.clear()
+
+
 class ScriptedSellAdapter:
     """Boundary fake implementing the BaseExecutionAdapter contract.
 
@@ -1083,7 +1099,14 @@ class ScriptedSellAdapter:
         # production persistence without fake assistance).
         self._state_env = state_env
         # live C5Runtime whose per-cycle state dict is identity-checked
-        # in sell_cny (G-7 boundary invariant, see there)
+        # in sell_cny (G-7 boundary invariant, see there).  When the
+        # test does not pass runtime= explicitly, fall back to the
+        # single live runtime installed by the shared helper
+        # open_long_via_production (every exit scenario starts from it;
+        # restart scenarios replace this registry entry with the new
+        # runtime instance BEFORE running the guarded cycle).
+        if runtime is None:
+            runtime = _LIVE_RUNTIMES[-1] if _LIVE_RUNTIMES else None
         self._rt = runtime
         self.sell_calls = []
         self.orders = []
@@ -1132,12 +1155,17 @@ class ScriptedSellAdapter:
                 # object identity proves this call IS the same operation
                 # that persisted the marker — not a blind re-send after a
                 # restart (a restarted process builds an equal-but-new
-                # dict whose identity cannot match).
+                # dict whose identity cannot match).  When the test did
+                # not wire a live runtime (_rt is None) there can be no
+                # legitimate in-flight dispatch at all, so ANY sell with
+                # a marker on disk is treated as a violation.
                 pending = st.get("exit_pending_sell_intent")
                 if isinstance(pending, dict):
-                    live_marker = getattr(
-                        getattr(self, "_rt", None), "_last_state", {}
-                    ).get("exit_pending_sell_intent")
+                    rt = getattr(self, "_rt", None)
+                    live_marker = (
+                        getattr(rt, "_last_state", {}).get(
+                            "exit_pending_sell_intent")
+                        if rt is not None else None)
                     if live_marker is not pending:
                         raise AssertionError(
                             "blind SELL re-send while a durable unfinished "
@@ -1235,6 +1263,9 @@ def make_scripted_runtime(market, broker, sell_results):
                           config=TradingConfig("PAPER", True),
                           now_fn=lambda: market.holder["now"])
     rt.instrument = FakeInstrument()
+    # G-7 boundary-check fallback: this is the single live scripted
+    # runtime for the scenario built by the shared helpers.
+    _LIVE_RUNTIMES.append(rt)
     return rt, adapter
 
 
@@ -1533,7 +1564,7 @@ def _g5_exit_setup(state_env, market, sell_results_fn=None):
     rt, adapter, broker, qty = open_long_via_production(state_env, market)
     sell_results = sell_results_fn(qty) if sell_results_fn else []
     scripted = ScriptedSellAdapter(adapter._paper, sell_results,
-                                   state_env=state_env)
+                                   state_env=state_env, runtime=rt)
     rt.adapter = scripted
     # A2 fix: ADD the EXIT candle to the existing rows instead of
     # replacing them.  The entry candle C16 (16:00) stays in place —
@@ -1887,8 +1918,11 @@ def test_g5_external_confirmation_clears_freeze(state_env, market):
     # broker showing qty==0 — reconcile keeps the freeze (fail closed).
     broker.position_qty = 0
     rt2, adapter2 = make_runtime(market, broker)
-    scripted2 = ScriptedSellAdapter(adapter2, [], state_env=state_env)
+    scripted2 = ScriptedSellAdapter(adapter2, [], state_env=state_env,
+                                    runtime=rt2)
     rt2.adapter = scripted2
+    if _LIVE_RUNTIMES:
+        _LIVE_RUNTIMES[-1] = rt2
     CNEUTRAL = candle_5m(CONTROL_DAY, 17, 0, NEUTRAL)
     set_candles(market, CNEUTRAL)
     market.holder["now"] = utc_ms(CONTROL_DAY, 17, 5)
@@ -1913,8 +1947,11 @@ def test_g5_external_confirmation_clears_freeze(state_env, market):
     st["broker_position_confirmed"] = 0
     st_path.write_text(json.dumps(st))
     rt3, adapter3 = make_runtime(market, broker)
-    scripted3 = ScriptedSellAdapter(adapter3, [], state_env=state_env)
+    scripted3 = ScriptedSellAdapter(adapter3, [], state_env=state_env,
+                                    runtime=rt3)
     rt3.adapter = scripted3
+    if _LIVE_RUNTIMES:
+        _LIVE_RUNTIMES[-1] = rt3
     CNEUTRAL2 = candle_5m(CONTROL_DAY, 17, 10, NEUTRAL)
     set_candles(market, CNEUTRAL2)                  # no fresh break signal
     market.holder["now"] = utc_ms(CONTROL_DAY, 17, 15)
@@ -1943,8 +1980,11 @@ def test_g5_unverified_freeze_survives_process_restart(state_env, market):
     # Brand-new runtime instance over the SAME state file = restart.
     # Guarded empty script: ANY sell attempt raises immediately.
     rt2, adapter2 = make_runtime(market, broker)
-    scripted2 = ScriptedSellAdapter(adapter2, [], state_env=state_env)
+    scripted2 = ScriptedSellAdapter(adapter2, [], state_env=state_env,
+                                    runtime=rt2)
     rt2.adapter = scripted2
+    if _LIVE_RUNTIMES:
+        _LIVE_RUNTIMES[-1] = rt2
     CEXIT2 = candle_5m(CONTROL_DAY, 17, 0, SHORT_BREAK)
     set_candles(market, CEXIT2)                     # valid EXIT signal again
     market.holder["now"] = utc_ms(CONTROL_DAY, 17, 5)
@@ -2048,6 +2088,7 @@ class _SellRaisingAdapter:
 def _g6_exit_setup_with_raiser(state_env, market):
     rt, scripted, broker, qty, CEXIT = _g5_exit_setup(state_env, market)
     raising = _SellRaisingAdapter(scripted._paper)
+    raising._rt = rt          # G-7 boundary-check wiring (see fake)
     rt.adapter = raising
     return rt, raising, broker, qty, CEXIT
 
@@ -2113,8 +2154,11 @@ def test_g6_restart_after_exception_blocks_resend(state_env, market):
     # Brand-new runtime over the SAME state file = process restart.
     # Guarded empty script: ANY sell attempt raises AssertionError.
     rt2, adapter2 = make_runtime(market, broker)
-    scripted2 = ScriptedSellAdapter(adapter2, [], state_env=state_env)
+    scripted2 = ScriptedSellAdapter(adapter2, [], state_env=state_env,
+                                    runtime=rt2)
     rt2.adapter = scripted2
+    if _LIVE_RUNTIMES:
+        _LIVE_RUNTIMES[-1] = rt2
     CEXIT2 = candle_5m(CONTROL_DAY, 17, 0, SHORT_BREAK)
     set_candles(market, CEXIT2)              # свежий валидный EXIT-сигнал
     market.holder["now"] = utc_ms(CONTROL_DAY, 17, 5)
@@ -2317,8 +2361,11 @@ def test_g7_sell_exception_with_final_save_failure_no_resend_after_restart(
 
     # Restart: brand-new runtime over the same state file + guarded fake.
     rt2, adapter2 = make_runtime(market, broker)
-    scripted2 = ScriptedSellAdapter(adapter2, [], state_env=state_env)
+    scripted2 = ScriptedSellAdapter(adapter2, [], state_env=state_env,
+                                    runtime=rt2)
     rt2.adapter = scripted2
+    if _LIVE_RUNTIMES:
+        _LIVE_RUNTIMES[-1] = rt2
     CEXIT2 = candle_5m(CONTROL_DAY, 17, 0, SHORT_BREAK)
     set_candles(market, CEXIT2)
     market.holder["now"] = utc_ms(CONTROL_DAY, 17, 5)
@@ -2380,8 +2427,11 @@ def test_g7_confirmed_full_with_final_save_failure_keeps_marker(state_env,
     # stay untouched on disk until an explicit operator resolution
     # (resolve_pending_sell_intent) clears exactly this operation.
     rt2, adapter2 = make_runtime(market, broker)
-    scripted2 = ScriptedSellAdapter(adapter2, [], state_env=state_env)
+    scripted2 = ScriptedSellAdapter(adapter2, [], state_env=state_env,
+                                    runtime=rt2)
     rt2.adapter = scripted2
+    if _LIVE_RUNTIMES:
+        _LIVE_RUNTIMES[-1] = rt2
     CEXIT2 = candle_5m(CONTROL_DAY, 17, 0, SHORT_BREAK)
     market.holder["rows"].append(CEXIT2)
     market.holder["now"] = utc_ms(CONTROL_DAY, 17, 5)
@@ -2513,8 +2563,11 @@ def test_g7_unverified_result_persists_marker_and_freeze(state_env, market):
 
     # restart → both guards block any re-send
     rt2, adapter2 = make_runtime(market, broker)
-    scripted2 = ScriptedSellAdapter(adapter2, [], state_env=state_env)
+    scripted2 = ScriptedSellAdapter(adapter2, [], state_env=state_env,
+                                    runtime=rt2)
     rt2.adapter = scripted2
+    if _LIVE_RUNTIMES:
+        _LIVE_RUNTIMES[-1] = rt2
     CEXIT2 = candle_5m(CONTROL_DAY, 17, 0, SHORT_BREAK)
     set_candles(market, CEXIT2)
     market.holder["now"] = utc_ms(CONTROL_DAY, 17, 5)
