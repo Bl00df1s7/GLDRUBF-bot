@@ -287,11 +287,14 @@ def test_safety_2_no_bid_or_ask_blocks_entry(state_env, market):
 def test_safety_3_invalid_quote_blocks_entry(state_env, market):
     set_candles(market, ENTRY_CANDLE())
     # ask below bid (crossed/stale quote) → INVALID_QUOTE in the guard.
-    # The pair is placed symmetrically around the mid so the expected
-    # slippage vs. mid stays ≈0.35% and the guard reason is exactly
-    # "EXECUTION_GUARD_INVALID_QUOTE" (a wide crossed pair would also
-    # trip SLIPPAGE and the runtime maps that to "SLIPPAGE_GUARD").
-    market.holder["book"] = ([(1405.0, 100)], [(1400.0, 100)])
+    # The crossed pair is a hair-wide (bid 1400.001 > ask 1400.0): still
+    # provably crossed (ask < bid ⇒ INVALID_QUOTE), but |vwap − mid| /
+    # mid ≈ 0.000036% stays FAR below C5_MAX_EXPECTED_SLIPPAGE (0.10%),
+    # so the guard fails ONLY on INVALID_QUOTE.  A wide crossed pair
+    # (e.g. 1405/1400 ⇒ 0.178%) would ALSO trip the independent
+    # SLIPPAGE check, which the runtime maps to "SLIPPAGE_GUARD" first
+    # — that would test two guards at once instead of this one.
+    market.holder["book"] = ([(1400.001, 100)], [(1400.0, 100)])
 
     rt, adapter = make_runtime(market, new_broker())
     decision = rt.run_cycle()

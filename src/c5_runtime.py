@@ -937,6 +937,45 @@ class C5Runtime:
                 # It never survives into a later cycle and NEVER replaces
                 # the durable marker on disk.
                 self._sell_dispatch_in_flight = False
+            # G-9C.2: a None return from the adapter proves NEITHER an
+            # execution NOR a confirmed rejection — it is the same
+            # UNKNOWN-fate class as the post-dispatch exception above.
+            # Handle it explicitly BEFORE any attribute access (result.ok
+            # / result.reason would raise AttributeError on None).  The
+            # position is NOT reduced, the durable marker is kept and
+            # relabeled SELL_OUTCOME_UNVERIFIED, the candle is burned so
+            # no blind re-send can duplicate a possibly-live order, and
+            # the EXIT_UNVERIFIED freeze blocks every further position
+            # operation until explicit reconciliation.  None is NEVER
+            # laundered into a fabricated ExecutionResult(ok=False): the
+            # classification below comes straight from the None itself.
+            if result is None:
+                logger.error(
+                    "CNY_EXIT: adapter returned None after dispatch —"
+                    " outcome unknown; position untouched, candle %s"
+                    " burned, EXIT_UNVERIFIED freeze set until explicit"
+                    " reconciliation", ts)
+                state["exit_failure_reason"] = EXIT_UNVERIFIED_REASON
+                state["exit_unverified_until_reconcile"] = \
+                    EXIT_UNVERIFIED_REASON
+                state["last_processed_5m_ts"] = ts
+                # Keep the pre-dispatch marker on disk (it was persisted
+                # strictly before dispatch); relabel it to the
+                # UNKNOWN-outcome residue exactly like the UNVERIFIED /
+                # exception paths so the owning process's pre-guard
+                # recognises its own burned candle while a restarted
+                # process stays fully blocked.
+                self._mark_sell_outcome_unverified(state)
+                try:
+                    save_state_strict(state)
+                except StateSaveError as exc2:
+                    logger.error(
+                        "G-9C.2: None-outcome freeze/burn persistence not"
+                        " proven (%r) — falling back to best-effort atomic"
+                        " write", exc2)
+                    save_state(state)
+                return c5_core.block_entry(_noop_decision(),
+                                           REASON_EXIT_UNVERIFIED)
             status, filled = _classify_exit_execution(result, qty)
             if not result.ok:
                 # G-4 path unchanged: ok=False carries no trustworthy
