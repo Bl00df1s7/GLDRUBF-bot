@@ -1,5 +1,4 @@
---extra-index-url https://github.com/Invest-SDK/invest-python/raw/refs/heads/master/t_tech_investments-1.51.0-py3-none-any.whl
-t-tech-investments
+https://github.com/Invest-SDK/invest-python/raw/refs/heads/master/t_tech_investments-1.51.0-py3-none-any.whl
 pandas
 numpy
 requests
