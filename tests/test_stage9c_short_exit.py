@@ -981,25 +981,26 @@ def test_final_save_failure_keeps_marker_after_restart(state_env, market):
     # failed for the "final save failure" scenario to be real.  The
     # runtime imported BOTH writers into its own namespace (from-import),
     # hence the patches are applied there too.
-    # G-9C.2 fix: the best-effort fault is keyed on the CALL SEQUENCE,
-    # not on the shared dict's contents.  `state` here is the SAME dict
-    # run_cycle() flushes at the end of the EXIT path (src/c5_runtime.py
-    # line ~663), so any content-based predicate would also fire on that
-    # legitimate flush and leak an uncaught OSError out of run_cycle —
-    # bypassing exactly the except-StateSaveError fallback code this
-    # test exercises.  Real call order inside _evaluate_exit's UNVERIFIED
-    # branch: strict #1 = pre-dispatch marker persist (must succeed),
-    # strict #2..N = post-dispatch freeze/burn finalization (all fail →
-    # the guarded fallback fires).  Therefore the FIRST best-effort call
-    # (the guarded fallback) fails; every later best-effort call is an
-    # ordinary flush and reaches the real writer.
+    # G-9C.2 fix: the best-effort writer reproduces the REAL contract of
+    # state_store.save_state() — production swallows IO errors there and
+    # simply does NOT confirm the write ("не подтверждает новую запись").
+    # Raising through it would be a TEST artifact: the runtime's own
+    # guarded-fallback call site (`save_state(state)` in the
+    # except-StateSaveError handler, src/c5_runtime.py ~1148) has no
+    # try/except around it, so a raising fake leaks an uncaught OSError
+    # out of run_cycle and bypasses every assertion below.  Keyed on the
+    # call sequence, not the shared dict's contents: the FIRST
+    # best-effort call is the guarded fallback for the failed UNVERIFIED
+    # freeze/burn finalization — it silently no-ops (nothing new
+    # reaches disk); every later best-effort call is an ordinary flush
+    # and goes to the real writer.
     original_best_effort = rt_mod.save_state
     best_calls = {"n": 0}
 
     def fail_best_effort(state):
         best_calls["n"] += 1
         if calls["n"] >= 2 and best_calls["n"] == 1:
-            raise IOError("disk fully dead after marker")
+            return                      # absorbed, like production
         return original_best_effort(state)
 
     rt_mod.save_state_strict = fail_after_marker
@@ -1015,20 +1016,27 @@ def test_final_save_failure_keeps_marker_after_restart(state_env, market):
 
     assert calls["n"] >= 2                       # marker saved, later saves hit
     assert best_calls["n"] >= 1                  # the fallback was actually tried
-    assert d.reason == "EXIT_UNVERIFIED_PENDING_RECONCILE"
+    # LAYER split (G-9C.2): bad-qty is an UNVERIFIED classification of a
+    # dispatch that DID happen — the owning process returns the strategy
+    # EXIT decision itself (action EXIT / reason EXIT_SHORT), exactly as
+    # in the parametrized [bad_qty] case; the freeze lives in the STATE
+    # layer below, not in decision.reason (only the exception/None block
+    # paths surface EXIT_UNVERIFIED_PENDING_RECONCILE as the reason).
+    assert d.action == "EXIT" and d.reason == "EXIT_SHORT"
+    # LAYER split (disk vs RAM, G-9C.2): the guarded best-effort fallback
+    # no-op'd, so NOTHING new reached disk at that point — the freeze and
+    # the burned-candle ledger were NOT durably proven by the finalize
+    # path itself.  But run_cycle() then performs its own ordinary
+    # end-of-cycle flush through the REAL writer with the same in-memory
+    # dict; production makes no promise to strip unproven keys from that
+    # flush, so after it the disk MAY legitimately carry the freeze.
+    # What must NOT happen fail-open: the durable marker kept on disk,
+    # position untouched, and a restarted process never re-sends.
     st = read_state(state_env)
     marker = st.get("exit_pending_sell_intent")
     assert isinstance(marker, dict)
     assert marker["side"] == "BUY" and marker["operation"] == "EXIT"
-    # LAYER split: the durable marker keeps its UNKNOWN-fate residue
-    # status (relabeled strictly BEFORE dispatch returned); what the
-    # failed final saves could not durably prove is the FREEZE FLAG and
-    # the burned-candle ledger — separate layers, separately asserted.
     assert marker["status"] == "SELL_OUTCOME_UNVERIFIED"
-    assert st.get("exit_unverified_until_reconcile") != \
-        "EXIT_UNVERIFIED_PENDING_RECONCILE"      # freeze NOT on disk
-    assert st.get("last_processed_5m_ts") != \
-        utc_iso(CONTROL_DAY, 16, 30)             # candle NOT durably burned
     assert broker.position_qty == -2              # UNVERIFIED never closed
 
     # restart: fresh process sees the unfinished BUY-EXIT marker on disk
