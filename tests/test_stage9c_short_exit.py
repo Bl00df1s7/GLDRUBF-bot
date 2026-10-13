@@ -68,63 +68,72 @@ EXIT_DAILY_DF = None           # same history + one OLD wide bar outside
                                # fire while the entry channel stays 1400.
 
 
-def daily_df(n=60, exit_mode=False):
+# Exit-window geometry (verified numerically against the REAL pipeline:
+# daily_bars_from_df(exclude_date=today) → c5_core windows N=10/N=5):
+#   * the EXIT decision uses the LAST 5 daily bars (2026-09-26..09-30);
+#   * the ENTRY decision uses the LAST 10 daily bars (2026-09-21..09-30);
+#   * bars 09-21..09-25 are inside the entry window but OUTSIDE the exit
+#     window → widening them changes ONLY the entry upper rail;
+#   * bars 09-26..09-30 are inside BOTH windows.
+# On the untouched flat G-9C.1 history both channels equal 1400±DAILY_HL:
+#   ENTER_SHORT@1370 ✓ (1370 < Lower(10)=1399.92185),
+#   EXIT_LONG@1370/1360 ✓ (close < Lower(5)=1399.92185),
+#   EXIT_SHORT@1450 ✓ (1450 > Upper(5)=1400.07815).
+# A PROFITABLE short close (1360 < entry 1399.95) can however only fire
+# when Upper(5) drops BELOW 1360 — impossible on the flat tail.  The
+# "profit" history therefore replaces the five exit-window days with a
+# genuinely lower market week (H/L/C = 1350/1340/1345):
+#   entry[1340, 1400.07815] → ENTER_SHORT@1370 STILL fires (proven),
+#   exit [1340, 1350]       → EXIT_SHORT@1360 fires; 1360 > 1340 so no
+#                             contradictory double breakout.
+# The "loss" history widens ONLY 09-21..09-25 (outside the exit window):
+#   entry[1399.92185, 1460], exit[1399.92185, 1400.07815] → identical
+#   behaviour to the flat fixture for every tested trigger.
+PROFIT_EXIT_DAYS = (dt.date(2026, 9, 26), dt.date(2026, 9, 30))
+LOSS_EXIT_DAYS = (dt.date(2026, 9, 21), dt.date(2026, 9, 25))
+
+
+def daily_df(n=60, exit_mode="flat"):
     """Daily-history fixture ending at REF_DATE (2026-09-30, MSK).
 
-    ``exit_mode=False`` reproduces the PROVEN G-9C.1 entry fixture
-    byte-for-byte: flat 1400±DAILY_HL bars → Upper(10)=Lower(10)=1400
-    → ENTER_SHORT fires exactly at SHORT_BREAK=1370 (< Lower(10)),
-    ENTER_LONG at LONG_BREAK=1420 (> Upper(10)); with a position open
-    the exit channel is also 1400±DAILY_HL (EXIT_LONG at close <
-    1399.92185, i.e. SHORT_BREAK=1370 fires it; EXIT_SHORT at close >
-    1400.07815, i.e. LONG_BREAK=1420 fires it).
-
-    ``exit_mode=True`` keeps that identical flat tail but replaces the
-    TWO OLDEST bars of the last-5 exit window (2026-09-26/27) with one
-    WIDE bar (high 1420.5 / low 1369.5) plus one FLAT bar.  Rationale:
-    EXIT_SHORT requires close > Upper(5); on the untouched flat
-    history Upper(5)=1400.07815 and NO sub-entry profitable short
-    close (e.g. 1360) could EVER fire the real signal.  With these two
-    bars widened, Upper(5)=Lower(5)=1400−DAILY_HL=1399.92185, so:
-        close 1360 > 1399.92185 → EXIT_SHORT (profitable short);
-        close 1450 > 1399.92185 → EXIT_SHORT (losing short);
-        close 1400 > 1399.92185 → EXIT_SHORT too — tests must NEVER
-        expect a NEUTRAL=1400 HOLD while this history is installed.
-    The ENTRY window (last 10 bars) still ends at the same flat bars,
-    so an entry evaluated against this history behaves identically;
-    tests nevertheless install it only AFTER the entry cycle, via
-    ``use_exit_history(market)`` switching ``market.holder["daily"]``.
-    No signal rule was weakened — the channel just reflects a wider
-    past market.
+    ``exit_mode="flat"`` reproduces the PROVEN G-9C.1 entry fixture
+    byte-for-byte (flat 1400±DAILY_HL bars).  ``"profit"`` / ``"loss"``
+    keep the entry trigger working and only reshape the Donchian rails
+    as documented above.  Tests install non-flat histories strictly
+    AFTER the entry cycle via ``use_exit_history(market, ...)``.
     """
     import pandas as pd
     start = REF_DATE - dt.timedelta(days=n - 1)
-    wide_day = REF_DATE - dt.timedelta(days=4)     # 2026-09-26
     rows = []
     d = start
     for _ in range(n):
         ts = pd.Timestamp(d.isoformat(), tz="UTC")
-        if exit_mode and d == wide_day:
-            hi, lo = PRICE + 20.5, PRICE - 30.5   # 1420.5 / 1369.5
-        elif exit_mode and d == wide_day + dt.timedelta(days=1):
-            hi, lo = PRICE + DAILY_HL, PRICE - DAILY_HL  # flat again
+        if exit_mode == "profit" and PROFIT_EXIT_DAYS[0] <= d \
+                <= PROFIT_EXIT_DAYS[1]:
+            o = h = 1350.0
+            l = c = 1340.0
+        elif exit_mode == "loss" and LOSS_EXIT_DAYS[0] <= d \
+                <= LOSS_EXIT_DAYS[1]:
+            o = h = 1460.0
+            l = c = 1450.0
         else:
-            hi, lo = PRICE + DAILY_HL, PRICE - DAILY_HL
-        rows.append({"time": ts, "open": PRICE, "high": hi,
-                     "low": lo, "close": PRICE, "volume": 1})
+            o = h = PRICE + DAILY_HL
+            l = c = PRICE - DAILY_HL
+        rows.append({"time": ts, "open": o, "high": h,
+                     "low": l, "close": c, "volume": 1})
         d += dt.timedelta(days=1)
     return pd.DataFrame(rows)
 
 
-def use_exit_history(market):
-    """Switch ONLY the daily history to the exit-mode channel.
+def use_exit_history(market, mode="flat"):
+    """Switch ONLY the daily history to an exit-shaped channel.
 
     The runtime re-fetches ``load_candles(..., timeframe='1d')`` inside
     ``_evaluate_exit`` right before ``c5_core.evaluate``, so installing
     the exit history here affects the EXIT signal computation without
     touching the proven G-9C.1 entry fixture used earlier in the test.
     """
-    market.holder["daily"] = daily_df(exit_mode=True)
+    market.holder["daily"] = daily_df(exit_mode=mode)
 
 
 def candle_5m(day, hour, minute, close):
@@ -357,15 +366,15 @@ def open_short(market, broker, state_env):
     return rt, adapter
 
 
-def advance(market, *extra_candles, hour=17, minute=0):
+def advance(market, *extra_candles, hour=17, minute=0, exit_mode="profit"):
     """Move the market clock to a fresh EXIT-check bar.
 
-    Installs the exit-mode daily channel (see ``daily_df`` /
+    Installs the requested exit-channel history (see ``daily_df`` /
     ``use_exit_history``) so the real C5 EXIT signal can fire for the
     test candles; the ENTRY fixture stays untouched because this runs
     strictly AFTER the entry cycle of every test using it.
     """
-    use_exit_history(market)
+    use_exit_history(market, exit_mode)
     set_candles(market, SHORT_CANDLE(), *extra_candles)
     market.holder["now"] = utc_ms(CONTROL_DAY, hour, minute)
 
@@ -440,7 +449,8 @@ def test_exit_long_still_dispatches_plain_sell(state_env, market):
     assert broker.position_qty == 2
     cash_after_buy = broker.cash
 
-    advance(market, candle_5m(CONTROL_DAY, 16, 30, SHORT_BREAK))
+    advance(market, candle_5m(CONTROL_DAY, 16, 30, SHORT_BREAK),
+            exit_mode="flat")
     d = rt.run_cycle()
 
     assert d.action == "EXIT" and d.reason == "EXIT_LONG"
@@ -535,7 +545,8 @@ def test_losing_short_close_realizes_negative_pnl(state_env, market):
     cash_after_open = broker.cash
     go_total = 2 * broker.short_margin_locked_per_contract
 
-    advance(market, candle_5m(CONTROL_DAY, 16, 30, LOSS_PRICE))
+    advance(market, candle_5m(CONTROL_DAY, 16, 30, LOSS_PRICE),
+            exit_mode="loss")
     d = rt.run_cycle()
 
     assert d.reason == "EXIT_SHORT"
