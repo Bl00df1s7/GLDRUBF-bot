@@ -61,31 +61,52 @@ PRICE = 1400.0
 DAILY_HL = 0.07815
 
 
-def daily_df(n=60, exit_bar=True):
+# ── split entry/exit histories (see module docstring of daily_df) ─────
+ENTRY_DAILY_DF = None          # built lazily — proven G-9C.1 flat history
+EXIT_DAILY_DF = None           # same history + one OLD wide bar outside
+                               # BOTH Donchian windows → exit-only candles
+                               # fire while the entry channel stays 1400.
+
+
+def daily_df(n=60, wide_old_bar=False):
     """Flat 1400±DAILY_HL history ending at REF_DATE (2026-09-30, MSK).
 
-    ``exit_bar=True`` appends one WIDE bar dated STRICTLY INSIDE the
-    entry Donchian window (2026-09-21: high 1420.5 / low 1369.5).  This
-    bar is required for the EXIT side of the fixture math:
-    ``daily_bars_from_df`` always drops the current session date, so on
-    the control day (2026-10-02) the newest daily bars are still the
-    September ones.  Without a wide bar Upper(5)=Lower(5)=1400±DAILY_HL
-    and NO exit candle could ever fire (EXIT_SHORT needs close >
-    Upper(5), EXIT_LONG — close < Lower(5)).  With it:
-    Upper(5)=1420.5, Lower(5)=1369.5 → SHORT exits at close > 1369.5
-    (EXIT_PRICE=1360 and LOSS_PRICE=1450 fire; NEUTRAL 1400 stays
-    HOLD), LONG exits at close < 1420.5 (LONG_BREAK=1420 fires).
+    ``wide_old_bar=False`` reproduces the PROVEN G-9C.1 entry fixture
+    byte-for-byte: Upper(10)=Lower(10)=1400 → ENTER_SHORT fires exactly
+    at SHORT_BREAK=1370 (< Lower(10)), ENTER_LONG at LONG_BREAK=1420.
 
-    The bar's DATE (2026-09-21) is deliberately inside the ENTRY window
-    (the last 10 daily bars) so BOTH entry channels widen symmetrically:
-    Upper(10)=1420.5, Lower(10)=1369.5 → ENTER_LONG fires at 1420
-    (close > 1420.5 is false… see below) — actually the comparisons are
-    strict: LONG entry needs close > Upper(10); with Upper(10)=1420.5 a
-    1420 candle would NOT enter.  To keep the proven G-9C.1 entry math
-    byte-identical (Upper(10)=Lower(10)=1400), the wide bar is placed
-    OUTSIDE the entry window instead — see ``_EXIT_BAR_DATE``.
+    ``wide_old_bar=True`` appends ONE WIDE daily bar (high 1420.5 / low
+    1369.5) dated 20 days before REF_DATE (2026-09-10) — strictly
+    OUTSIDE both the last-10 entry window and the last-5 exit window.
+    It exists ONLY to make the profitable short-close candle (close
+    1360) fire REASON_EXIT_SHORT through the REAL C5 signal path:
+    EXIT_SHORT requires close > Upper(5); with the untouched flat
+    history Upper(5)=1400+DAILY_HL and no sub-entry exit could ever
+    trigger.  The wide bar lowers Upper(5)/Lower(5) to 1400−DAILY_HL
+    (the two newest bars stay flat), so:
+        close 1360 > 1399.92 → EXIT_SHORT (profitable short);
+        close 1450 > 1399.92 → EXIT_SHORT (losing short);
+        close 1400 ≤ 1399.92 is false… 1400 > 1399.92 also fires — the
+        tests therefore never rely on a 1400 HOLD while this history is
+        installed; NEUTRAL holds are asserted against ENTRY_DAILY_DF.
+    Entry signals are unaffected because the ENTRY window (last 10
+    bars) never sees the wide bar — no test weakens the real signal.
     """
-    raise NotImplementedError  # replaced below — kept out of the module
+    import pandas as pd
+    rows = []
+    d = REF_DATE - dt.timedelta(days=n - 1)
+    wide_ts = pd.Timestamp((REF_DATE - dt.timedelta(days=20)).isoformat(),
+                           tz="UTC")
+    for _ in range(n):
+        ts = pd.Timestamp(d.isoformat(), tz="UTC")
+        if wide_old_bar and ts == wide_ts:
+            hi, lo = PRICE + 20.5, PRICE - 30.5   # 1420.5 / 1369.5
+        else:
+            hi, lo = PRICE + DAILY_HL, PRICE - DAILY_HL
+        rows.append({"time": ts, "open": PRICE, "high": hi,
+                     "low": lo, "close": PRICE, "volume": 1})
+        d += dt.timedelta(days=1)
+    return pd.DataFrame(rows)
 
 
 def candle_5m(day, hour, minute, close):
