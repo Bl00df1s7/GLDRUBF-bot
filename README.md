@@ -1,254 +1,256 @@
-# GLDRUBF-Sentry
+# CNYRUBF (C5) Trading Bot — Golden Bot
 
-Торговый бот для фьючерса `GLDRUBF` через T-Invest API. Он загружает свечи, рассчитывает индикаторы, определяет сигнал стратегии, проверяет текущую позицию и при необходимости отправляет рыночный ордер.
+Торговый runtime для фьючерса **`CNYRUBF_SPBFUT`** (MOEX SPBFUT) по замороженной
+тренд-следящей стратегии **C5** (spec v1.1). Активный путь исполнения —
+[`src/c5_runtime.py`](src/c5_runtime.py); он единственный подключён к
+[`src/main.py`](src/main.py) и GitHub Actions workflow
+[`.github/workflows/gold_strategy.yml`](.github/workflows/gold_strategy.yml).
 
-> Важно: при включённом `AUTO_TRADING_ENABLED` бот может отправлять реальные заявки. Сначала проверяйте работу в sandbox или в режиме сигналов.
+Legacy-код первой версии бота (GLDRUBF 4H: `strategy.py`, `auto_trader.py`,
+`stop_orders.py`, `position_monitor.py`, `indicators.calculate_sar`) остаётся в
+репозитории, но **не импортируется активным runtime** — это запрещено тестом
+`test_legacy_paths_are_not_importable_from_active_runtime`
+([`tests/test_stage2d_runtime.py`](tests/test_stage2d_runtime.py)).
 
-## Текущее поведение
+---
 
-- Режим по умолчанию: `AUTO_TRADING_ENABLED = True`.
-- Telegram по умолчанию отключён: `TELEGRAM_ENABLED = False`.
-- Инструмент: `GLDRUBF`, таймфрейм сигнала: 4H.
-- На вход используется 90% стоимости портфеля, 10% остаётся резервом.
-- При realised loss 3% за текущую сессию новые входы блокируются до следующей сессии; закрытие существующей позиции разрешено.
-- Мониторинг может закрыть позицию при сочетании критического уровня и близкого SL, нарушения структуры с быстрым adverse move или FAST_ADVERSE с сильным давлением.
-- Перед каждым рыночным ордером проверяются начало сессии 03:00 МСК и флаги `api_trade_available_flag`/`market_order_available_flag` через `get_trading_status()`; клиринг блокируется статусом API.
-- Открытие и закрытие выполняются рыночными ордерами.
-- `python -m src.main` выполняет один проход и завершается. Для постоянной работы нужен планировщик.
-- После подтверждения открытия выставляются две серверные заявки: SL и TP. Стратегические SL/TP/BE также проверяются при следующих запусках по закрытым свечам.
-- После каждой рыночной заявки выполняется polling `get_order_state()` до 10 секунд с шагом 500 мс; частичное исполнение защищается по фактическому количеству лотов.
-- Временные gRPC-ошибки `UNAVAILABLE` и `DEADLINE_EXCEEDED` повторяются до 4 раз с backoff 1/2/4/8 секунд. `RESOURCE_EXHAUSTED` не повторяется.
+## 1. Стратегия C5 (заморожена — не добавлять фильтры/стопы/оптимизацию)
 
-## Структура проекта
+Источник истины: [`src/strategies/c5_core.py`](src/strategies/c5_core.py)
+(чистая decision-функция), [`src/strategies/c5_signals.py`](src/strategies/c5_signals.py)
+(pandas-адаптер с теми же определениями), параметры —
+[`config/settings.py`](config/settings.py) (блок `FROZEN C5 STRATEGY PARAMETERS`).
 
-```text
-GLDRUBF-Sentry/
-├── config/settings.py       # настройки стратегии и режимов
-├── src/main.py              # один полный цикл работы
-├── src/client_factory.py    # подключение к API с DNS workaround
-├── src/api_retry.py         # retry временных gRPC-ошибок
-├── src/risk_manager.py      # дневной circuit breaker
-├── src/trade_logger.py      # trades.csv и агрегаты PnL
-├── src/observability.py     # JSON-логи с correlation_id
-├── src/lock.py              # защита от параллельных запусков
-├── src/preflight.py         # проверка API и счёта перед запуском
-├── src/instruments.py       # поиск GLDRUBF
-├── src/market_data.py       # свечи и текущая цена
-├── src/indicators.py        # ATR, Donchian, Parabolic SAR
-├── src/strategy.py          # правила входа и выхода
-├── src/positions.py         # поиск позиции и средней цены
-├── src/auto_trader.py       # размер позиции и ордера
-├── src/state_store.py       # состояние между запусками
-├── src/telegram_bot.py      # необязательные уведомления
-├── tests/                   # тесты
-├── requirements.txt         # зависимости
-├── setup.sh                 # первичная установка
-├── token.env                # локальный токен, не коммитить
-└── README.md
+| Параметр | Значение | Константа |
+|---|---|---|
+| Инструмент | `CNYRUBF` / class code `SPBFUT`, 1 контракт = 1000 CNY | `C5_TARGET_TICKER`, `C5_CONTRACT_SIZE_CNY` |
+| Сигнальный TF | закрытые **дневные** бары (`1d`) | `C5_TIMEFRAME` |
+| Контрольная точка | одна закрытая 5m-свеча с close в **16:00 MSK**, раз в день | `C5_CONTROL_TIMEFRAME`, `C5_CONTROL_HOUR_MS` |
+| Вход | Donchian breakout **N = 10**: close контрольной свечи > Upper(10) → LONG, < Lower(10) → SHORT | `C5_ENTRY_DONCHIAN` |
+| Выход | контр-канал **M = 5** только: LONG закрывается при close < Lower(5), SHORT — при close > Upper(5) | `C5_EXIT_DONCHIAN` |
+| ATR14 | только для риск-сайзинга, **не** часть сигнала | `C5_ATR_LEN` |
+| Risk multiplier | `clip(ATR_TARGET / ATR14, 0.5, 1.5)` (не инвертируется; ATR_TARGET = 0.1563) | `C5_ATR_TARGET`, `C5_RISK_MULT_MIN/MAX` |
+| Risk budget | `equity × 0.20 × multiplier` | `C5_RISK_BUDGET_PCT` |
+| Объём | `qty = min(qty_risk, qty_margin, MAX_QTY=40)`, затем stage-cap | `C5_MAX_QTY`, `C5_STAGE_MAX_QTY` |
+| Маржа/эквити | `M/E > 0.30 ⇒ NO_ENTRY (ME_LIMIT)` | `C5_ME_LIMIT` |
+| Stage-лимит | Stage 1: исполняется не более **5** контрактов | `C5_STAGE_MAX_QTY` |
+| Slippage guard | expected slippage > **0.10%** ⇒ вход блокируется | `C5_MAX_EXPECTED_SLIPPAGE` |
+| Protections | daily loss 10% / drawdown freeze 20% / kill switch 30% | `C5_DAILY_LOSS_BREAKER`, `C5_DRAWDOWN_FREEZE`, `C5_KILL_SWITCH_DD` |
+
+Правила, зафиксированные в коде (docstring `c5_core.py`):
+
+- каналы строятся из **предыдущих** закрытых баров (`shift(1)`) — lookahead
+  запрещён; сегодняшняя дневная свеча исключается из истории
+  (`fetch_daily_bars(..., exclude_date=today)`);
+- при открытой позиции сигналы входа полностью игнорируются — выход только по
+  M=5-каналу;
+- **нет** SL / TP / Parabolic SAR / break-even / trailing / time-stop /
+  дополнительных фильтров;
+- contradictory breakout (long+short одновременно) — anomaly guard, no action
+  (`DONCHIAN_ANOMALY_BOTH_SIGNALS` в `c5_signals.py`);
+- словарь причин решения — §9 спеки: константы `REASON_*` в начале
+  `c5_core.py` (`NO_SIGNAL`, `ENTER_LONG/SHORT`, `EXIT_LONG/SHORT`, `HOLD_POSITION`,
+  `QTY_ZERO`, `ME_LIMIT`, `MARGIN_API_UNAVAILABLE`, `DATA_INSUFFICIENT`,
+  `STAGE_CAPPED`; внешние блокеры — `DAILY_LOSS_BREAKER`, `DRAWDOWN_FREEZE`,
+  `KILL_SWITCH`, `SLIPPAGE_GUARD` через `block_entry()`).
+
+`evaluate(daily_bars, control_bar, position, equity, price, margin_rate)` —
+единственная точка принятия решения; возвращает иммутабельный
+`Decision(action, qty, reason + полная диагностика: каналы, ATR, ГО, M/E,
+qty_risk/margin/liquidity/raw)`. Плохие данные ⇒ `DataError` /
+`MarginRateError` — модуль «не угадывает».
+
+## 2. Архитектура runtime
+
+Пайплайн одного цикла (docstring и код [`src/c5_runtime.py`](src/c5_runtime.py)):
+
+```
+Market Data (1d + closed 5m)          src/market_data.py
+  ↓
+Time Gate: ENTRY строго после 16:00 MSK control point (control_point_passed);
+           EXIT — на каждой новой закрытой 5m-свече в сессии 10:00–23:40 MSK
+  ↓
+C5 Core (signal + sizing — никогда не реимплементируется здесь)
+  ↓
+Margin Provider (live ГО get_future FULL, без fallback)   src/margin_provider.py
+  ↓                      long → dlongClient, short → dshortClient;
+                         вне диапазона (0, 0.5) ⇒ MARGIN_API_UNAVAILABLE
+Execution Guard (стак: bid/ask/spread/depth, slippage ≤ 0.10%)  src/execution_guard.py
+  ↓
+Protection (daily loss 10% / DD freeze 20% / kill switch 30%)    src/protection.py
+  ↓              защиты блокируют ТОЛЬКО вход, никогда выход
+Cash Manager (TMON-ликвидация под нужную маржу; строго 1 облигация
+              за операцию, cap MAX_TMON_SELLS=20)                 src/cash_manager.py
+  ↓
+Execution Adapter (PAPER/LIVE различаются ТОЛЬКО здесь)     src/execution_adapter.py
+  ↓
+State Store (идемпотентность, восстановление)                src/state_store.py
 ```
 
-## Установка
+Ключевые компоненты:
 
-Требования: macOS/Linux, Python 3.9+, интернет и токен T-Invest API.
+- **`C5Runtime.bootstrap(state)`** — резолвит инструмент (реальный API в обоих
+  режимах — read-only данные), адаптер, счёт, делает reconcile и refresh ГО.
+  Классификация сбоев G-1: `ReconcileError` ⇒ `reconcile_status=FAILED`,
+  исполнение **запрещено**; `MarginApiUnavailable` после успешного reconcile ⇒
+  **EXIT/HOLD разрешены** (позиция восстановлена из снапшота брокера, ГО для
+  них не нужен), **ENTRY fail-closed**.
+- **`reconcile(adapter, account_id, state)`** — контракт сверки: брокер против
+  сохранённого состояния. `broker_qty != stored_qty ⇒ позиция перенимается у
+  брокера`; направление выводится из знака qty (отрицательная ⇒ SHORT).
+  Открытые заявки при нулевой позиции ⇒ `ReconcileError` (ручной разбор).
+  Недействительный equity ⇒ ошибка, состояние не мутируется.
+- **`run_cycle()`** — один производственный цикл: safety gate → bootstrap →
+  market data → exit-path → entry-path → durable state save. Точка входа
+  планировщика — `run_once(token)` / `python -m src.main`.
+- **Идемпотентность**: каждая обработанная свеча фиксируется по timestamp
+  (`last_processed_5m_ts`, хэш свечи в `state_store.check_candle_already_processed`);
+  control point «сжигается» даже при NO_SIGNAL; повторный вход по той же
+  свече/точке невозможен, включая рестарт процесса (тесты J/N в
+  `test_stage5b_paper_runtime.py`).
+- **State** ([`src/state_store.py`](src/state_store.py)) — JSON на диске,
+  атомарная запись (`_atomic_write_state`), `save_state_strict` бросает
+  `StateSaveError` при сбое (G-7: до dispatch SELL строгий save обязателен —
+  при его неудаче ордер НЕ отправляется, `SELL_INTENT_PERSIST_FAILED`).
+
+## 3. Безопасность PAPER/LIVE и обработка исполнения
+
+### Конфигурационный gate (Stage 5A)
+[`src/runtime_config.py`](src/runtime_config.py) — единственный парсер
+переменных окружения (runtime больше нигде их не читает):
+
+- `TRADING_MODE` — **обязателен**, только `PAPER` или `LIVE`; отсутствует /
+  пуст / невалиден ⇒ `TradingConfigError` (fail closed). Дефолтного режима нет,
+  LIVE по умолчанию невозможен.
+- `AUTO_TRADING_ENABLED` — optional; любое значение кроме `true/1/yes/on` ⇒
+  `False`, что блокирует **весь** поток ордеров (включая PAPER) до execution
+  слоя (`enforce_trading_gate`).
+- Токен: единственное имя переменной — `T_SANDAPI`; legacy названия не
+  активируют runtime (тест `test_credential_legacy_names_do_not_enable_runtime`).
+
+### Адаптеры
+[`src/execution_adapter.py`](src/execution_adapter.py):
+
+- `PaperExecutionAdapter` + `SimulatedBroker` — локальное зеркало счёта;
+  физически не содержит вызовов `post_order` (тесты D/K/G/H/I в
+  `test_stage5a_paper_gate.py` и `test_stage5b_paper_runtime.py`).
+  SimulatedBroker fail-closed: неизвестное ГО для SHORT, отсутствующая цена
+  закрытия, CLOSE_SHORT без позиции, oversell/reversal — отказ с ошибкой.
+- `LiveExecutionAdapter` — рыночные ордера полным объёмом, подтверждение через
+  `wait_for_order_fill` до мутации состояния; TMON — одна облигация за операцию.
+
+### Классификация fills (G-5 exit / G-9C entry)
+`_classify_exit_execution` / `_classify_entry_execution` в `c5_runtime.py`:
+`FULL / PARTIAL / ZERO_FILL / UNVERIFIED / FAILED`. Принципы:
+
+- `ok=True` само по себе **не доказывает** исполнение — позиция обновляется
+  только по валидному `qty_executed` (confirmed volume only);
+- отсутствующий/не-int/bool/отрицательный/больше запрошенного `qty_executed`
+  ⇒ `UNVERIFIED`; `0` при `ok=True` ⇒ `ZERO_FILL` (противоречие ⇒ трактуется
+  как UNVERIFIED); `ok=False` на exit ⇒ UNVERIFIED, на entry ⇒ `FAILED`
+  (доказанная недоставка — безопасен ре-темпл без дубля);
+- частичное исполнение оставляет остаток позиции (PARTIAL books executed, not
+  requested — тесты `test_g5_partial_fill_keeps_remaining_position`,
+  `test_partial_short_books_only_confirmed_qty`).
+
+### Защита от повторной отправки (G-7 / G-9C)
+- **Durable intent markers**: перед dispatch SELL/BUY в состояние строго
+  пишется маркер `exit_pending_sell_intent` / entry-маркер с полем `operation`
+  (`EXIT_LONG`, `OPEN_SHORT`, `CLOSE_SHORT`) и `candle_ts`; снимается только
+  proven-terminal результатом или явной операторской конфирмацией.
+- **EXIT_UNVERIFIED freeze**: после unverifiable sell все будущие позиционные
+  операции блокированы; reconcile **никогда** не снимает freeze автоматически
+  (один снапшот не доказывает terminality). Снятие — только
+  `state["broker_position_confirmed"] = <int>` (не int-значение отвергается).
+- Рестарт процесса не создаёт «своего» in-flight-маркера (`_sell_dispatch_in_flight`,
+  per-process seq) — прочитанный с диска маркер всегда считается чужой
+  незавершённой операцией и блокирует re-send
+  (`test_g6_restart_after_exception_blocks_resend`,
+  `test_restart_after_ambiguous_entry_blocks_resend`,
+  `test_restart_blocks_repeat_buy_until_operator_resolution`).
+- Доверие open-orders (PR #37, [`tests/test_open_orders_trust.py`](tests/test_open_orders_trust.py)):
+  ошибка `get_orders()` в LIVE-снапшоте пробрасывается наружу, а не маскируется
+  как `open_orders=0`; сбой чтения на старте блокирует исполнение
+  (`STARTUP_RECONCILE_FAILED`).
+
+## 4. Тестирование
+
+Запуск: `python -m pytest tests/` (pytest). Сеть и реальные ордера не
+используются — всё на boundary-фейках и DI-хуках `C5Runtime`
+(`adapter`, `margin_tracker`, `now_fn`, `config`).
+
+| Файл | Что проверяет |
+|---|---|
+| [`tests/test_c5_core.py`](tests/test_c5_core.py) | Замороженная математика C5: T1–T18 спеки (§13) — ATR vs reference, направление/клип множителя, no-lookahead, сигналы N=10/M=5, игнор входа при позиции, сайзинг/stage-cap/ME-limit, валидация ГО, детерминизм/чистота; отдельно G-1 (exit/HOLD при `margin_rate=None`, entry fail-closed). |
+| [`tests/test_stage2d_runtime.py`](tests/test_stage2d_runtime.py) | Цикл runtime A–V: control point, дубли Candle/entries, exit полный объём, restart-идемпотентность, ГО-блокировки, protections (10/20/30%), TMON-секвенции, reconcile «брокер важнее state», slippage/depth guards, legacy-пути не импортируются, main делегирует c5_runtime. |
+| [`tests/test_stage5a_paper_gate.py`](tests/test_stage5a_paper_gate.py) | Safety-gate: TRADING_MODE fail-closed/без LIVE-дефолта, AUTO=false блокирует до market data, paper-ветка не конструирует live-клиент, PAPER lifecycle целиком, LIVE маршрутизируется через fake SDK. |
+| [`tests/test_stage5b_paper_runtime.py`](tests/test_stage5b_paper_runtime.py) | E2E PAPER A–N + G-1…G-7: идемпотентность, restart+reconcile для LONG (Test N), G-5 классификатор/freeze/residual-survives-restart, G-6 exception-safety, G-7 durability strict-save. |
+| [`tests/test_safety_guards_paper_runtime.py`](tests/test_safety_guards_paper_runtime.py) | Guards входа: стакан недоступен/пуст/невалиден, qty=0, TMON-неподтверждение, broker error на BUY. Два кейса помечены `xfail(strict=True)` — см. ограничения ниже. |
+| [`tests/test_open_orders_trust.py`](tests/test_open_orders_trust.py) | Надёжность open-orders в LIVE-снапшоте: пустой список = подтверждённый 0, ошибка НЕ маскируется (в т.ч. rate-limit `RequestError`), nonzero open orders блокируют reconcile. |
+| [`tests/test_stage9c_short_execution.py`](tests/test_stage9c_short_execution.py) | G-9C.1 SHORT entry: SELL с OPEN_SHORT intent, отрицательная позиция + резервирование ГО только по confirmed qty, partial/unproven/ambiguous-кейсы, маркер через рестарт, запрет flip/stack. |
+| [`tests/test_stage9c_short_exit.py`](tests/test_stage9c_short_exit.py) | G-9C.2 SHORT exit: BUY CLOSE_SHORT, release ГО + реализация PnL (в т.ч. убыток), oversize-close/refusal без позиции, unproven close ≠ flat, маркер через рестарт, full-cycle test с partial exit и reconcile. |
+| [`tests/test_paper_smoke_clock_override.py`](tests/test_paper_smoke_clock_override.py) | Diagnostic-раннер `scripts/paper_smoke_test.py` (см. §5 CI/workflow). |
+| Legacy-тесты (`test_strategy.py`, `test_auto_trader.py`, `test_stop_orders.py`, `test_position_monitor.py`, `test_risk_manager.py`, `test_trading_schedule.py`, `test_api_retry.py`, `test_reliability.py`, `test_trade_logger.py`) | Относятся к GLDRUBF-наследию; проходят, но активный путь C5 ими не покрывается. |
+
+Известные ограничения:
+
+- **GAP A / GAP B** (`test_safety_5`, `test_safety_6`): ветки
+  `TMON_SELL_N_NOT_CONFIRMED` и `SimulatedBrokerError` на BUY не достижимы
+  через реальную PAPER-цепочку детерминированными хуками; закреплены как
+  `xfail(strict=True)` до закрытия gap.
+- Часть тестов требует установленного `t_tech.invest` (SDK) — в CI заглушки/
+  skip там, где grpc недоступен.
+- Workflow `gold_strategy.yml` жёстко `TRADING_MODE=PAPER`; LIVE из GitHub
+  Actions невозможен. Ручной `workflow_dispatch` c `paper_smoke_test=true`
+  выполняет полный PAPER-прогон; diag-флаги `--diag-market/--diag-margin/--diag-broker`
+  работают только все вместе (partial selection = fail closed).
+
+## 5. Состояние проекта
+
+**Реализовано и подтверждено тестами:**
+
+- Полная production-цепочка C5: данные → time gate → сигнал/сайзинг → live ГО →
+  guards → protections → TMON → adapter → state (Stages 2D–6D);
+- LONG-цикл PAPER end-to-end, включая рестарт процесса + reconcile
+  (Test N, G-5 partial residual survives restart);
+- SHORT entry (G-9C.1) и SHORT exit (G-9C.2) в PAPER: отрицательная позиция,
+  резерв/освобождение ГО по dshortClient, confirmed-volume bookkeeping,
+  durable markers через рестарт;
+- Safety-gate Stage 5A (fail-closed конфиг, отсутствие LIVE-дефолта, физическая
+  изоляция PAPER от `post_order`);
+- Trust-модель open-orders для LIVE snapshot (PR #37).
+
+**Ограничения / известные проблемы:**
+
+- SHORT close-out в **LIVE** пока не включён в production-маршрут (реализован и
+  проверен только на PAPER-уровне);
+- `EXIT_UNVERIFIED` / ambiguous-fill требуют ручного операторского разрешения
+  (`broker_position_confirmed`) — автоматического снятия freeze нет by design;
+- GAP A / GAP B зафиксированы как strict xfail (§4);
+- стратегия заморожена: любые изменения сигналов — только через ревизию спеки.
+
+**Ближайшая задача:** сквозной SHORT-цикл через **рестарт процесса** —
+открытие SHORT (фаза 1) → новый экземпляр `C5Runtime` поверх того же state →
+bootstrap/reconcile восстанавливает отрицательную позицию → повторный вход по
+той же свече заблокирован → EXIT_SHORT даёт ровно один BUY CLOSE_SHORT →
+flat, ГО освобождено, PnL корректен. Существующий restart-тест (Test N) покрыт
+только для LONG; отдельные G-9C-тесты проверяют entry/exit без полной
+две-процессной склейки.
+
+## 6. Запуск
 
 ```bash
-chmod +x setup.sh
-./setup.sh
+pip install -r requirements.txt        # включает t_techinvest SDK (whl с GitHub)
+export T_SANDAPI="<sandbox token>"     # единственный принятый токен env name
+export TRADING_MODE=PAPER              # обязательно; дефолта нет, LIVE — только осознанно
+export AUTO_TRADING_ENABLED=true       # без него весь поток ордеров заблокирован
+
+python -m src.main                     # один цикл (для scheduler/cron)
+python scripts/paper_smoke_test.py --clock-epoch "2026-10-02T16:01:00+03:00"  # diagnostic PAPER-run
+python -m pytest tests/ -q             # тесты (без сети, без реальных ордеров)
 ```
 
-`setup.sh` создаёт `venv` и устанавливает `t-tech-investments` из PyPI-источника T-Bank, а также `pandas`, `numpy`, `requests` и `python-dotenv`.
-
-Ручная установка:
-
-```bash
-python3 -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
-```
-
-## Токен
-
-Файл `token.env`:
-
-```dotenv
-T_SANDAPI=ваш_токен_T_Invest_API
-```
-
-Название переменной историческое: код использует `T_SANDAPI` для текущего подключения к API. Если токен попадал в чат, логи или публичный репозиторий, отзовите его и выпустите новый.
-
-Загрузка переменных и запуск:
-
-```bash
-source venv/bin/activate
-set -a
-source token.env
-set +a
-python -m src.main
-```
-
-## Запуск
-
-Однократно:
-
-```bash
-source venv/bin/activate && set -a && source token.env && set +a && python -m src.main
-```
-
-Режим только сигналов включается в `config/settings.py`:
-
-```python
-AUTO_TRADING_ENABLED = False
-```
-
-Автоторговля:
-
-```python
-AUTO_TRADING_ENABLED = True
-TELEGRAM_ENABLED = False
-RESERVE_RATIO = 0.10
-```
-
-Для production-запуска рекомендуется workflow `.github/workflows/gold_strategy.yml`. Он запускает мониторинг по будням каждый час в `:05` с `03:05` до `23:05 МСК`, а также выполняет финальную проверку в `23:50 МСК`. Ручной запуск доступен через `workflow_dispatch`.
-
-GitHub Actions runner временный, поэтому workflow сохраняет `runtime/state.json`, `runtime/trades.csv` и `runtime/logs/` через Actions Cache. Мониторинг позиции выполняется внутри того же `src.main`; отдельный процесс мониторинга не нужен.
-
-Для локального cron можно использовать:
-
-```cron
-1 */4 * * * cd /путь/к/GLDRUBF-Sentry && /путь/к/GLDRUBF-Sentry/venv/bin/python -m src.main >> bot.log 2>&1
-```
-
-Каждый запуск пишет JSON-лог в `logs/bot_YYYYMMDD.log` (или в каталог из `LOG_DIR`). Событие `run_summary` содержит сигнал входа, сигнал выхода, итоговое действие и текущую позицию; `run_completed` дополнительно содержит результат ордера. Для пропущенных запусков записывается причина в `run_skipped` или `run_finished_without_signal`.
-
-## Логика стратегии
-
-`src/indicators.py` рассчитывает:
-
-- ATR с периодом `ATR_LEN` и сглаживанием Wilder.
-- Donchian Channel за `DONCHIAN_LEN` предыдущих свечей. Текущая свеча исключается через `shift(1)`.
-- `long_signal`, если close закрытой свечи выше верхней границы.
-- `short_signal`, если close ниже нижней границы.
-- Parabolic SAR и признаки разворота.
-
-Последняя незакрытая 4H-свеча игнорируется.
-
-### Вход
-
-- Нет позиции + `long_signal` -> `SIGNAL_OPEN_LONG` -> BUY.
-- Нет позиции + `short_signal` -> `SIGNAL_OPEN_SHORT` -> SELL.
-- Нет сигнала -> `WAIT`.
-- Если оба сигнала истинны, вход отменяется как аномалия.
-
-### Выход
-
-Для существующей позиции условия проверяются в порядке:
-
-1. SL: для LONG low <= SL, для SHORT high >= SL.
-2. TP: для LONG high >= TP, для SHORT low <= TP.
-3. Разворот Parabolic SAR.
-4. Движение в пользу позиции на `BE_PCT` активирует безубыток.
-5. После BE возврат к цене входа закрывает позицию.
-
-При одновременном касании SL и TP приоритет имеет SL. По OHLC закрытой свечи нельзя определить порядок событий внутри свечи.
-
-## Управление капиталом
-
-```text
-доступный капитал = стоимость портфеля * (1 - RESERVE_RATIO)
-маржа на лот = initial_margin_on_buy/on_sell из API
-лоты = floor(доступный капитал / маржа на лот)
-```
-
-`RESERVE_RATIO = 0.10` означает использование 90% портфеля. В `auto_trader.py` есть ограничение максимум 100 лотов.
-
-ГО запрашивается из `initial_margin_on_buy` и `initial_margin_on_sell` API; берётся большее значение. Если ГО недоступно, новый вход блокируется. Резерв 10% не является ограничением убытка на сделку и не учитывает проскальзывание или изменение маржи.
-
-`MAX_DAILY_LOSS_PCT = 0.03` задаёт дневной circuit breaker. Сессия начинается в 03:00 МСК. Реализованный результат берётся из операций API по `GLDRUBF`; при достижении лимита в state устанавливается `TRADING_HALTED = True`.
-
-## Исполнение ордеров
-
-`src/auto_trader.py` отправляет:
-
-- LONG: `ORDER_DIRECTION_BUY`.
-- SHORT: `ORDER_DIRECTION_SELL`.
-- Закрытие LONG: SELL.
-- Закрытие SHORT: BUY.
-- Тип: `ORDER_TYPE_MARKET`.
-
-После открытия `src/stop_orders.py` выставляет отдельные серверные заявки `STOP_LOSS` и `TAKE_PROFIT` с `GOOD_TILL_CANCEL`. Их ID сохраняются в state. Перед закрытием по сигналу бот отзывает сохранённые заявки.
-
-Перед отправкой защитных заявок цена округляется к `instrument.min_price_increment`, а количество приводится к полному `instrument.lot`. В SDK `quantity` передаётся в лотах, не в базовых единицах.
-
-При `BE_TRIGGERED` бот отменяет старые защитные заявки и выставляет новую пару с расчётным стопом на entry price. Комиссионное смещение пока не рассчитывается отдельно.
-
-После отправки заявки состояние не перечитывается в этом же запуске; фактическое исполнение проверяется следующим запуском. Рыночный ордер не гарантирует цену исполнения.
-
-## API и DNS
-
-Продакшен-адрес: `invest-public-api.tbank.ru:443`.
-
-Все подключения должны проходить через `src.client_factory.get_client(token)`. Фабрика разрешает hostname через `socket.getaddrinfo`, подключается к IP и сохраняет TLS-имя через `grpc.ssl_target_name_override`. Это обход проблемы DNS gRPC на некоторых конфигурациях macOS.
-
-Не создавайте `Client(token)` напрямую в новых модулях.
-
-Предупреждение `NotOpenSSLWarning` связано с Python 3.9 и LibreSSL. Оно не блокирует запуск, но для нового окружения лучше использовать Python с OpenSSL.
-
-## Состояние
-
-По умолчанию состояние хранится в `/tmp/gldrubf_state.json`. Путь меняется так:
-
-```bash
-export STATE_FILE="$PWD/state.json"
-```
-
-Сохраняются hash последней свечи, ключ позиции, entry price, SL/TP/BE, последний action и состояние мониторинга. Если свеча и позиция не изменились, повторная обработка пропускается.
-
-State-файл не следует коммитить: он может содержать идентификатор счёта и торговую историю.
-
-Журнал сделок хранится в `trades.csv` или по пути из `TRADES_FILE`. Логи хранятся в `logs/` или в каталоге из `LOG_DIR`; каждая строка JSON содержит `correlation_id` текущего запуска.
-
-## Telegram
-
-Telegram не нужен для работы стратегии. При `TELEGRAM_ENABLED = False` `BOT_TOKEN` и `TELEGRAM_CHAT_ID` не требуются.
-
-`bot.py` — отдельный Telegram-бот с командой `/signal`, которая запускает GitHub Actions workflow вручную. Для автоматической торговли он не нужен. Для него нужны `BOT_TOKEN`, `GH_TRIGGER_TOKEN`, `GITHUB_OWNER` и `GITHUB_REPO`.
-
-## Тесты
-
-```bash
-source venv/bin/activate
-python -m pytest -q
-python -m py_compile src/*.py config/*.py
-```
-
-Тесты в основном покрывают стратегию и мониторинг. Торговые тесты должны быть без реального API: проверяйте размер позиции, направление заявки, SL/TP/BE и ошибки подключения.
-
-## Как передать проект другой модели
-
-Используйте этот контекст:
-
-```text
-Это Python-бот для T-Invest API и фьючерса GLDRUBF.
-Точка входа: src/main.py; один запуск обрабатывает последнюю закрытую 4H-свечу.
-Индикаторы: src/indicators.py. Входы и выходы: src/strategy.py.
-API-клиент создавай только через src.client_factory.get_client(token),
-потому что на macOS есть проблема DNS у gRPC.
-Торговые операции: src/auto_trader.py. Позиции: src/positions.py.
-Состояние: src/state_store.py. Настройки: config/settings.py.
-По умолчанию авто-трейдинг включён, Telegram выключен, резерв 10%.
-Не отправляй реальные заявки в тестах. Сначала найди функцию, управляющую поведением,
-внеси минимальное изменение, добавь узкий тест и запусти pytest/py_compile.
-```
-
-В запросе к модели указывайте: что изменить, нужен ли реальный ордер, допустимый процент капитала, поведение при противоположном сигнале и ожидаемый тест.
-
-## Известные ограничения
-
-- Процесс не работает постоянно без внешнего планировщика.
-- Серверные SL/TP выставляются после открытия; при `BE_TRIGGERED` старая защита заменяется новой.
-- Мониторинг закрывает позицию только по явно заданным комбинациям alert level и ATR-признаков; противоположный сигнал сам по себе позицию не закрывает и не переворачивает.
-- При недоступном ГО новый вход блокируется.
-- Используется первый найденный активный счёт с позицией или первый открытый счёт для новой позиции.
-- Нет отдельной настройки `account_id`.
-- При частичном исполнении защита выставляется на фактически исполненные лоты; неисполненная часть не считается открытой позицией.
-- Gross PnL считается как разница цен в пунктах × размер лота × количество лотов. Комиссия составляет 0.025% от номинала отдельно на вход и выход; net PnL вычитает обе комиссии.
+Секреты (`T_SANDAPI`, `.env*`) не коммитятся (`.gitignore`); токен sandbox
+T-Invest выдаётся в кабинете клиента. Реальные торговые заявки возможны только
+при явном `TRADING_MODE=LIVE` + `AUTO_TRADING_ENABLED=true` и вне этого README
+не демонстрируются.
