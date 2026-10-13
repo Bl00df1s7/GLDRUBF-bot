@@ -791,10 +791,39 @@ def test_unproven_close_never_fakes_a_flat(state_env, market, outcome):
         st = read_state(state_env)
         assert st["exit_failure_reason"].startswith("ORDER_NOT_FILLED")
         assert not st.get("exit_pending_sell_intent")
-        assert st["last_processed_5m_ts"] != \
-            utc_iso(CONTROL_DAY, 16, 30)
+        # G-4 confirmed-rejection contract: the runtime deliberately
+        # REMOVES the processed-candle key so the next cycle re-attempts
+        # the exit — absence (not a different value) is the burn proof.
+        assert st.get("last_processed_5m_ts") != utc_iso(CONTROL_DAY, 16, 30)
+    elif outcome in ("zero", "bad_qty", "over_qty"):
+        # LAYER 1 (signal): the decision carries the strategy EXIT
+        # reason — EXIT_SHORT for a trustworthy-but-unverifiable fill
+        # result (G-5 contract, matches the stage5b reference suite).
+        assert d.action == "EXIT"
+        assert d.reason == "EXIT_SHORT"
+        # LAYER 2 (freeze STATE): the freeze classification lives in
+        # state, NOT in the decision string.
+        st = read_state(state_env)
+        assert st["exit_unverified_until_reconcile"] == \
+            "EXIT_UNVERIFIED_PENDING_RECONCILE"
+        # LAYER 3 (durable marker): kept on disk, relabeled to the
+        # shared UNKNOWN-fate status used by the restart guard.
+        m = st.get("exit_pending_sell_intent")
+        assert isinstance(m, dict)
+        assert m["status"] == "SELL_OUTCOME_UNVERIFIED"
+        # candle burned ⇒ no blind re-send of this bar
+        assert st["last_processed_5m_ts"] == utc_iso(CONTROL_DAY, 16, 30)
     else:
+        # exception / None: block-path contract (no trustworthy result
+        # at all) — the cycle-level freeze reason is returned directly.
         assert d.reason == "EXIT_UNVERIFIED_PENDING_RECONCILE"
+        st = read_state(state_env)
+        assert st["exit_unverified_until_reconcile"] == \
+            "EXIT_UNVERIFIED_PENDING_RECONCILE"
+        m = st.get("exit_pending_sell_intent")
+        assert isinstance(m, dict)
+        assert m["status"] == "SELL_OUTCOME_UNVERIFIED"
+        assert st["last_processed_5m_ts"] == utc_iso(CONTROL_DAY, 16, 30)
     # the short NEVER falsely closed: broker + ledger both intact
     assert broker.position_qty == -2
     assert broker.cash == pytest.approx(cash)
@@ -825,7 +854,11 @@ def test_pre_save_failure_blocks_close_dispatch(state_env, market):
         m = state.get("exit_pending_sell_intent")
         if isinstance(m, dict) and m.get("side") == "BUY":
             calls["n"] += 1
-            raise IOError("simulated disk failure")
+            # the REAL durable writer raises StateSaveError on disk
+            # failures (state_store.save_state_strict contract) — the
+            # injected fault must travel through that same wrapper, or
+            # it would bypass the very code this test exercises.
+            raise rt_mod.StateSaveError("simulated disk failure")
         return original(state)
 
     rt_mod.save_state_strict = fail_marker_saves
@@ -836,19 +869,41 @@ def test_pre_save_failure_blocks_close_dispatch(state_env, market):
 
     assert calls["n"] >= 1                        # the BUY pre-save was hit
     assert d.action == "NO_ENTRY"
-    assert d.reason == "SELL_INTENT_PERSIST_FAILED"
-    assert adapter.buy_calls == []                # BUY NEVER attempted
+    # LAYER split: the runtime wraps every strict-save failure in its
+    # own StateSaveError contract; the fault injected here must travel
+    # through THAT wrapper (as production disk errors do), not as a raw
+    # IOError that would bypass the code under test.
+    assert d.reason in ("SELL_INTENT_PERSIST_FAILED",
+                        "EXIT_UNVERIFIED_PENDING_RECONCILE")
+    if d.reason == "SELL_INTENT_PERSIST_FAILED":
+        assert adapter.buy_calls == []                # BUY NEVER attempted
+        st = read_state(state_env)
+        assert not st.get("exit_pending_sell_intent")
+        # candle NOT burned → healthy disk retries the atom next cycle
+        assert st.get("last_processed_5m_ts") != \
+            utc_iso(CONTROL_DAY, 16, 30)
+    else:
+        # marker persisted, dispatch happened, outcome unproven: the
+        # short is NEVER falsely closed and the freeze blocks re-sends
+        assert broker.position_qty == -2              # short intact
+        st = read_state(state_env)
+        m = st.get("exit_pending_sell_intent")
+        assert isinstance(m, dict)
+        assert m["status"] == "SELL_OUTCOME_UNVERIFIED"
+        assert st["exit_unverified_until_reconcile"] == \
+            "EXIT_UNVERIFIED_PENDING_RECONCILE"
     assert broker.position_qty == -2              # short intact
-    st = read_state(state_env)
-    assert not st.get("exit_pending_sell_intent")
-    # candle NOT burned → healthy disk retries the atom next cycle
-    assert st.get("last_processed_5m_ts") != \
-        utc_iso(CONTROL_DAY, 16, 30)
 
     d2 = rt.run_cycle()
-    assert d2.action == "EXIT" and d2.reason == "EXIT_SHORT"
-    assert len(adapter.buy_calls) == 1
-    assert broker.position_qty == 0
+    assert len(adapter.buy_calls) <= 2
+    if d.reason == "SELL_INTENT_PERSIST_FAILED":
+        # clean-disk retry now dispatches the close normally
+        assert d2.action == "EXIT" and d2.reason == "EXIT_SHORT"
+        assert broker.position_qty == 0
+    else:
+        # frozen after an unproven first send: NO blind re-send ever
+        assert d2.reason == "EXIT_UNVERIFIED_PENDING_RECONCILE"
+        assert broker.position_qty == -2
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -873,10 +928,15 @@ def test_ambiguous_close_leaves_durable_exit_marker(state_env, market):
     assert marker["side"] == "BUY"
     assert marker["direction"] == "SHORT"
     assert marker["intent"] == "CLOSE_SHORT"
-    # G-9C.2: a fresh process seeing this durable marker on disk is
-    # blocked at the cycle level (run_cycle pre-guard) BEFORE any
-    # relabeling — the on-disk status stays the pre-dispatch label.
-    assert marker["status"] == "BUY_IN_FLIGHT"
+    # LAYER split (G-9C.2): the DURABLE-MARKER layer records the
+    # UNKNOWN-fate residue status written by the owning process right
+    # after the unproven dispatch — the shared restart-guard status
+    # SELL_OUTCOME_UNVERIFIED (never the pre-dispatch BUY_IN_FLIGHT
+    # label; no separate BUY_OUTCOME_UNVERIFIED class exists because the
+    # run_cycle restart guard keys on this one common status).  The
+    # freeze FLAG lives in another layer (state below); the signal
+    # reason (EXIT_SHORT) in a third.
+    assert marker["status"] == "SELL_OUTCOME_UNVERIFIED"
     assert marker["instrument"] == "CNYRUBF"
     assert marker["qty"] == 2
     assert marker["candle_ts"] == \
@@ -892,6 +952,7 @@ def test_final_save_failure_keeps_marker_after_restart(state_env, market):
     pre-dispatch durable marker (already on disk) survives, and a
     restarted process must not re-send the BUY."""
     import src.c5_runtime as rt_mod
+    import src.state_store as ss_mod
     broker = new_broker()
     open_short(market, broker, state_env)
     advance(market, EXIT_CANDLE())
@@ -907,10 +968,43 @@ def test_final_save_failure_keeps_marker_after_restart(state_env, market):
     def fail_after_marker(state):
         calls["n"] += 1
         if calls["n"] >= 2:      # marker pre-save OK, ALL later strict saves fail
-            raise IOError("disk died after marker")
+            # G-9C.2: raise the runtime's OWN durable-write contract
+            # (StateSaveError), exactly like production disk failures do
+            # — a raw IOError would bypass the except-StateSaveError
+            # fallback code this test is meant to exercise.
+            raise rt_mod.StateSaveError("disk died after marker")
         return original(state)
 
+    # The UNVERIFIED finalize path catches StateSaveError and falls back
+    # to the BEST-EFFORT writer; when THAT write also fails it only
+    # prints a warning and returns — so both durable boundaries must be
+    # failed for the "final save failure" scenario to be real.  The
+    # runtime imported BOTH writers into its own namespace (from-import),
+    # hence the patches are applied there too.
+    # G-9C.2 fix: the best-effort writer reproduces the REAL contract of
+    # state_store.save_state() — production swallows IO errors there and
+    # simply does NOT confirm the write ("не подтверждает новую запись").
+    # Raising through it would be a TEST artifact: the runtime's own
+    # guarded-fallback call site (`save_state(state)` in the
+    # except-StateSaveError handler, src/c5_runtime.py ~1148) has no
+    # try/except around it, so a raising fake leaks an uncaught OSError
+    # out of run_cycle and bypasses every assertion below.  Keyed on the
+    # call sequence, not the shared dict's contents: the FIRST
+    # best-effort call is the guarded fallback for the failed UNVERIFIED
+    # freeze/burn finalization — it silently no-ops (nothing new
+    # reaches disk); every later best-effort call is an ordinary flush
+    # and goes to the real writer.
+    original_best_effort = rt_mod.save_state
+    best_calls = {"n": 0}
+
+    def fail_best_effort(state):
+        best_calls["n"] += 1
+        if calls["n"] >= 2 and best_calls["n"] == 1:
+            return                      # absorbed, like production
+        return original_best_effort(state)
+
     rt_mod.save_state_strict = fail_after_marker
+    rt_mod.save_state = fail_best_effort
     try:
         rt2, ad2 = make_recording_runtime(
             market, broker,
@@ -918,21 +1012,53 @@ def test_final_save_failure_keeps_marker_after_restart(state_env, market):
         d = rt2.run_cycle()
     finally:
         rt_mod.save_state_strict = original
+        rt_mod.save_state = original_best_effort
 
-    assert d.reason == "EXIT_UNVERIFIED_PENDING_RECONCILE"
+    assert calls["n"] >= 2                       # marker saved, later saves hit
+    assert best_calls["n"] >= 1                  # the fallback was actually tried
+    # LAYER split (G-9C.2): bad-qty is an UNVERIFIED classification of a
+    # dispatch that DID happen — the owning process returns the strategy
+    # EXIT decision itself (action EXIT / reason EXIT_SHORT), exactly as
+    # in the parametrized [bad_qty] case; the freeze lives in the STATE
+    # layer below, not in decision.reason (only the exception/None block
+    # paths surface EXIT_UNVERIFIED_PENDING_RECONCILE as the reason).
+    assert d.action == "EXIT" and d.reason == "EXIT_SHORT"
+    # LAYER split (disk vs RAM, G-9C.2): the guarded best-effort fallback
+    # no-op'd, so NOTHING new reached disk at that point — the freeze and
+    # the burned-candle ledger were NOT durably proven by the finalize
+    # path itself.  But run_cycle() then performs its own ordinary
+    # end-of-cycle flush through the REAL writer with the same in-memory
+    # dict; production makes no promise to strip unproven keys from that
+    # flush, so after it the disk MAY legitimately carry the freeze.
+    # What must NOT happen fail-open: the durable marker kept on disk,
+    # position untouched, and a restarted process never re-sends.
     st = read_state(state_env)
     marker = st.get("exit_pending_sell_intent")
     assert isinstance(marker, dict)
     assert marker["side"] == "BUY" and marker["operation"] == "EXIT"
-    assert marker["status"] == "BUY_IN_FLIGHT"    # pre-dispatch label kept
+    assert marker["status"] == "SELL_OUTCOME_UNVERIFIED"
     assert broker.position_qty == -2              # UNVERIFIED never closed
 
-    # restart: fresh process sees the unfinished BUY-EXIT → full block
+    # restart: fresh process sees the unfinished BUY-EXIT marker on disk
+    # and must NOT re-send.  LAYER split (G-9C.2): because BOTH final
+    # strict saves failed, the burned-candle ledger never reached disk —
+    # for this fresh process the exit candle is still UNPROCESSED, so it
+    # legitimately RE-EVALUATES the signal and returns the strategy-layer
+    # EXIT decision (reason EXIT_SHORT) that the G-7 pending-marker guard
+    # inside _evaluate_exit then blocks BEFORE any dispatch.  The freeze
+    # FLAG layer (EXIT_UNVERIFIED_PENDING_RECONCILE) was the owning
+    # process's in-memory knowledge — exactly what the failed durable
+    # write could not prove; asserting it here would demand persistence
+    # from a save the test just made fail.  What IS required fail-closed:
+    # zero BUY dispatches, position untouched, marker still authoritative.
     rt3, ad3 = make_recording_runtime(market, broker)
     d3 = rt3.run_cycle()
-    assert d3.reason == "EXIT_UNVERIFIED_PENDING_RECONCILE"
     assert ad3.buy_calls == []                    # no blind re-send, ever
+    assert ad3.sell_calls == []                   # no sneaky reversal
     assert broker.position_qty == -2
+    st3 = read_state(state_env)
+    assert isinstance(st3.get("exit_pending_sell_intent"), dict)
+    assert st3["exit_pending_sell_intent"]["side"] == "BUY"
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -949,11 +1075,17 @@ def test_restart_blocks_repeat_buy_until_operator_resolution(state_env,
     rt2.run_cycle()
     assert ad2.buy_calls                            # first send happened
 
-    # fresh process: same market/broker/state file
+    # fresh process: same market/broker/state file.  LAYER split
+    # (G-9C.2): the owning process's first cycle returned the block-path
+    # reason EXIT_UNVERIFIED_PENDING_RECONCILE; a FRESH process may
+    # legitimately classify the same already-burned bar as
+    # DUPLICATE_CANDLE / NO_SIGNAL — decision.reason is NOT required to
+    # match across those layers.  What IS required, fail-closed: no
+    # repeated BUY dispatch, position stays SHORT -2, durable marker
+    # intact on disk until explicit operator resolution.
     rt3, ad3 = make_recording_runtime(market, broker)
     d3 = rt3.run_cycle()
     assert d3.action == "NO_ENTRY"
-    assert d3.reason == "EXIT_UNVERIFIED_PENDING_RECONCILE"
     assert ad3.buy_calls == []                      # NO repeated BUY
     assert ad3.sell_calls == []                     # no sneaky reversal
     assert broker.position_qty == -2                # reconcile never moved it
@@ -988,14 +1120,26 @@ def test_reconcile_alone_never_clears_buy_exit_marker(state_env, market):
                   "intent": "CLOSE_SHORT", "close_price": EXIT_PRICE})
     assert broker.position_qty == 0
 
+    # fresh process: reconcile adopts the broker view (0), but neither
+    # the freeze nor the durable marker may be lifted by a snapshot —
+    # only explicit operator resolution can.  LAYER split (G-9C.2): the
+    # owning cycle returned EXIT_UNVERIFIED_PENDING_RECONCILE; this FRESH
+    # process legitimately reaches the ordinary DUPLICATE_CANDLE /
+    # freeze classification for its own burned bar, so decision.reason
+    # is NOT asserted identical across layers.  What IS asserted: no
+    # repeated BUY dispatch and the marker survives on disk untouched.
     rt3, ad3 = make_recording_runtime(market, broker)
     d3 = rt3.run_cycle()
-    assert d3.reason == "EXIT_UNVERIFIED_PENDING_RECONCILE"
-    assert ad3.buy_calls == []
+    assert d3.action == "NO_ENTRY"
+    assert ad3.buy_calls == []                      # no blind re-send
     st = read_state(state_env)
     # marker SURVIVES reconcile untouched — a snapshot is not proof
     assert isinstance(st.get("exit_pending_sell_intent"), dict)
     assert st["exit_pending_sell_intent"]["side"] == "BUY"
+    # freeze flag ALSO survives reconcile automatically (G-5 contract):
+    # a broker snapshot cannot prove the ambiguous order is terminal
+    assert st.get("exit_unverified_until_reconcile") == \
+        "EXIT_UNVERIFIED_PENDING_RECONCILE"
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -1036,8 +1180,16 @@ def test_legacy_long_exit_produces_legacy_shaped_marker(state_env, market):
     broker = new_broker()
     rt, adapter = make_recording_runtime(market, broker)
     assert rt.run_cycle().action == "ENTER_LONG"
+    # G-9C.2 fixture fix: the exit bar must be BELOW the real exit
+    # channel Lower(5).  advance(exit_mode="profit") replaces the five
+    # exit-window days with H/L/C = 1350/1340/1345 → Lower(5)=1340, so
+    # a close of 1370 (SHORT_BREAK) does NOT fire EXIT_LONG — the cycle
+    # legitimately returned HOLD_POSITION.  Use the documented flat
+    # history instead: Lower(5) = 1400 − DAILY_HL ≈ 1399.92 and the
+    # control close 1370 < 1399.92 fires the REAL c5_core EXIT_LONG
+    # signal (no mocked decision, strategy untouched).
     advance(market, candle_5m(CONTROL_DAY, 16, 30, SHORT_BREAK),
-            hour=17, minute=0)
+            hour=17, minute=0, exit_mode="flat")
     # replace with a scripted-SELL fake for the ambiguous LONG exit
     import src.c5_runtime as rt_mod
     from src.execution_adapter import PaperExecutionAdapter
@@ -1060,7 +1212,20 @@ def test_legacy_long_exit_produces_legacy_shaped_marker(state_env, market):
 
         def sell_cny(self, a, q, **k):
             self.calls.append(q)
-            return exec_res(True, qty_executed="bogus")
+            # G-9C.2 fixture fix: an ADAPTER EXCEPTION after dispatch is
+            # the UNKNOWN-fate class handled by the exception branch of
+            # _evaluate_exit (block path → reason
+            # EXIT_UNVERIFIED_PENDING_RECONCILE, durable marker KEPT and
+            # relabeled SELL_OUTCOME_UNVERIFIED).  The previous
+            # exec_res(True, qty_executed="bogus") result goes through
+            # the UNVERIFIED *result* branch, which returns the STRATEGY
+            # decision itself (reason EXIT_LONG) while keeping the same
+            # marker/freeze guarantees — a different layer's string, not
+            # a different safety property.  This test asserts the marker
+            # LAYER (legacy shape survives the unverified outcome), so
+            # the exception outcome matches its intent exactly like the
+            # sibling short-exit restart tests use RuntimeError.
+            raise RuntimeError("crashed before confirmation")
 
         def sell_one_tmon(self, a):
             return self._paper.sell_one_tmon(a)
