@@ -328,6 +328,13 @@ class C5Runtime:
         # an operation legitimately in flight in THIS process — any further
         # dispatch attempt is then a blind re-send and stays blocked.
         self._sell_dispatch_in_flight = False
+        # G-7: identity of the durable SELL-intent marker created by THIS
+        # process (per-process counter folded into ``created_at``).  A
+        # restarted process starts at 0, so it can never reproduce the
+        # exact marker content written by the previous process before a
+        # crash — the boundary fake uses this to tell the legitimate
+        # first dispatch apart from a blind re-send.
+        self._sell_intent_seq = 0
         # Stage 5A safety gate — parsed ONCE via src.runtime_config (the
         # single source of truth). Injected configs are used as-is; when
         # omitted the validated env snapshot is loaded here (no second
@@ -512,44 +519,35 @@ class C5Runtime:
             # terminal.  Exception (per spec): the marker belongs to the
             # candle THIS runtime's ledger already processed
             # (marker.candle_ts == last_processed_5m_ts) AND the outcome
-            # was recorded as non-terminal — a freeze flag
-            # (exit_unverified_until_reconcile / EXIT_UNVERIFIED_REASON
-            # failure reason) or an explicit "SELL_OUTCOME_UNVERIFIED"
-            # marker status.  The owning process burned that candle and
-            # its own _evaluate_exit guards (duplicate → freeze →
-            # pending) keep blocking every further dispatch, so the cycle
-            # may proceed to bootstrap/reconcile and reach the ordinary
-            # DUPLICATE_CANDLE classification for the same bar.  A FRESH
-            # process never carries our in-process dispatch flag, and any
-            # marker from a DIFFERENT candle remains fully blocked: no
-            # adapter call, no reconcile, no position re-baselining, no
-            # ENTRY, no blind re-send.  Only resolve_pending_sell_intent
-            # () clears it.  The flag NEVER replaces the durable marker.
-            unverified_outcome = bool(
-                state.get("exit_unverified_until_reconcile")
-                or state.get("exit_failure_reason") == EXIT_UNVERIFIED_REASON
-                or str(pending_marker.get("status"))
-                == "SELL_OUTCOME_UNVERIFIED")
+            # was recorded as non-terminal — an explicit
+            # "SELL_OUTCOME_UNVERIFIED" marker status written by the
+            # owning process right after dispatch.  The owning process
+            # burned that candle and its own _evaluate_exit guards
+            # (duplicate → freeze → pending) keep blocking every further
+            # dispatch, so the cycle may proceed to bootstrap/reconcile
+            # and reach the ordinary DUPLICATE_CANDLE classification for
+            # the same bar.  A FRESH process never carries our
+            # in-process dispatch flag, and any marker from a DIFFERENT
+            # candle remains fully blocked: no adapter call, no
+            # reconcile, no position re-baselining, no ENTRY, no blind
+            # re-send.  Only resolve_pending_sell_intent() clears the
+            # durable marker.  The flag NEVER replaces the marker.
+            #
+            # The G-5 freeze flags are deliberately NOT sufficient here:
+            # they do not prove WHICH candle the ambiguous SELL belongs
+            # to, and a freeze can be lifted later by an explicit
+            # operator confirmation — the still-present marker must then
+            # keep blocking the whole cycle (see the G-7 test battery).
             burned_by_ledger = str(pending_marker.get("candle_ts")) == \
                 str(state.get("last_processed_5m_ts"))
+            owns_burned_candle = False
             if self._sell_dispatch_in_flight:
+                # Mid-dispatch re-entry inside the owning process only;
+                # never set across cycles or restarts (cleared in the
+                # dispatch finally, initialised False in __init__).
                 owns_burned_candle = True
-            elif (burned_by_ledger
-                  and str(pending_marker.get("status"))
-                  == "SELL_OUTCOME_UNVERIFIED"):
-                # G-7: the marker itself records a NON-TERMINAL outcome
-                # of the SELL this ledger already burned.  The owning
-                # process's own _evaluate_exit guards (duplicate →
-                # freeze → pending) keep blocking every further
-                # dispatch, so the cycle may proceed to
-                # bootstrap/reconcile and reach the ordinary
-                # DUPLICATE_CANDLE / freeze classification for the same
-                # bar.  A FRESH process never carries our in-process
-                # dispatch flag; any marker from a DIFFERENT candle or
-                # an active-trading status (SELL_IN_FLIGHT) remains
-                # fully blocked here.  reconcile() never clears the
-                # durable marker (see its G-7 note), so no blind
-                # re-send is possible on this path either.
+            elif burned_by_ledger and str(pending_marker.get("status")) \
+                    == "SELL_OUTCOME_UNVERIFIED":
                 logger.error(
                     "PENDING_SELL_INTENT owned-by-this-process: unfinished"
                     " exit operation %s for already-burned candle %s —"
@@ -557,23 +555,6 @@ class C5Runtime:
                     " further SELL dispatch until explicit resolution",
                     pending_marker, pending_marker.get("candle_ts"))
                 owns_burned_candle = True
-            elif unverified_outcome and burned_by_ledger:
-                # G-7: the owning process proved its SELL non-terminal,
-                # burned this very candle and froze the position.  The
-                # cycle may proceed to bootstrap/reconcile; the durable
-                # marker stays authoritative on disk — reconcile never
-                # clears it (see reconcile() G-7 note) and _evaluate_exit
-                # re-blocks every dispatch while it survives, so no blind
-                # re-send is possible on this path either.
-                logger.error(
-                    "PENDING_SELL_INTENT owned-by-this-process: unfinished"
-                    " exit operation %s for already-burned candle %s —"
-                    " proceeding under the EXIT_UNVERIFIED freeze; NO"
-                    " further SELL dispatch until explicit resolution",
-                    pending_marker, pending_marker.get("candle_ts"))
-                owns_burned_candle = True
-            else:
-                owns_burned_candle = False
             if not owns_burned_candle:
                 logger.error(
                     "CYCLE_BLOCKED_PENDING_SELL_INTENT: unfinished SELL "
@@ -648,25 +629,21 @@ class C5Runtime:
         # Re-sending blindly could duplicate a live/filled order, so ALL
         # SELL dispatch is blocked until explicit operator resolution
         # (resolve_pending_sell_intent) or a proven-terminal result below
-        # clears it. The candle is burned exactly like the G-5/G-6 guards.
+        # clears it.  This guard is unconditional: even the very candle
+        # that created the marker may NOT be dispatched twice while the
+        # marker survives (a crash between dispatch and the terminal
+        # save must never allow a second send on the same bar).  The
+        # candle is burned exactly like the G-5/G-6 guards.
         pending = state.get("exit_pending_sell_intent")
         if isinstance(pending, dict):
-            # G-7: the candle that CREATED this marker is by definition
-            # already accounted for — the creating cycle burned it on a
-            # proven-terminal/frozen outcome (pre-guard ledger match) or
-            # left it unburned for a safe re-attempt after a confirmed
-            # rejection.  Only a marker from a DIFFERENT candle is an
-            # unfinished foreign operation; burn THIS candle too so no
-            # blind re-send can duplicate the possibly-live order.
-            if str(pending.get("candle_ts")) != str(ts):
-                logger.error(
-                    "SELL_INTENT_PENDING: unfinished exit operation %s found"
-                    " on disk; re-send BLOCKED until explicit operator"
-                    " resolution. Candle %s burned to prevent blind re-send.",
-                    pending, ts)
-                state["last_processed_5m_ts"] = ts
-                return c5_core.block_entry(_noop_decision(),
-                                           REASON_EXIT_UNVERIFIED)
+            logger.error(
+                "SELL_INTENT_PENDING: unfinished exit operation %s found"
+                " on disk; re-send BLOCKED until explicit operator"
+                " resolution. Candle %s burned to prevent blind re-send.",
+                pending, ts)
+            state["last_processed_5m_ts"] = ts
+            return c5_core.block_entry(_noop_decision(),
+                                       REASON_EXIT_UNVERIFIED)
 
         daily = self.fetch_daily_bars(now_msk)
         if len(daily) < max(c5_core.C5_EXIT_DONCHIAN,
@@ -723,6 +700,7 @@ class C5Runtime:
             # end of the cycle, so any later successful save also persists
             # (or clears) this marker — no orphan can survive a confirmed
             # terminal outcome while the final save succeeded.
+            self._sell_intent_seq += 1
             intent = {
                 "status": "SELL_IN_FLIGHT",
                 "side": "SELL",
@@ -731,7 +709,12 @@ class C5Runtime:
                 "direction": position.direction,
                 "candle_ts": ts,
                 "qty": qty,
-                "created_at": now_utc.isoformat(),
+                # G-7: per-process sequence number folded into the
+                # timestamp makes the marker content unique to THIS
+                # process's dispatch — a restarted runtime can never
+                # byte-for-byte reproduce a crashed predecessor's marker.
+                "created_at": "%s+seq%d" % (now_utc.isoformat(),
+                                            self._sell_intent_seq),
             }
             state["exit_pending_sell_intent"] = intent
             # G-7: this process IS the one that just persisted the marker

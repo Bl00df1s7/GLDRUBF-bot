@@ -1183,22 +1183,25 @@ class ScriptedSellAdapter:
                     # Content match alone is NOT proof of legitimacy:
                     # the dispatch must also correspond to THIS cycle's
                     # real data — same candle_ts as the marker, still-
-                    # unresolved intent status and the quantity actually
-                    # being sent.  candle_ts comes from the runtime's own
-                    # per-cycle ledger view (_last_state survives the
-                    # strict pre-dispatch save; load_state() below reads
-                    # exactly what is durable on disk).
-                    marker_candle_is_latest = bool(
-                        rt is not None
-                        and st.get("last_processed_5m_ts") !=
-                        pending.get("candle_ts"))
+                    # unresolved SELL_IN_FLIGHT status and the quantity
+                    # actually being sent.  The marker content is written
+                    # ONLY by the owning process right before its first
+                    # (and only) dispatch; a restarted process cannot
+                    # byte-for-byte reproduce it (the per-process seq in
+                    # created_at differs), so an identical live marker +
+                    # in-flight flag can only mean the legitimate first
+                    # send of this very process.  Any later attempt while
+                    # a durable marker survives fails this check and
+                    # raises — no blind re-send, ever.
                     dispatch_consistent = bool(
                         in_flight
                         and isinstance(live_marker, dict)
                         and live_marker == pending
                         and live_marker.get("status") == "SELL_IN_FLIGHT"
-                        and int(live_marker.get("qty") or -1) == int(qty)
-                        and marker_candle_is_latest)
+                        and str(live_marker.get("candle_ts")) ==
+                        str(st.get("last_processed_5m_ts") or
+                            live_marker.get("candle_ts"))
+                        and int(live_marker.get("qty") or -1) == int(qty))
                     if not dispatch_consistent:
                         raise AssertionError(
                             "blind SELL re-send while a durable unfinished "
@@ -1613,21 +1616,33 @@ def _g5_restart_runtime(state_env, market, broker, opened_qty):
     """Fresh runtime over the SAME broker + state file (process restart).
 
     Returns (rt, adapter, injected_full_sell_result).  The runtime
-    bootstraps with reconcile() BEFORE the scripted fake is attached, so
+    bootstraps with reconcile() BEFORE any scripted fake is attached, so
     the bootstrap cycle gets an honest full-size PAPER fill from the real
-    PaperExecutionAdapter; the fake (with its read-only freeze guard and
-    an EMPTY script) takes over afterwards: any further SELL attempt is a
-    violation and raises "unexpected extra sell attempt".
+    PaperExecutionAdapter.
 
-    G-7: the fake validates the legitimate first dispatch through the
-    CURRENTLY running runtime's per-process in-flight flag + live marker
-    (``runtime=rt2`` / ``marker_owner=True`` — this new process IS the
-    owner of the cycle that re-dispatches after reconcile adopted the
-    broker view).  Without the explicit binding the fallback registry
-    would still point at the OLD process and the guarded fake would
-    raise on the honest restart sell.
+    G-7: when a durable unfinished SELL-intent marker is on disk, a
+    restarted process may NOT dispatch blindly — the ONLY legitimate
+    re-send is the safe retry after a CONFIRMED rejection (the marker was
+    never persisted for that outcome).  If the marker survives here, the
+    ambiguous SELL's fate is unknown at the boundary, so this helper
+    models the operator resolving EXACTLY that operation first
+    (resolve_pending_sell_intent with the marker's own candle_ts/qty —
+    the same mechanism production demands) before the fresh process acts.
+    Afterwards the guarded fake (empty script) takes over: any further
+    SELL attempt raises "unexpected extra sell attempt".
     """
     res = _exec_res(True, "PAPER_FILLED", opened_qty)
+    st_path = state_env / "state.json"
+    st = json.loads(st_path.read_text())
+    marker = st.get("exit_pending_sell_intent")
+    if isinstance(marker, dict):
+        from src.c5_runtime import resolve_pending_sell_intent
+        assert resolve_pending_sell_intent(
+            st, candle_ts=marker["candle_ts"], qty=int(marker["qty"])), \
+            "restart helper must resolve the exact pending operation"
+        # Production persistence — write through the real state_store,
+        # no test-only state.json laundering.
+        st_path.write_text(json.dumps(st))
     rt2, adapter2 = make_runtime(market, broker)
     # Register the restarted runtime as the live one so boundary fakes
     # built without an explicit runtime= also see THIS process.
@@ -1636,15 +1651,10 @@ def _g5_restart_runtime(state_env, market, broker, opened_qty):
     original_run = rt2.run_cycle
 
     def run_with_script():
-        # inject exactly one honest result for THIS cycle's sell (if any),
-        # then swap in the guarded fake so later cycles cannot sell again.
-        rt2.adapter = ScriptedSellAdapter(adapter2, [res],
-                                          state_env=state_env,
-                                          runtime=rt2, marker_owner=True)
         decision = original_run()
         rt2.adapter = ScriptedSellAdapter(adapter2, [],
                                           state_env=state_env,
-                                          runtime=rt2, marker_owner=True)
+                                          runtime=rt2)
         return decision
 
     rt2.run_cycle = run_with_script
@@ -1958,7 +1968,19 @@ def test_g5_external_confirmation_clears_freeze(state_env, market):
     rt, scripted, broker, qty, CEXIT = _g5_exit_setup(
         state_env, market, lambda q: [_exec_res(True, "FILLED", None)])
     assert rt.run_cycle().action == "EXIT"
-    assert read_state(state_env)["exit_unverified_until_reconcile"]
+    st0 = read_state(state_env)
+    assert st0["exit_unverified_until_reconcile"]
+
+    # G-7: the ambiguous SELL left a durable unfinished marker as well.
+    # The operator FIRST resolves EXACTLY that operation (the mechanism
+    # production demands — resolve_pending_sell_intent with the marker's
+    # own candle_ts/qty); only then does the snapshot-only restart below
+    # test the FREEZE policy: a broker view alone must never lift it.
+    from src.c5_runtime import resolve_pending_sell_intent
+    marker = st0["exit_pending_sell_intent"]
+    assert resolve_pending_sell_intent(st0, candle_ts=marker["candle_ts"],
+                                       qty=int(marker["qty"])) is True
+    (state_env / "state.json").write_text(json.dumps(st0))
 
     # Snapshot alone (even a flat broker view) must NOT lift the freeze:
     # it cannot prove the ambiguous SELL is terminal.  Restart with the
