@@ -1062,6 +1062,22 @@ def test_g1_entry_still_fail_closed_when_margin_api_unavailable(state_env, marke
 # (ExecutionResult semantics identical to LiveExecutionAdapter
 # ._post_market_order); production LIVE order mechanics are untouched.
 # ══════════════════════════════════════════════════════════════════════
+# Registry of the currently-live scripted runtimes.  Appended by
+# open_long_via_production; replaced by restart scenarios before the
+# guarded cycle runs.  Serves as the ScriptedSellAdapter fallback for the
+# G-7 boundary check so every exit path in the suite is guarded without
+# touching ~20 constructor call sites.
+_LIVE_RUNTIMES = []
+
+
+@pytest.fixture(autouse=True)
+def _reset_live_runtimes():
+    # keep the G-7 boundary-check registry scoped to one test
+    _LIVE_RUNTIMES.clear()
+    yield
+    _LIVE_RUNTIMES.clear()
+
+
 class ScriptedSellAdapter:
     """Boundary fake implementing the BaseExecutionAdapter contract.
 
@@ -1071,9 +1087,19 @@ class ScriptedSellAdapter:
     ExecutionResults of the LIVE adapter.
     """
 
-    def __init__(self, paper_adapter, sell_results, state_env=None):
+    def __init__(self, paper_adapter, sell_results, state_env=None,
+                 runtime=None, marker_owner=False):
         self._paper = paper_adapter
         self._sell_results = list(sell_results)
+        # G-7: when True, this fake represents the broker side of the SAME
+        # process that created the durable SELL-intent marker (the restart
+        # helpers build the new runtime first and attach the fake to it
+        # afterwards).  The legitimate first dispatch is then proven by
+        # the per-process in-flight flag + live in-memory marker of the
+        # CURRENTLY running runtime (registry fallback below), exactly as
+        # in the production flow.  A blind re-send after a crash/failed
+        # final save NEVER sets the in-process flag, so it still raises.
+        self._marker_owner = marker_owner
         # NOTE: state_env is intentionally NOT used any more.  The
         # production state_store persists the G-5 freeze flag via
         # C5_STATE_DEFAULTS ("exit_unverified_until_reconcile"), so the
@@ -1081,13 +1107,31 @@ class ScriptedSellAdapter:
         # and masked nothing — it has been removed (see task: verify
         # production persistence without fake assistance).
         self._state_env = state_env
+        # live C5Runtime whose per-cycle state dict is identity-checked
+        # in sell_cny (G-7 boundary invariant, see there).  When the
+        # test does not pass runtime= explicitly, fall back to the
+        # single live runtime installed by the shared helper
+        # open_long_via_production (every exit scenario starts from it;
+        # restart scenarios replace this registry entry with the new
+        # runtime instance BEFORE running the guarded cycle).
+        if runtime is None:
+            runtime = _LIVE_RUNTIMES[-1] if _LIVE_RUNTIMES else None
+        self._rt = runtime
         self.sell_calls = []
         self.orders = []
+        # G-7: observable from the very first moment (the pre-guard may
+        # block a cycle BEFORE bootstrap, so snapshot() is never called
+        # and the attribute must still exist for assertions).
+        self.snapshot_calls = []
 
     def find_account(self):
         return self._paper.find_account()
 
     def snapshot(self, account_id):
+        calls = getattr(self, "snapshot_calls", None)
+        if calls is None:
+            calls = self.snapshot_calls = []
+        calls.append(account_id)
         return self._paper.snapshot(account_id)
 
     def buy_cny(self, account_id, qty, **kwargs):
@@ -1114,6 +1158,55 @@ class ScriptedSellAdapter:
                     raise AssertionError(
                         "blind SELL re-send while EXIT_UNVERIFIED freeze "
                         "is active (G-5 fail-closed violated)")
+                # G-7 boundary invariant: a durable unfinished SELL-intent
+                # marker must block EVERY further sell dispatch — but the
+                # FIRST dispatch of the cycle that just WROTE this very
+                # marker before sending is exactly what G-7 requires.
+                # The runtime sets the per-process flag
+                # _sell_dispatch_in_flight=True right before handing the
+                # SELL to the adapter (src/c5_runtime.py) and clears it on
+                # every proven-terminal outcome; a brand-new process (a
+                # restarted runtime) always starts with the flag False, so
+                # ANY sell attempted by it while a marker is on disk is a
+                # blind re-send and must raise here.  Comparing the marker
+                # CONTENT (not object identity) keeps the check robust
+                # across JSON round-trips through load_state()/save_state.
+                pending = st.get("exit_pending_sell_intent")
+                if isinstance(pending, dict):
+                    rt = getattr(self, "_rt", None)
+                    in_flight = bool(getattr(rt, "_sell_dispatch_in_flight",
+                                             False))
+                    live_marker = (
+                        getattr(rt, "_last_state", {}).get(
+                            "exit_pending_sell_intent")
+                        if rt is not None else None)
+                    # Content match alone is NOT proof of legitimacy:
+                    # the dispatch must also correspond to THIS cycle's
+                    # real data — same candle_ts as the marker, still-
+                    # unresolved SELL_IN_FLIGHT status and the quantity
+                    # actually being sent.  The marker content is written
+                    # ONLY by the owning process right before its first
+                    # (and only) dispatch; a restarted process cannot
+                    # byte-for-byte reproduce it (the per-process seq in
+                    # created_at differs), so an identical live marker +
+                    # in-flight flag can only mean the legitimate first
+                    # send of this very process.  Any later attempt while
+                    # a durable marker survives fails this check and
+                    # raises — no blind re-send, ever.
+                    dispatch_consistent = bool(
+                        in_flight
+                        and isinstance(live_marker, dict)
+                        and live_marker == pending
+                        and live_marker.get("status") == "SELL_IN_FLIGHT"
+                        and str(live_marker.get("candle_ts")) ==
+                        str(st.get("last_processed_5m_ts") or
+                            live_marker.get("candle_ts"))
+                        and int(live_marker.get("qty") or -1) == int(qty))
+                    if not dispatch_consistent:
+                        raise AssertionError(
+                            "blind SELL re-send while a durable unfinished "
+                            "SELL-intent marker is on disk (G-7 fail-closed "
+                            "violated)")
         self.orders.append({"instrument": "CNYRUBF", "side": "SELL",
                             "qty": qty})
         if not self._sell_results:
@@ -1206,6 +1299,9 @@ def make_scripted_runtime(market, broker, sell_results):
                           config=TradingConfig("PAPER", True),
                           now_fn=lambda: market.holder["now"])
     rt.instrument = FakeInstrument()
+    # G-7 boundary-check fallback: this is the single live scripted
+    # runtime for the scenario built by the shared helpers.
+    _LIVE_RUNTIMES.append(rt)
     return rt, adapter
 
 
@@ -1504,7 +1600,7 @@ def _g5_exit_setup(state_env, market, sell_results_fn=None):
     rt, adapter, broker, qty = open_long_via_production(state_env, market)
     sell_results = sell_results_fn(qty) if sell_results_fn else []
     scripted = ScriptedSellAdapter(adapter._paper, sell_results,
-                                   state_env=state_env)
+                                   state_env=state_env, runtime=rt)
     rt.adapter = scripted
     # A2 fix: ADD the EXIT candle to the existing rows instead of
     # replacing them.  The entry candle C16 (16:00) stays in place —
@@ -1520,24 +1616,45 @@ def _g5_restart_runtime(state_env, market, broker, opened_qty):
     """Fresh runtime over the SAME broker + state file (process restart).
 
     Returns (rt, adapter, injected_full_sell_result).  The runtime
-    bootstraps with reconcile() BEFORE the scripted fake is attached, so
+    bootstraps with reconcile() BEFORE any scripted fake is attached, so
     the bootstrap cycle gets an honest full-size PAPER fill from the real
-    PaperExecutionAdapter; the fake (with its read-only freeze guard and
-    an EMPTY script) takes over afterwards: any further SELL attempt is a
-    violation and raises "unexpected extra sell attempt".
+    PaperExecutionAdapter.
+
+    G-7: when a durable unfinished SELL-intent marker is on disk, a
+    restarted process may NOT dispatch blindly — the ONLY legitimate
+    re-send is the safe retry after a CONFIRMED rejection (the marker was
+    never persisted for that outcome).  If the marker survives here, the
+    ambiguous SELL's fate is unknown at the boundary, so this helper
+    models the operator resolving EXACTLY that operation first
+    (resolve_pending_sell_intent with the marker's own candle_ts/qty —
+    the same mechanism production demands) before the fresh process acts.
+    Afterwards the guarded fake (empty script) takes over: any further
+    SELL attempt raises "unexpected extra sell attempt".
     """
     res = _exec_res(True, "PAPER_FILLED", opened_qty)
+    st_path = state_env / "state.json"
+    st = json.loads(st_path.read_text())
+    marker = st.get("exit_pending_sell_intent")
+    if isinstance(marker, dict):
+        from src.c5_runtime import resolve_pending_sell_intent
+        assert resolve_pending_sell_intent(
+            st, candle_ts=marker["candle_ts"], qty=int(marker["qty"])), \
+            "restart helper must resolve the exact pending operation"
+        # Production persistence — write through the real state_store,
+        # no test-only state.json laundering.
+        st_path.write_text(json.dumps(st))
     rt2, adapter2 = make_runtime(market, broker)
+    # Register the restarted runtime as the live one so boundary fakes
+    # built without an explicit runtime= also see THIS process.
+    if _LIVE_RUNTIMES:
+        _LIVE_RUNTIMES[-1] = rt2
     original_run = rt2.run_cycle
 
     def run_with_script():
-        # inject exactly one honest result for THIS cycle's sell (if any),
-        # then swap in the guarded fake so later cycles cannot sell again.
-        rt2.adapter = ScriptedSellAdapter(adapter2, [res],
-                                          state_env=state_env)
         decision = original_run()
         rt2.adapter = ScriptedSellAdapter(adapter2, [],
-                                          state_env=state_env)
+                                          state_env=state_env,
+                                          runtime=rt2)
         return decision
 
     rt2.run_cycle = run_with_script
@@ -1851,15 +1968,30 @@ def test_g5_external_confirmation_clears_freeze(state_env, market):
     rt, scripted, broker, qty, CEXIT = _g5_exit_setup(
         state_env, market, lambda q: [_exec_res(True, "FILLED", None)])
     assert rt.run_cycle().action == "EXIT"
-    assert read_state(state_env)["exit_unverified_until_reconcile"]
+    st0 = read_state(state_env)
+    assert st0["exit_unverified_until_reconcile"]
+
+    # G-7: the ambiguous SELL left a durable unfinished marker as well.
+    # The operator FIRST resolves EXACTLY that operation (the mechanism
+    # production demands — resolve_pending_sell_intent with the marker's
+    # own candle_ts/qty); only then does the snapshot-only restart below
+    # test the FREEZE policy: a broker view alone must never lift it.
+    from src.c5_runtime import resolve_pending_sell_intent
+    marker = st0["exit_pending_sell_intent"]
+    assert resolve_pending_sell_intent(st0, candle_ts=marker["candle_ts"],
+                                       qty=int(marker["qty"])) is True
+    (state_env / "state.json").write_text(json.dumps(st0))
 
     # Snapshot alone (even a flat broker view) must NOT lift the freeze:
     # it cannot prove the ambiguous SELL is terminal.  Restart with the
     # broker showing qty==0 — reconcile keeps the freeze (fail closed).
     broker.position_qty = 0
     rt2, adapter2 = make_runtime(market, broker)
-    scripted2 = ScriptedSellAdapter(adapter2, [], state_env=state_env)
+    scripted2 = ScriptedSellAdapter(adapter2, [], state_env=state_env,
+                                    runtime=rt2)
     rt2.adapter = scripted2
+    if _LIVE_RUNTIMES:
+        _LIVE_RUNTIMES[-1] = rt2
     CNEUTRAL = candle_5m(CONTROL_DAY, 17, 0, NEUTRAL)
     set_candles(market, CNEUTRAL)
     market.holder["now"] = utc_ms(CONTROL_DAY, 17, 5)
@@ -1884,8 +2016,11 @@ def test_g5_external_confirmation_clears_freeze(state_env, market):
     st["broker_position_confirmed"] = 0
     st_path.write_text(json.dumps(st))
     rt3, adapter3 = make_runtime(market, broker)
-    scripted3 = ScriptedSellAdapter(adapter3, [], state_env=state_env)
+    scripted3 = ScriptedSellAdapter(adapter3, [], state_env=state_env,
+                                    runtime=rt3)
     rt3.adapter = scripted3
+    if _LIVE_RUNTIMES:
+        _LIVE_RUNTIMES[-1] = rt3
     CNEUTRAL2 = candle_5m(CONTROL_DAY, 17, 10, NEUTRAL)
     set_candles(market, CNEUTRAL2)                  # no fresh break signal
     market.holder["now"] = utc_ms(CONTROL_DAY, 17, 15)
@@ -1914,8 +2049,11 @@ def test_g5_unverified_freeze_survives_process_restart(state_env, market):
     # Brand-new runtime instance over the SAME state file = restart.
     # Guarded empty script: ANY sell attempt raises immediately.
     rt2, adapter2 = make_runtime(market, broker)
-    scripted2 = ScriptedSellAdapter(adapter2, [], state_env=state_env)
+    scripted2 = ScriptedSellAdapter(adapter2, [], state_env=state_env,
+                                    runtime=rt2)
     rt2.adapter = scripted2
+    if _LIVE_RUNTIMES:
+        _LIVE_RUNTIMES[-1] = rt2
     CEXIT2 = candle_5m(CONTROL_DAY, 17, 0, SHORT_BREAK)
     set_candles(market, CEXIT2)                     # valid EXIT signal again
     market.holder["now"] = utc_ms(CONTROL_DAY, 17, 5)
@@ -2019,6 +2157,7 @@ class _SellRaisingAdapter:
 def _g6_exit_setup_with_raiser(state_env, market):
     rt, scripted, broker, qty, CEXIT = _g5_exit_setup(state_env, market)
     raising = _SellRaisingAdapter(scripted._paper)
+    raising._rt = rt          # G-7 boundary-check wiring (see fake)
     rt.adapter = raising
     return rt, raising, broker, qty, CEXIT
 
@@ -2084,8 +2223,11 @@ def test_g6_restart_after_exception_blocks_resend(state_env, market):
     # Brand-new runtime over the SAME state file = process restart.
     # Guarded empty script: ANY sell attempt raises AssertionError.
     rt2, adapter2 = make_runtime(market, broker)
-    scripted2 = ScriptedSellAdapter(adapter2, [], state_env=state_env)
+    scripted2 = ScriptedSellAdapter(adapter2, [], state_env=state_env,
+                                    runtime=rt2)
     rt2.adapter = scripted2
+    if _LIVE_RUNTIMES:
+        _LIVE_RUNTIMES[-1] = rt2
     CEXIT2 = candle_5m(CONTROL_DAY, 17, 0, SHORT_BREAK)
     set_candles(market, CEXIT2)              # свежий валидный EXIT-сигнал
     market.holder["now"] = utc_ms(CONTROL_DAY, 17, 5)
@@ -2139,3 +2281,370 @@ def test_g6_classify_contract_unchanged_for_full_partial_zero(state_env):
     assert cls(_exec_res(True, "FILLED", 1), 2) == ("PARTIAL", 1)
     assert cls(_exec_res(True, "FILLED", 0), 2) == ("ZERO_FILL", 0)
     assert cls(_exec_res(True, "FILLED", None), 2) == ("UNVERIFIED", 0)
+
+
+# ══════════════════════════════════════════════════════════════════════
+# G-7 — Durable SELL intent: состояние переживает сбой записи
+# ══════════════════════════════════════════════════════════════════════
+
+def _g7_fail_save_on_predicate(predicate):
+    """Patch state_store's atomic writer to raise IOError while the
+    predicate matches the payload being saved (simulates a disk failure
+    at exactly the pre-save or the final save)."""
+    import src.state_store as ss
+    original = ss._atomic_write_state
+
+    def flaky(state):
+        if predicate(state):
+            raise IOError("simulated disk failure")
+        return original(state)
+
+    return ss, original, flaky
+
+
+def _g7_full_result_from_disk(state_env):
+    """Read the persisted marker after a cycle (None when absent)."""
+    st = read_state(state_env)
+    return st.get("exit_pending_sell_intent")
+
+
+# ── unit G-7.0: save_state_strict бросает StateSaveError; save_state — best-effort
+def test_g7_save_state_strict_raises_and_best_effort_survives(tmp_path,
+                                                              monkeypatch):
+    import src.state_store as ss
+    path = str(tmp_path / "state.json")
+    monkeypatch.setenv("C5_STATE_FILE", path)
+
+    ss.save_state({"v": 1})                       # best-effort ok
+    assert json.loads(open(path).read())["v"] == 1
+    ss.save_state_strict({"v": 2})                # strict ok
+    assert json.loads(open(path).read())["v"] == 2
+
+    # Simulated hard failure at the temp-file creation step: BOTH writers
+    # must leave the previous valid state byte-identical and no leftovers.
+    real_open = ss.os.open
+
+    def boom(*a, **k):
+        raise OSError(28, "simulated ENOSPC")
+
+    monkeypatch.setattr(ss.os, "open", boom)
+    with pytest.raises(ss.StateSaveError):
+        ss.save_state_strict({"v": 3})
+    ss.save_state({"v": 3})                       # best-effort: prints, no raise
+    monkeypatch.setattr(ss.os, "open", real_open)
+
+    assert json.loads(open(path).read()) == {"v": 2}   # NOT destroyed
+    leftovers = [p for p in tmp_path.iterdir() if ".tmp." in p.name]
+    assert leftovers == []                        # temp cleaned up
+
+
+# ── unit G-7.0b: сбой ДО os.replace не трогает предыдущий валидный JSON
+def test_g7_atomic_write_failure_preserves_previous_state(tmp_path,
+                                                          monkeypatch):
+    import src.state_store as ss
+    path = str(tmp_path / "state.json")
+    monkeypatch.setenv("C5_STATE_FILE", path)
+    ss.save_state_strict({"generation": 1})
+
+    real_replace = ss.os.replace
+
+    def boom(src_, dst_):
+        raise OSError("simulated replace failure")
+
+    monkeypatch.setattr(ss.os, "replace", boom)
+    with pytest.raises(ss.StateSaveError):
+        ss.save_state_strict({"generation": 2})
+    monkeypatch.setattr(ss.os, "replace", real_replace)
+
+    assert json.loads(open(path).read()) == {"generation": 1}
+    leftovers = [p for p in tmp_path.iterdir() if ".tmp." in p.name]
+    assert leftovers == []                        # temp cleaned up
+
+
+# ── E2E G-7.1: сбой ПРЕДВАРИТЕЛЬНОЙ записи → sell_cny НЕ вызван ───────
+def test_g7_pre_save_failure_blocks_sell_dispatch(state_env, market):
+    rt, scripted, broker, qty, CEXIT = _g5_exit_setup(state_env, market)
+
+    def fails_on_marker(st):
+        return isinstance(st.get("exit_pending_sell_intent"), dict)
+
+    ss, original, flaky = _g7_fail_save_on_predicate(fails_on_marker)
+    orig = ss._atomic_write_state
+    ss._atomic_write_state = flaky
+    try:
+        d = rt.run_cycle()
+    finally:
+        ss._atomic_write_state = orig
+
+    assert d.action == "NO_ENTRY"
+    assert d.reason == "SELL_INTENT_PERSIST_FAILED"
+    assert scripted.sell_calls == []              # broker NEVER saw SELL
+    assert broker.position_qty == qty             # position untouched
+    st = read_state(state_env)
+    # candle NOT burned (order provably never left the process),
+    # no marker leaked to disk, previous state intact:
+    assert st.get("last_processed_5m_ts") != CEXIT["time"].isoformat() \
+        or st.get("last_processed_5m_ts") is None
+    assert not st.get("exit_pending_sell_intent")
+    assert st["c5_position_qty"] == qty
+
+    # next cycle with a healthy disk retries the persist-and-send atom
+    full = _exec_res(True, "FILLED", qty)
+    scripted._sell_results = [full]
+    d2 = rt.run_cycle()
+    assert d2.action == "EXIT"
+    assert scripted.sell_calls == [qty]
+
+
+# ── E2E G-7.2: пред-сохранение OK, SELL бросает ИСКЛЮЧЕНИЕ, финальная
+#              запись падает → после рестарта повторного SELL нет ──────
+def test_g7_sell_exception_with_final_save_failure_no_resend_after_restart(
+        state_env, market):
+    rt, raising, broker, qty, CEXIT = _g6_exit_setup_with_raiser(
+        state_env, market)
+
+    # Pre-save succeeds (no marker in payload yet); EVERY save that
+    # already contains the EXIT_UNVERIFIED freeze (the final post-cycle
+    # save AND our strict finalize) FAILS — worst-case durability storm.
+    def fails_on_freeze(st):
+        return bool(st.get("exit_unverified_until_reconcile"))
+
+    ss, original, flaky = _g7_fail_save_on_predicate(fails_on_freeze)
+    orig = ss._atomic_write_state
+    ss._atomic_write_state = flaky
+    try:
+        d = rt.run_cycle()                        # no crash escapes
+        d2 = rt.run_cycle()                       # retry cycle too
+    finally:
+        ss._atomic_write_state = orig
+
+    assert d.reason == "EXIT_UNVERIFIED_PENDING_RECONCILE"
+    assert raising.sell_calls == [qty]            # exactly ONE dispatch
+    # The pre-dispatch marker WAS durably on disk before sell_cny ran;
+    # every later write failed, so the LAST successful version still
+    # carries it — and crucially it can only be interpreted alongside...
+    st = read_state(state_env)
+    assert st["exit_pending_sell_intent"]["qty"] == qty
+    assert st["exit_pending_sell_intent"]["candle_ts"] == \
+        CEXIT["time"].isoformat()
+
+    # Restart: brand-new runtime over the same state file + guarded fake.
+    rt2, adapter2 = make_runtime(market, broker)
+    scripted2 = ScriptedSellAdapter(adapter2, [], state_env=state_env,
+                                    runtime=rt2)
+    rt2.adapter = scripted2
+    if _LIVE_RUNTIMES:
+        _LIVE_RUNTIMES[-1] = rt2
+    CEXIT2 = candle_5m(CONTROL_DAY, 17, 0, SHORT_BREAK)
+    set_candles(market, CEXIT2)
+    market.holder["now"] = utc_ms(CONTROL_DAY, 17, 5)
+    d3 = rt2.run_cycle()
+    assert d3.action == "NO_ENTRY"
+    assert d3.reason == "EXIT_UNVERIFIED_PENDING_RECONCILE"
+    assert scripted2.sell_calls == []             # NO blind re-send
+    # position still fully open, nothing invented:
+    assert read_state(state_env)["c5_position_qty"] == qty
+
+
+# ── E2E G-7.3: подтверждённый FULL, но финальная запись падает →
+#              незавершённый маркер остаётся на диске, повторной отправки нет
+def test_g7_confirmed_full_with_final_save_failure_keeps_marker(state_env,
+                                                                market):
+    rt, scripted, broker, qty, CEXIT = _g5_exit_setup(
+        state_env, market,
+        lambda q: [_exec_res(True, "FILLED", q)])
+
+    ss, original = _g7_fail_save_on_predicate(None)[0:2]
+    orig = ss._atomic_write_state
+    # Exactly ONE successful write is allowed: the pre-dispatch strict
+    # save that persists the marker. EVERY later write (finalize retry
+    # chain AND run_cycle's best-effort save) fails — durability storm
+    # after the order was already handed to the adapter.
+    calls = {"n": 0}
+
+    def flaky_counted(st):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return original(st)                   # pre-save succeeds
+        raise IOError("simulated disk failure on final save")
+
+    ss._atomic_write_state = flaky_counted
+    try:
+        d = rt.run_cycle()
+    finally:
+        ss._atomic_write_state = orig
+
+    assert d.action == "EXIT"                     # confirmed FULL fill
+    assert scripted.sell_calls == [qty]
+    st = read_state(state_env)
+    # final state could NOT be persisted → the durable UNFINISHED marker
+    # from the successful pre-save REMAINS on disk:
+    assert st["exit_pending_sell_intent"]["status"] == "SELL_IN_FLIGHT"
+    assert st["exit_pending_sell_intent"]["qty"] == qty
+    assert st["c5_position_qty"] == qty           # stale on disk but SAFE:
+    #                                               no silent success claim
+
+    # Restart over the SAME state file. The FULL fill really executed at
+    # the broker (SimulatedBroker went flat through the scripted mirror),
+    # only OUR PERSISTENCE failed.  G-7 fail-closed recovery: the durable
+    # unfinished marker found on disk blocks the WHOLE cycle before any
+    # adapter/bootstrap/position evaluation — no SELL, no BUY, and NOT
+    # even a reconcile snapshot could launder the stale stored size into
+    # a fresh ENTRY on top of an unknown residual.  The decisive
+    # assertions: the guarded fake raises on ANY sell attempt and NO SELL
+    # ever reaches it again; the marker and the stale position fields
+    # stay untouched on disk until an explicit operator resolution
+    # (resolve_pending_sell_intent) clears exactly this operation.
+    rt2, adapter2 = make_runtime(market, broker)
+    scripted2 = ScriptedSellAdapter(adapter2, [], state_env=state_env,
+                                    runtime=rt2)
+    rt2.adapter = scripted2
+    if _LIVE_RUNTIMES:
+        _LIVE_RUNTIMES[-1] = rt2
+    CEXIT2 = candle_5m(CONTROL_DAY, 17, 0, SHORT_BREAK)
+    market.holder["rows"].append(CEXIT2)
+    market.holder["now"] = utc_ms(CONTROL_DAY, 17, 5)
+    d2 = rt2.run_cycle()
+    assert scripted2.sell_calls == []             # NO blind re-send, ever
+    st2 = read_state(state_env)
+    # G-7 fail-closed restart: the durable unfinished marker found on
+    # disk blocks the whole cycle BEFORE bootstrap/reconcile, so nothing
+    # is adopted or invented — the ambiguous operation stays durably
+    # marked UNFINISHED and the position fields remain as they were on
+    # the last successful write until an explicit operator resolution
+    # (resolve_pending_sell_intent) clears exactly this operation.
+    assert d2.action == "NO_ENTRY"
+    assert d2.reason == "EXIT_UNVERIFIED_PENDING_RECONCILE"
+    assert st2["exit_pending_sell_intent"]["status"] == "SELL_IN_FLIGHT"
+    assert st2["c5_position_qty"] == qty          # stale but SAFE: block
+    # reconcile never even ran for the blocked cycle (the guard precedes
+    # self.bootstrap in run_cycle):
+    assert scripted2.snapshot_calls == []
+
+    # Explicit operator resolution of THIS marker is what finally lets
+    # normal operation resume: reconcile adopts the broker truth (flat)
+    # and the next cycle proceeds without touching the guarded fake.
+    from src.c5_runtime import resolve_pending_sell_intent
+    marker2 = st2["exit_pending_sell_intent"]
+    st3 = read_state(state_env)
+    assert resolve_pending_sell_intent(
+        st3, candle_ts=marker2["candle_ts"], qty=qty) is True
+    (state_env / "state.json").write_text(json.dumps(st3))
+    rt3, adapter3 = make_runtime(market, broker)
+    snap3 = rt3.bootstrap(read_state(state_env))
+    assert snap3 is not None and int(snap3.position_qty) == 0
+
+
+# ── unit G-7.4: snapshot/сверка НЕ снимают маркер автоматически ───────
+def test_g7_pending_marker_survives_reconcile_needs_explicit_resolution(
+        state_env, market):
+    from src.c5_runtime import reconcile, resolve_pending_sell_intent
+
+    marker = {"status": "SELL_IN_FLIGHT", "side": "SELL",
+              "direction": "LONG", "candle_ts": "2026-10-13T10:00:00+00:00",
+              "qty": 2}
+    st = read_state(state_env) if (state_env / "state.json").exists() else {}
+    st.update({"c5_position_qty": 2, "c5_position_direction": "LONG",
+               "c5_entry_price": 0.09, "reconcile_status": None,
+               "exit_pending_sell_intent": marker})
+    (state_env / "state.json").write_text(json.dumps(st))
+
+    # Any broker view — matching qty, zero, whatever — keeps the marker.
+    for view in (2, 0, 1):
+        st = read_state(state_env)
+        reconcile(_SnapAdapter(view), "a1", st)
+        assert st["exit_pending_sell_intent"] == marker   # NOT cleared
+
+    # Wrong candle/ts or qty cannot clear it (no implicit/partial match).
+    st = read_state(state_env)
+    assert resolve_pending_sell_intent(st, candle_ts="other", qty=2) is False
+    assert resolve_pending_sell_intent(st, candle_ts=marker["candle_ts"],
+                                       qty=99) is False
+    assert st["exit_pending_sell_intent"] == marker
+    # Only the EXACT explicit operator resolution clears it.
+    assert resolve_pending_sell_intent(st, candle_ts=marker["candle_ts"],
+                                       qty=2) is True
+    assert "exit_pending_sell_intent" not in st
+
+
+# ── E2E G-7.5: подтверждённый REJECTED/CANCELLED — контракт G-4 цел ────
+@pytest.mark.parametrize("res_factory,name",
+                         [(_rejected_result, "REJECTED"),
+                          (_cancelled_result, "CANCELLED")],
+                         ids=["rejected", "cancelled"])
+def test_g7_confirmed_rejection_still_allows_safe_retry(state_env, market,
+                                                        res_factory, name):
+    rt, scripted, broker, qty, CEXIT = _g5_exit_setup(
+        state_env, market, lambda q: [res_factory()])
+
+    d = rt.run_cycle()
+    # existing G-4 contract: the runtime returns the core EXIT decision;
+    # the safety lives in STATE (candle unburned, marker resolved).
+    assert d.action == "EXIT"
+    assert scripted.sell_calls == [qty]
+    st = read_state(state_env)
+    # G-4: candle NOT burned, position intact, safe re-attempt allowed...
+    assert st.get("last_processed_5m_ts") != CEXIT["time"].isoformat()
+    assert st["c5_position_qty"] == qty
+    # ...and the resolved intent marker is NOT left dangling on disk.
+    assert not st.get("exit_pending_sell_intent")
+
+    # retry on a NEW exit candle now succeeds (fresh signal, same as the
+    # existing G-4 re-attempt tests — rejected orders never burn candles)
+    CEXIT2 = candle_5m(CONTROL_DAY, 17, 0, SHORT_BREAK)
+    market.holder["rows"].append(CEXIT2)
+    market.holder["now"] = utc_ms(CONTROL_DAY, 17, 5)
+    scripted._sell_results = [_exec_res(True, "FILLED", qty)]
+    d2 = rt.run_cycle()
+    assert d2.action == "EXIT"
+    assert scripted.sell_calls == [qty, qty]
+    st2 = read_state(state_env)
+    assert st2["c5_position_qty"] == 0
+    assert not st2.get("exit_pending_sell_intent")
+
+
+# ── unit G-7.6: классификация FULL/PARTIAL/ZERO_FILL/UNVERIFIED неизменна
+def test_g7_classification_contract_unchanged():
+    from src.c5_runtime import _classify_exit_execution as cls
+
+    assert cls(_exec_res(True, "FILLED", 2), 2) == ("FULL", 2)
+    assert cls(_exec_res(True, "FILLED", 1), 2) == ("PARTIAL", 1)
+    assert cls(_exec_res(True, "FILLED", 0), 2) == ("ZERO_FILL", 0)
+    assert cls(_exec_res(True, "FILLED", None), 2) == ("UNVERIFIED", 0)
+    assert cls(SimpleNamespace(ok=True), 2) == ("UNVERIFIED", 0)
+
+
+# ── E2E G-7.7: UNVERIFIED-результат сохраняет И маркер, и freeze ──────
+def test_g7_unverified_result_persists_marker_and_freeze(state_env, market):
+    rt, scripted, broker, qty, CEXIT = _g5_exit_setup(
+        state_env, market, lambda q: [_exec_res(True, "FILLED", None)])
+
+    d = rt.run_cycle()
+    # contract preserved: the UNVERIFIED branch returns the core EXIT
+    # decision itself (same as before G-7); protection lives in STATE.
+    assert d.action == "EXIT"
+    st = read_state(state_env)
+    assert st["exit_unverified_until_reconcile"] == \
+        "EXIT_UNVERIFIED_PENDING_RECONCILE"
+    m = st["exit_pending_sell_intent"]            # kept: order fate unknown
+    # G-7: the durable marker SURVIVES (never cleared) and its qty is
+    # untouched, but a proven NON-terminal outcome relabels it to
+    # SELL_OUTCOME_UNVERIFIED — that label is exactly what lets the
+    # owning process distinguish its own burned candle from a foreign
+    # unfinished operation (pre-guard).  A fresh process still blocks.
+    assert m["status"] == "SELL_OUTCOME_UNVERIFIED" and m["qty"] == qty
+    assert st["c5_position_qty"] == qty           # nothing invented
+
+    # restart → both guards block any re-send
+    rt2, adapter2 = make_runtime(market, broker)
+    scripted2 = ScriptedSellAdapter(adapter2, [], state_env=state_env,
+                                    runtime=rt2)
+    rt2.adapter = scripted2
+    if _LIVE_RUNTIMES:
+        _LIVE_RUNTIMES[-1] = rt2
+    CEXIT2 = candle_5m(CONTROL_DAY, 17, 0, SHORT_BREAK)
+    set_candles(market, CEXIT2)
+    market.holder["now"] = utc_ms(CONTROL_DAY, 17, 5)
+    d2 = rt2.run_cycle()
+    assert d2.reason == "EXIT_UNVERIFIED_PENDING_RECONCILE"
+    assert scripted2.sell_calls == []
