@@ -293,11 +293,39 @@ def _marker_operation(marker) -> str:
     established G-7 behaviour stays byte-for-byte compatible.  Anything
     unrecognised fails closed to "EXIT": the most restrictive legacy
     interpretation for guards that already assume exit semantics.
+
+    G-9C.2: the BUY-routed close of a SHORT is ALSO an EXIT operation —
+    it reuses this exact contract (see the EXIT path below), so no new
+    operation value and no parallel classification system are needed.
     """
     if not isinstance(marker, dict):
         return "EXIT"
     op = str(marker.get("operation") or "").strip().upper()
     return op if op in ("ENTRY", "EXIT") else "EXIT"
+
+
+def _persist_intent_marker(state, marker, log_prefix: str) -> bool:
+    """G-9C.2 shared durable intent pre-save (minimal common helper).
+
+    Persists ``state`` STRICTLY while ``marker`` is attached under
+    ``exit_pending_sell_intent`` — used by BOTH the G-7 LONG-exit SELL
+    dispatch and the G-9C.2 SHORT-exit BUY dispatch (same field, same
+    fail-closed contract; see run_cycle's pre-guard).  On failure the
+    caller MUST NOT dispatch the order: the in-memory marker is rolled
+    back here so nothing leaks into later saves of the cycle.  Returns
+    True only when the write was proven durable.
+    """
+    state["exit_pending_sell_intent"] = marker
+    try:
+        save_state_strict(state)
+        return True
+    except StateSaveError as exc:
+        state.pop("exit_pending_sell_intent", None)
+        logger.error(
+            "%s: durable intent %s could not be persisted (%r) — the "
+            "order is NOT dispatched, position untouched, candle NOT "
+            "burned (fail closed)", log_prefix, marker, exc)
+        return False
 
 
 def resolve_pending_sell_intent(state: dict, *, candle_ts: str,
@@ -742,20 +770,39 @@ class C5Runtime:
         if decision.action == "EXIT":
             qty = abs(int(snapshot.position_qty))
 
+            # G-9C.2: the exit SIDE is decided by the ACTUAL position, not
+            # by a hardcoded SELL: closing a LONG stays a plain SELL (the
+            # exact pre-G-9C.2 legacy path below), closing a SHORT is a
+            # BUY tagged intent="CLOSE_SHORT" so SimulatedBroker runs its
+            # dedicated short close-out accounting (proportional ГО
+            # release + realized P&L) and can NEVER flip the position
+            # into a LONG.  The dispatched volume is bounded by the
+            # absolute confirmed open size above (qty = |snapshot qty|);
+            # only a trustworthy qty_executed may reduce the position.
+            closing_short = position.direction == "SHORT"
+
             # G-7: durably record the SELL intent BEFORE dispatch. The
             # marker carries everything needed for a safe post-restart
             # assessment: status, instrument, account, direction, the
             # candle that triggered the exit and the requested contract
             # quantity. If this write fails the order is NOT sent — we
             # would rather miss one exit than duplicate an untracked one.
+            # G-9C.2: the SAME field/contract now also guards the SHORT
+            # exit — the marker then reads side="BUY" / operation="EXIT"
+            # / direction="SHORT" / intent="CLOSE_SHORT", so it uniquely
+            # identifies which routed operation is unfinished.  Legacy
+            # markers without "operation" keep EXIT semantics unchanged.
             # NOTE: `state` here is the same dict run_cycle() saves at the
             # end of the cycle, so any later successful save also persists
             # (or clears) this marker — no orphan can survive a confirmed
             # terminal outcome while the final save succeeded.
             self._sell_intent_seq += 1
             intent = {
-                "status": "SELL_IN_FLIGHT",
-                "side": "SELL",
+                "status": ("BUY_IN_FLIGHT" if closing_short
+                           else "SELL_IN_FLIGHT"),
+                "side": "BUY" if closing_short else "SELL",
+                "operation": "EXIT",
+                **({"intent": "CLOSE_SHORT"} if closing_short else {}),
                 "instrument": C5_TARGET_TICKER,
                 "account_id_masked": _mask_account_id_local(self.account_id),
                 "direction": position.direction,
@@ -804,7 +851,23 @@ class C5Runtime:
             # guaranteedly in the finally below — no path may leak it.
             self._sell_dispatch_in_flight = True
             try:
-                result = self.adapter.sell_cny(self.account_id, qty)
+                if closing_short:
+                    # G-9C.2: BUY close-out of the SHORT.  The actual
+                    # control-bar price is forwarded so SimulatedBroker
+                    # realizes P&L against the recorded entry basis
+                    # instead of guessing a fill price (fail closed when
+                    # missing).  LIVE refuses fail-closed: real orders
+                    # are out of scope for this slice.
+                    if getattr(self.config, "is_paper", False):
+                        result = self.adapter.buy_cny(
+                            self.account_id, qty,
+                            intent="CLOSE_SHORT", close_price=price)
+                    else:
+                        raise RuntimeError(
+                            "G-9C.2: SHORT close-out via BUY is PAPER-only"
+                            " — LIVE order flow is not enabled for shorts")
+                else:
+                    result = self.adapter.sell_cny(self.account_id, qty)
             except Exception as exc:
                 # G-6 defect fix: an adapter exception after the SELL was
                 # dispatched leaves the fill outcome UNKNOWN — it proves
@@ -874,6 +937,45 @@ class C5Runtime:
                 # It never survives into a later cycle and NEVER replaces
                 # the durable marker on disk.
                 self._sell_dispatch_in_flight = False
+            # G-9C.2: a None return from the adapter proves NEITHER an
+            # execution NOR a confirmed rejection — it is the same
+            # UNKNOWN-fate class as the post-dispatch exception above.
+            # Handle it explicitly BEFORE any attribute access (result.ok
+            # / result.reason would raise AttributeError on None).  The
+            # position is NOT reduced, the durable marker is kept and
+            # relabeled SELL_OUTCOME_UNVERIFIED, the candle is burned so
+            # no blind re-send can duplicate a possibly-live order, and
+            # the EXIT_UNVERIFIED freeze blocks every further position
+            # operation until explicit reconciliation.  None is NEVER
+            # laundered into a fabricated ExecutionResult(ok=False): the
+            # classification below comes straight from the None itself.
+            if result is None:
+                logger.error(
+                    "CNY_EXIT: adapter returned None after dispatch —"
+                    " outcome unknown; position untouched, candle %s"
+                    " burned, EXIT_UNVERIFIED freeze set until explicit"
+                    " reconciliation", ts)
+                state["exit_failure_reason"] = EXIT_UNVERIFIED_REASON
+                state["exit_unverified_until_reconcile"] = \
+                    EXIT_UNVERIFIED_REASON
+                state["last_processed_5m_ts"] = ts
+                # Keep the pre-dispatch marker on disk (it was persisted
+                # strictly before dispatch); relabel it to the
+                # UNKNOWN-outcome residue exactly like the UNVERIFIED /
+                # exception paths so the owning process's pre-guard
+                # recognises its own burned candle while a restarted
+                # process stays fully blocked.
+                self._mark_sell_outcome_unverified(state)
+                try:
+                    save_state_strict(state)
+                except StateSaveError as exc2:
+                    logger.error(
+                        "G-9C.2: None-outcome freeze/burn persistence not"
+                        " proven (%r) — falling back to best-effort atomic"
+                        " write", exc2)
+                    save_state(state)
+                return c5_core.block_entry(_noop_decision(),
+                                           REASON_EXIT_UNVERIFIED)
             status, filled = _classify_exit_execution(result, qty)
             if not result.ok:
                 # G-4 path unchanged: ok=False carries no trustworthy
