@@ -62,6 +62,21 @@ DAILY_HL = 0.07815
 
 
 def daily_df(n=60):
+    """Flat 1400±DAILY_HL history plus the breakout day right before the
+    control day (2026-10-01, MSK).
+
+    That last bar is required for the EXIT side of the fixture math:
+    ``daily_bars_from_df`` always drops the current session date, so on
+    2026-10-02 the newest daily bar IS 2026-10-01.  Without it the exit
+    channel Upper(5)=Lower(5)=1400±DAILY_HL and NO exit candle could
+    ever fire (EXIT_SHORT needs close > Upper(5), EXIT_LONG — close <
+    Lower(5)).  With it: Upper(5)=1420.5, Lower(5)=1369.5 →
+    SHORT exits at close ≥ 1370 (EXIT_PRICE/LOSS_PRICE fire; NEUTRAL
+    1400 stays HOLD), LONG exits at close ≤ 1369.5 (SHORT_BREAK fires).
+    The entry window Upper/Lower(10) keeps its original values because
+    the entry path runs strictly at the 16:00 control point BEFORE any
+    exit candle exists in the ledger.
+    """
     import pandas as pd
     rows = []
     d = REF_DATE - dt.timedelta(days=n - 1)
@@ -70,6 +85,12 @@ def daily_df(n=60):
         rows.append({"time": ts, "open": PRICE, "high": PRICE + DAILY_HL,
                      "low": PRICE - DAILY_HL, "close": PRICE, "volume": 1})
         d += dt.timedelta(days=1)
+    # 2026-10-01 (MSK): the completed breakout session preceding the
+    # control day — high 1420.5 / low 1369.5 (see docstring).
+    ts = pd.Timestamp(dt.datetime(2026, 10, 1, 12, tzinfo=MSK)
+                      .astimezone(dt.timezone.utc))
+    rows.append({"time": ts, "open": PRICE, "high": 1420.5,
+                 "low": 1369.5, "close": PRICE, "volume": 1})
     return pd.DataFrame(rows)
 
 

@@ -448,7 +448,7 @@ class SimulatedBroker:
         self.cash -= total_margin
         self.short_margin_locked_per_contract = total_margin / qty
 
-    def _close_short(self, qty: int, close_price) -> None:
+    def _close_short(self, order: dict) -> None:
         """G-9C.2: CLOSE_SHORT — a BUY reduces/closes an open SHORT only.
 
         Fail-closed rules (checked BEFORE any mutation — a refused order
@@ -486,6 +486,8 @@ class SimulatedBroker:
                 "CLOSE_SHORT intent — a plain BUY must never reverse or "
                 "stack onto a short (SHORT close requires intent="
                 "\"CLOSE_SHORT\")")
+        qty = int(order["qty"])
+        close_price = order.get("close_price")
         held = abs(min(0, self.position_qty))
         if qty > held:
             raise SimulatedBrokerError(
@@ -547,7 +549,7 @@ class SimulatedBroker:
                 # path (see _close_short); must be checked BEFORE the
                 # generic BUY branch so no plain BUY can ever stack onto
                 # or reverse a short.
-                self._close_short(qty, order.get("close_price"))
+                self._close_short(order)
             elif opening_short:
                 if self.position_qty >= 1:
                     # An OPEN_SHORT order may NEVER flip an existing long
