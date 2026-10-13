@@ -321,6 +321,13 @@ class C5Runtime:
         self.now_fn = now_fn
         self.instrument = None
         self.account_id = None
+        # G-7: per-process marker of a SELL dispatch that this runtime has
+        # already handed to the adapter without a proven-terminal outcome.
+        # A brand-new process (restart) always starts with False, so a
+        # durable intent marker loaded from disk can never be mistaken for
+        # an operation legitimately in flight in THIS process — any further
+        # dispatch attempt is then a blind re-send and stays blocked.
+        self._sell_dispatch_in_flight = False
         # Stage 5A safety gate — parsed ONCE via src.runtime_config (the
         # single source of truth). Injected configs are used as-is; when
         # omitted the validated env snapshot is loaded here (no second
@@ -461,10 +468,13 @@ class C5Runtime:
 
         state = load_state()
 
-        # G-7: expose the live per-cycle state dict to test boundary
-        # fakes (identity check for the durable SELL-intent marker —
-        # see tests/test_stage5b_paper_runtime.py ScriptedSellAdapter).
-        # Purely observational; production logic never reads it.
+        # G-7: a NEW process always starts with an empty dispatch flag (set
+        # in __init__), so a marker loaded from disk can never be mistaken
+        # for an in-flight operation of this process (see _evaluate_exit /
+        # set flag below).  Also expose the live per-cycle state dict to
+        # test boundary fakes — purely observational, production logic
+        # never reads it (see tests/test_stage5b_paper_runtime.py
+        # ScriptedSellAdapter).
         self._last_state = state
 
         # G-7 fail-closed pre-guard: a durable unfinished SELL-intent
@@ -475,13 +485,27 @@ class C5Runtime:
         # explicit operator resolution (resolve_pending_sell_intent)
         # clears it; ordinary snapshots NEVER do.
         if isinstance(state.get("exit_pending_sell_intent"), dict):
-            logger.error(
-                "CYCLE_BLOCKED_PENDING_SELL_INTENT: unfinished SELL "
-                "intent %s survived on disk — no reconcile/ENTRY/EXIT "
-                "until explicit operator resolution",
-                state["exit_pending_sell_intent"])
-            return c5_core.block_entry(_noop_decision(),
-                                       REASON_EXIT_UNVERIFIED)
+            # G-7 fail-closed restart guard.  A durable unfinished
+            # SELL-intent marker means an exit order send is NOT proven
+            # terminal.  It can legitimately coexist with a burned
+            # matching candle ONLY inside the very process that owns the
+            # dispatch (freeze kept, final save failed, etc.); a FRESH
+            # process always starts with the flag False, so ANY marker it
+            # finds — matching ledger or not — is an unresolved foreign
+            # operation.  Block the WHOLE cycle before bootstrap: no
+            # adapter call, no reconcile, no position re-baselining, no
+            # ENTRY, no blind re-send.  Only resolve_pending_sell_intent
+            # () clears it.  The flag NEVER replaces the durable marker:
+            # it merely distinguishes "my own in-flight operation" from
+            # "a marker inherited from another process".
+            if not self._sell_dispatch_in_flight:
+                logger.error(
+                    "CYCLE_BLOCKED_PENDING_SELL_INTENT: unfinished SELL "
+                    "intent %s survived on disk — no reconcile/ENTRY/EXIT "
+                    "until explicit operator resolution",
+                    state["exit_pending_sell_intent"])
+                return c5_core.block_entry(_noop_decision(),
+                                           REASON_EXIT_UNVERIFIED)
 
         snapshot = self.bootstrap(state)
         if snapshot is None:
@@ -551,14 +575,22 @@ class C5Runtime:
         # clears it. The candle is burned exactly like the G-5/G-6 guards.
         pending = state.get("exit_pending_sell_intent")
         if isinstance(pending, dict):
-            logger.error(
-                "SELL_INTENT_PENDING: unfinished exit operation %s found"
-                " on disk; re-send BLOCKED until explicit operator"
-                " resolution. Candle %s burned to prevent blind re-send.",
-                pending, ts)
-            state["last_processed_5m_ts"] = ts
-            return c5_core.block_entry(_noop_decision(),
-                                       REASON_EXIT_UNVERIFIED)
+            # G-7: the candle that CREATED this marker is by definition
+            # already accounted for — the creating cycle burned it on a
+            # proven-terminal/frozen outcome (pre-guard ledger match) or
+            # left it unburned for a safe re-attempt after a confirmed
+            # rejection.  Only a marker from a DIFFERENT candle is an
+            # unfinished foreign operation; burn THIS candle too so no
+            # blind re-send can duplicate the possibly-live order.
+            if str(pending.get("candle_ts")) != str(ts):
+                logger.error(
+                    "SELL_INTENT_PENDING: unfinished exit operation %s found"
+                    " on disk; re-send BLOCKED until explicit operator"
+                    " resolution. Candle %s burned to prevent blind re-send.",
+                    pending, ts)
+                state["last_processed_5m_ts"] = ts
+                return c5_core.block_entry(_noop_decision(),
+                                           REASON_EXIT_UNVERIFIED)
 
         daily = self.fetch_daily_bars(now_msk)
         if len(daily) < max(c5_core.C5_EXIT_DONCHIAN,
@@ -626,15 +658,25 @@ class C5Runtime:
                 "created_at": now_utc.isoformat(),
             }
             state["exit_pending_sell_intent"] = intent
+            # G-7: this process IS the one that just persisted the marker
+            # and is about to hand the SELL to the adapter — set the
+            # in-process dispatch flag BEFORE sell_cny so the boundary
+            # fake can distinguish the legitimate first dispatch from a
+            # blind re-send after a restart (a restarted process always
+            # starts with the flag False).  Cleared below once the result
+            # reaches a proven-terminal state.
             try:
                 save_state_strict(state)
             except StateSaveError as exc:
                 # Pre-dispatch failure: the order was provably NOT sent
-                # (sell_cny has not been called yet). Roll the in-memory
-                # marker back, burn nothing, keep the candle unprocessed —
-                # the next cycle retries the persist-and-send atom. The
-                # on-disk previous state never contained the marker (the
-                # strict save failed), so there is nothing to clean there.
+                # (sell_cny has not been called yet — the dispatch flag
+                # is set ONLY after this strict save succeeds, so the
+                # marker on disk can never claim an in-flight send that
+                # never happened).  Roll the in-memory marker back, burn
+                # nothing, keep the candle unprocessed — the next cycle
+                # retries the persist-and-send atom.  The on-disk
+                # previous state never contained the marker (the strict
+                # save failed), so there is nothing to clean there.
                 state.pop("exit_pending_sell_intent", None)
                 logger.error(
                     "%s: durable SELL intent could not be persisted (%r)"
@@ -644,6 +686,12 @@ class C5Runtime:
                 return c5_core.block_entry(
                     _noop_decision(), REASON_SELL_INTENT_PERSIST_FAILED)
 
+            # G-7: the marker is durably on disk NOW; this process is
+            # about to hand the SELL to the adapter.  Set the per-process
+            # dispatch flag immediately BEFORE sell_cny() (never earlier:
+            # a pre-save failure must leave it False) and clear it
+            # guaranteedly in the finally below — no path may leak it.
+            self._sell_dispatch_in_flight = True
             try:
                 result = self.adapter.sell_cny(self.account_id, qty)
             except Exception as exc:
@@ -685,6 +733,13 @@ class C5Runtime:
                 self._finalize_exit_state(state)
                 return c5_core.block_entry(_noop_decision(),
                                            REASON_EXIT_UNVERIFIED)
+            finally:
+                # G-7: guaranteed clear — EVERY exit path of the dispatch
+                # try (normal return, exception branch return, or a
+                # propagating error) leaves the per-process flag False.
+                # It never survives into a later cycle and NEVER replaces
+                # the durable marker on disk.
+                self._sell_dispatch_in_flight = False
             status, filled = _classify_exit_execution(result, qty)
             if not result.ok:
                 # G-4 path unchanged: ok=False carries no trustworthy
@@ -711,6 +766,9 @@ class C5Runtime:
                 # (after every field update, so a successful save can
                 # never leave a stale marker or a stale position size).
                 state.pop("exit_pending_sell_intent", None)
+                # G-7: strict durability FIRST (inside the guarded try —
+                # the finally below clears the dispatch flag only AFTER
+                # this write completed), then the terminal decision.
                 self._finalize_exit_state(state)
                 logger.info("CNY_EXIT executed: qty=%d order=%s reason=%s",
                             qty, result.order_id, decision.reason)
@@ -768,6 +826,9 @@ class C5Runtime:
                         # volume; resolve the intent and persist the full
                         # residual state strictly (see FULL branch note).
                         state.pop("exit_pending_sell_intent", None)
+                        # G-7: strict durability before returning the
+                        # terminal PARTIAL state (flag cleared in the
+                        # finally above this write completes).
                         self._finalize_exit_state(state)
                         logger.warning(
                             "CNY_EXIT PARTIAL: %d/%d filled order=%s "
@@ -800,6 +861,14 @@ class C5Runtime:
             # outcome ⇒ do NOT auto-retry (a second SELL could duplicate
             # an order that was in fact accepted/filled).
             confirmed_dead = _is_confirmed_rejection(result)
+            # G-7: the dispatch flag stays True THROUGH the whole
+            # post-dispatch handling below (including the strict final
+            # saves) and is cleared guaranteedly in the finally that
+            # wraps this try — so a mid-cycle crash can never leave a
+            # stale "in flight" claim alive in a later cycle.  The
+            # RAM-only flag NEVER replaces the durable marker: UNVERIFIED
+            # / unknown outcomes keep the marker on disk and stay
+            # fail-closed through the freeze + pre-guard instead.
             state["exit_failure_reason"] = str(
                 result.reason if not result.ok else EXIT_UNVERIFIED_REASON)
             if status == "UNVERIFIED" or (result.ok and status == "ZERO_FILL"):

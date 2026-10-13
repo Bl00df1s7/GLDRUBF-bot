@@ -1149,24 +1149,27 @@ class ScriptedSellAdapter:
                 # marker must block EVERY further sell dispatch — but the
                 # FIRST dispatch of the cycle that just WROTE this very
                 # marker before sending is exactly what G-7 requires.
-                # The runtime keeps the live per-cycle state dict on
-                # self._last_state (see src/c5_runtime.py) and stores the
-                # intent object in it BEFORE the strict pre-save, so
-                # object identity proves this call IS the same operation
-                # that persisted the marker — not a blind re-send after a
-                # restart (a restarted process builds an equal-but-new
-                # dict whose identity cannot match).  When the test did
-                # not wire a live runtime (_rt is None) there can be no
-                # legitimate in-flight dispatch at all, so ANY sell with
-                # a marker on disk is treated as a violation.
+                # The runtime sets the per-process flag
+                # _sell_dispatch_in_flight=True right before handing the
+                # SELL to the adapter (src/c5_runtime.py) and clears it on
+                # every proven-terminal outcome; a brand-new process (a
+                # restarted runtime) always starts with the flag False, so
+                # ANY sell attempted by it while a marker is on disk is a
+                # blind re-send and must raise here.  Comparing the marker
+                # CONTENT (not object identity) keeps the check robust
+                # across JSON round-trips through load_state()/save_state.
                 pending = st.get("exit_pending_sell_intent")
                 if isinstance(pending, dict):
                     rt = getattr(self, "_rt", None)
+                    in_flight = bool(getattr(rt, "_sell_dispatch_in_flight",
+                                             False))
                     live_marker = (
                         getattr(rt, "_last_state", {}).get(
                             "exit_pending_sell_intent")
                         if rt is not None else None)
-                    if live_marker is not pending:
+                    marker_matches = (isinstance(live_marker, dict)
+                                      and live_marker == pending)
+                    if not (in_flight or marker_matches):
                         raise AssertionError(
                             "blind SELL re-send while a durable unfinished "
                             "SELL-intent marker is on disk (G-7 fail-closed "
