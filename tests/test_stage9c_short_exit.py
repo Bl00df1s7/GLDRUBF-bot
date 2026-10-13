@@ -61,37 +61,31 @@ PRICE = 1400.0
 DAILY_HL = 0.07815
 
 
-def daily_df(n=60):
-    """Flat 1400±DAILY_HL history plus the breakout day right before the
-    control day (2026-10-01, MSK).
+def daily_df(n=60, exit_bar=True):
+    """Flat 1400±DAILY_HL history ending at REF_DATE (2026-09-30, MSK).
 
-    That last bar is required for the EXIT side of the fixture math:
+    ``exit_bar=True`` appends one WIDE bar dated STRICTLY INSIDE the
+    entry Donchian window (2026-09-21: high 1420.5 / low 1369.5).  This
+    bar is required for the EXIT side of the fixture math:
     ``daily_bars_from_df`` always drops the current session date, so on
-    2026-10-02 the newest daily bar IS 2026-10-01.  Without it the exit
-    channel Upper(5)=Lower(5)=1400±DAILY_HL and NO exit candle could
-    ever fire (EXIT_SHORT needs close > Upper(5), EXIT_LONG — close <
-    Lower(5)).  With it: Upper(5)=1420.5, Lower(5)=1369.5 →
-    SHORT exits at close ≥ 1370 (EXIT_PRICE/LOSS_PRICE fire; NEUTRAL
-    1400 stays HOLD), LONG exits at close ≤ 1369.5 (SHORT_BREAK fires).
-    The entry window Upper/Lower(10) keeps its original values because
-    the entry path runs strictly at the 16:00 control point BEFORE any
-    exit candle exists in the ledger.
+    the control day (2026-10-02) the newest daily bars are still the
+    September ones.  Without a wide bar Upper(5)=Lower(5)=1400±DAILY_HL
+    and NO exit candle could ever fire (EXIT_SHORT needs close >
+    Upper(5), EXIT_LONG — close < Lower(5)).  With it:
+    Upper(5)=1420.5, Lower(5)=1369.5 → SHORT exits at close > 1369.5
+    (EXIT_PRICE=1360 and LOSS_PRICE=1450 fire; NEUTRAL 1400 stays
+    HOLD), LONG exits at close < 1420.5 (LONG_BREAK=1420 fires).
+
+    The bar's DATE (2026-09-21) is deliberately inside the ENTRY window
+    (the last 10 daily bars) so BOTH entry channels widen symmetrically:
+    Upper(10)=1420.5, Lower(10)=1369.5 → ENTER_LONG fires at 1420
+    (close > 1420.5 is false… see below) — actually the comparisons are
+    strict: LONG entry needs close > Upper(10); with Upper(10)=1420.5 a
+    1420 candle would NOT enter.  To keep the proven G-9C.1 entry math
+    byte-identical (Upper(10)=Lower(10)=1400), the wide bar is placed
+    OUTSIDE the entry window instead — see ``_EXIT_BAR_DATE``.
     """
-    import pandas as pd
-    rows = []
-    d = REF_DATE - dt.timedelta(days=n - 1)
-    for _ in range(n):
-        ts = pd.Timestamp(d.isoformat(), tz="UTC")
-        rows.append({"time": ts, "open": PRICE, "high": PRICE + DAILY_HL,
-                     "low": PRICE - DAILY_HL, "close": PRICE, "volume": 1})
-        d += dt.timedelta(days=1)
-    # 2026-10-01 (MSK): the completed breakout session preceding the
-    # control day — high 1420.5 / low 1369.5 (see docstring).
-    ts = pd.Timestamp(dt.datetime(2026, 10, 1, 12, tzinfo=MSK)
-                      .astimezone(dt.timezone.utc))
-    rows.append({"time": ts, "open": PRICE, "high": 1420.5,
-                 "low": 1369.5, "close": PRICE, "volume": 1})
-    return pd.DataFrame(rows)
+    raise NotImplementedError  # replaced below — kept out of the module
 
 
 def candle_5m(day, hour, minute, close):

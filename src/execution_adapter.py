@@ -479,16 +479,21 @@ class SimulatedBroker:
             per the broker model (same cleanup shape as the legacy LONG
             SELL path).
         """
-        if str(order.get("intent") or "").upper() != "CLOSE_SHORT":
-            raise SimulatedBrokerError(
-                f"PAPER futures BUY x{qty} refused while a SHORT position "
-                f"({self.position_qty}) is open without the explicit "
-                "CLOSE_SHORT intent — a plain BUY must never reverse or "
-                "stack onto a short (SHORT close requires intent="
-                "\"CLOSE_SHORT\")")
         qty = int(order["qty"])
         close_price = order.get("close_price")
         held = abs(min(0, self.position_qty))
+        if str(order.get("intent") or "").upper() != "CLOSE_SHORT":
+            # A plain BUY while a short is open (or while flat) is NOT a
+            # close-out; it stays on the fail-closed generic paths of
+            # apply() (reversal refusal / normal LONG entry contract).
+            raise SimulatedBrokerError(
+                "PAPER futures BUY routed into _close_short without the "
+                "explicit CLOSE_SHORT intent — internal invariant broken")
+        if held == 0:
+            raise SimulatedBrokerError(
+                f"PAPER CLOSE_SHORT x{qty} refused: no SHORT position is "
+                "open — a closing BUY must never invent a LONG out of a "
+                "close intent (fail closed)")
         if qty > held:
             raise SimulatedBrokerError(
                 f"PAPER CLOSE_SHORT x{qty} refused: only {held} short "
