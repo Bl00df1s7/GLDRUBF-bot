@@ -1071,7 +1071,8 @@ class ScriptedSellAdapter:
     ExecutionResults of the LIVE adapter.
     """
 
-    def __init__(self, paper_adapter, sell_results, state_env=None):
+    def __init__(self, paper_adapter, sell_results, state_env=None,
+                 runtime=None):
         self._paper = paper_adapter
         self._sell_results = list(sell_results)
         # NOTE: state_env is intentionally NOT used any more.  The
@@ -1081,6 +1082,9 @@ class ScriptedSellAdapter:
         # and masked nothing — it has been removed (see task: verify
         # production persistence without fake assistance).
         self._state_env = state_env
+        # live C5Runtime whose per-cycle state dict is identity-checked
+        # in sell_cny (G-7 boundary invariant, see there)
+        self._rt = runtime
         self.sell_calls = []
         self.orders = []
 
@@ -1088,6 +1092,10 @@ class ScriptedSellAdapter:
         return self._paper.find_account()
 
     def snapshot(self, account_id):
+        calls = getattr(self, "snapshot_calls", None)
+        if calls is None:
+            calls = self.snapshot_calls = []
+        calls.append(account_id)
         return self._paper.snapshot(account_id)
 
     def buy_cny(self, account_id, qty, **kwargs):
@@ -1114,6 +1122,27 @@ class ScriptedSellAdapter:
                     raise AssertionError(
                         "blind SELL re-send while EXIT_UNVERIFIED freeze "
                         "is active (G-5 fail-closed violated)")
+                # G-7 boundary invariant: a durable unfinished SELL-intent
+                # marker must block EVERY further sell dispatch — but the
+                # FIRST dispatch of the cycle that just WROTE this very
+                # marker before sending is exactly what G-7 requires.
+                # The runtime keeps the live per-cycle state dict on
+                # self._last_state (see src/c5_runtime.py) and stores the
+                # intent object in it BEFORE the strict pre-save, so
+                # object identity proves this call IS the same operation
+                # that persisted the marker — not a blind re-send after a
+                # restart (a restarted process builds an equal-but-new
+                # dict whose identity cannot match).
+                pending = st.get("exit_pending_sell_intent")
+                if isinstance(pending, dict):
+                    live_marker = getattr(
+                        getattr(self, "_rt", None), "_last_state", {}
+                    ).get("exit_pending_sell_intent")
+                    if live_marker is not pending:
+                        raise AssertionError(
+                            "blind SELL re-send while a durable unfinished "
+                            "SELL-intent marker is on disk (G-7 fail-closed "
+                            "violated)")
         self.orders.append({"instrument": "CNYRUBF", "side": "SELL",
                             "qty": qty})
         if not self._sell_results:
@@ -2341,12 +2370,15 @@ def test_g7_confirmed_full_with_final_save_failure_keeps_marker(state_env,
 
     # Restart over the SAME state file. The FULL fill really executed at
     # the broker (SimulatedBroker went flat through the scripted mirror),
-    # only OUR PERSISTENCE failed — reconcile therefore re-baselines the
-    # stale stored size to the broker truth (qty 0) and the cycle routes
-    # to ENTRY. The decisive assertion: the guarded fake raises on ANY
-    # sell attempt, and NO SELL ever reaches it again — the stale but
-    # still-present marker never launders into a blind re-send, and with
-    # no position there is nothing to exit.
+    # only OUR PERSISTENCE failed.  G-7 fail-closed recovery: the durable
+    # unfinished marker found on disk blocks the WHOLE cycle before any
+    # adapter/bootstrap/position evaluation — no SELL, no BUY, and NOT
+    # even a reconcile snapshot could launder the stale stored size into
+    # a fresh ENTRY on top of an unknown residual.  The decisive
+    # assertions: the guarded fake raises on ANY sell attempt and NO SELL
+    # ever reaches it again; the marker and the stale position fields
+    # stay untouched on disk until an explicit operator resolution
+    # (resolve_pending_sell_intent) clears exactly this operation.
     rt2, adapter2 = make_runtime(market, broker)
     scripted2 = ScriptedSellAdapter(adapter2, [], state_env=state_env)
     rt2.adapter = scripted2
@@ -2356,10 +2388,32 @@ def test_g7_confirmed_full_with_final_save_failure_keeps_marker(state_env,
     d2 = rt2.run_cycle()
     assert scripted2.sell_calls == []             # NO blind re-send, ever
     st2 = read_state(state_env)
-    # reconcile adopted the broker truth (flat); the ambiguous operation
-    # stays durably marked UNFINISHED until explicit operator resolution:
-    assert st2["c5_position_qty"] == 0
+    # G-7 fail-closed restart: the durable unfinished marker found on
+    # disk blocks the whole cycle BEFORE bootstrap/reconcile, so nothing
+    # is adopted or invented — the ambiguous operation stays durably
+    # marked UNFINISHED and the position fields remain as they were on
+    # the last successful write until an explicit operator resolution
+    # (resolve_pending_sell_intent) clears exactly this operation.
+    assert d2.action == "NO_ENTRY"
+    assert d2.reason == "EXIT_UNVERIFIED_PENDING_RECONCILE"
     assert st2["exit_pending_sell_intent"]["status"] == "SELL_IN_FLIGHT"
+    assert st2["c5_position_qty"] == qty          # stale but SAFE: block
+    # reconcile never even ran for the blocked cycle (the guard precedes
+    # self.bootstrap in run_cycle):
+    assert scripted2.snapshot_calls == []
+
+    # Explicit operator resolution of THIS marker is what finally lets
+    # normal operation resume: reconcile adopts the broker truth (flat)
+    # and the next cycle proceeds without touching the guarded fake.
+    from src.c5_runtime import resolve_pending_sell_intent
+    marker2 = st2["exit_pending_sell_intent"]
+    st3 = read_state(state_env)
+    assert resolve_pending_sell_intent(
+        st3, candle_ts=marker2["candle_ts"], qty=qty) is True
+    (state_env / "state.json").write_text(json.dumps(st3))
+    rt3, adapter3 = make_runtime(market, broker)
+    snap3 = rt3.bootstrap(read_state(state_env))
+    assert snap3 is not None and int(snap3.position_qty) == 0
 
 
 # ── unit G-7.4: snapshot/сверка НЕ снимают маркер автоматически ───────

@@ -460,6 +460,29 @@ class C5Runtime:
         now_msk = _msk(now_utc)
 
         state = load_state()
+
+        # G-7: expose the live per-cycle state dict to test boundary
+        # fakes (identity check for the durable SELL-intent marker —
+        # see tests/test_stage5b_paper_runtime.py ScriptedSellAdapter).
+        # Purely observational; production logic never reads it.
+        self._last_state = state
+
+        # G-7 fail-closed pre-guard: a durable unfinished SELL-intent
+        # marker on disk means an exit order send is NOT proven terminal.
+        # Block the WHOLE cycle before bootstrap/reconcile — no adapter
+        # call, no snapshot, no position re-baselining could launder the
+        # unknown residual into a fresh ENTRY or a blind re-send.  Only
+        # explicit operator resolution (resolve_pending_sell_intent)
+        # clears it; ordinary snapshots NEVER do.
+        if isinstance(state.get("exit_pending_sell_intent"), dict):
+            logger.error(
+                "CYCLE_BLOCKED_PENDING_SELL_INTENT: unfinished SELL "
+                "intent %s survived on disk — no reconcile/ENTRY/EXIT "
+                "until explicit operator resolution",
+                state["exit_pending_sell_intent"])
+            return c5_core.block_entry(_noop_decision(),
+                                       REASON_EXIT_UNVERIFIED)
+
         snapshot = self.bootstrap(state)
         if snapshot is None:
             save_state(state)
@@ -649,18 +672,17 @@ class C5Runtime:
                 state["exit_unverified_until_reconcile"] = \
                     EXIT_UNVERIFIED_REASON
                 state["last_processed_5m_ts"] = ts
-                # G-7: sell_cny raised BEFORE returning anything — the
-                # request never left this process (dispatch boundary, see
-                # tests/test_stage5b_paper_runtime.py: ScriptedSellAdapter
-                # records calls only AFTER the adapter returns/raises).
-                # The intent therefore did NOT reach the broker and the
-                # marker would be misleading; the far stronger G-5/G-6
-                # EXIT_UNVERIFIED freeze governs from here (it survives
-                # restarts and blocks every position operation until
-                # explicit operator confirmation via
-                # broker_position_confirmed). run_cycle()'s final
-                # save_state persists both changes together.
-                state.pop("exit_pending_sell_intent", None)
+                # G-7: the SELL-intent marker was persisted strictly to
+                # disk BEFORE dispatch, so the unfinished operation is
+                # already durable.  KEEP it here as well: an adapter
+                # exception proves nothing about whether the request
+                # reached the broker (the dispatch boundary records calls
+                # only AFTER the adapter returns/raises — see
+                # tests/test_stage5b_paper_runtime.py ScriptedSellAdapter),
+                # and the freeze alone must survive even if the final save
+                # below fails outright.  resolve_pending_sell_intent() /
+                # a proven-terminal outcome are the only ways to clear it.
+                self._finalize_exit_state(state)
                 return c5_core.block_entry(_noop_decision(),
                                            REASON_EXIT_UNVERIFIED)
             status, filled = _classify_exit_execution(result, qty)
@@ -797,9 +819,10 @@ class C5Runtime:
                 state["last_processed_5m_ts"] = ts
                 # G-7: the order WAS handed to the broker adapter and its
                 # fate is unproven — KEEP the marker on disk (finalized
-                # strictly below) so even a restart that somehow loses the
-                # freeze still sees the unfinished operation.
-                self._finalize_exit_state(state)
+                # strictly above) so even a restart that somehow loses the
+                # freeze still sees the unfinished operation. The marker
+                # was already durably written before dispatch; nothing
+                # further to persist here.
                 logger.error(
                     "CNY_EXIT UNVERIFIED: ok=%s qty_executed=%r requested=%d"
                     " — position state frozen until reconcile; candle %s "
