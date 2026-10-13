@@ -291,30 +291,65 @@ class PaperExecutionAdapter(BaseExecutionAdapter):
         return float(getattr(self.broker, "tmon_price", 1000.0))
 
     def _apply(self, instrument: str, side: str, qty: int,
-               price_ref: float, **extra) -> ExecutionResult:
+               price_ref: float, fill_qty=None, **extra) -> ExecutionResult:
+        # ``fill_qty`` (G-9C) lets tests/fakes simulate a PARTIAL fill of
+        # an order SENT with ``qty`` contracts: the broker applies the
+        # whole dispatched order (its position/margin accounting mirrors
+        # what the exchange does for that order), while the execution
+        # report carries ONLY the confirmed executed volume.  Default:
+        # full fill — identical to the pre-G-9C behaviour.
+        if fill_qty is None:
+            fill_qty = qty
+        fill_qty = int(fill_qty)
         order = {"instrument": instrument, "side": side, "qty": int(qty),
                  **extra}
         self.orders.append(order)
         self.broker.apply(order)
-        logger.info("PAPER_FILL %s %s x%d", instrument, side, qty)
+        logger.info("PAPER_FILL %s %s x%d (executed %d)",
+                    instrument, side, qty, fill_qty)
         return ExecutionResult(True, "PAPER_FILLED",
                                order_id=f"paper-{len(self.orders)}",
-                               qty_executed=int(qty))
+                               qty_executed=fill_qty)
 
     def buy_cny(self, account_id: str, qty: int,
                 margin_per_contract: Optional[float] = None,
-                entry_price: Optional[float] = None) -> ExecutionResult:
+                entry_price: Optional[float] = None,
+                intent: Optional[str] = None,
+                fill_qty=None) -> ExecutionResult:
         # ГО per contract (already computed by the runtime from the live
         # FutureBy rate — see c5_runtime._evaluate_entry) is forwarded to
         # SimulatedBroker as PAPER margin reservation metadata.  Passing
         # None here means "caller has no ГО"; SimulatedBroker FAILS CLOSED
         # on a futures BUY without it (no fallback constant allowed).
+        # ``intent`` (G-9C) is an OPTIONAL order-metadata tag only — old
+        # callers that omit it keep working unchanged.
         return self._apply(C5_TARGET_TICKER, "BUY", qty, 0.0,
+                           fill_qty=fill_qty,
                            margin_per_contract=margin_per_contract,
-                           entry_price=entry_price)
+                           entry_price=entry_price,
+                           **({"intent": intent} if intent else {}))
 
-    def sell_cny(self, account_id: str, qty: int) -> ExecutionResult:
-        return self._apply(C5_TARGET_TICKER, "SELL", qty, 0.0)
+    def sell_cny(self, account_id: str, qty: int,
+                 margin_per_contract: Optional[float] = None,
+                 entry_price: Optional[float] = None,
+                 intent: Optional[str] = None,
+                 fill_qty=None) -> ExecutionResult:
+        # Legacy EXIT path (closing a LONG) keeps the exact two-argument
+        # call signature — no extra metadata, identical order dict shape.
+        # G-9C: opening a SHORT is ALSO a SELL of CNYRUBF contracts; the
+        # runtime then forwards the live ГО / entry price so
+        # SimulatedBroker can reserve margin and record the basis, and
+        # tags the order with its durable intent ("OPEN_SHORT") so the
+        # broker can tell an opening SELL from a closing one.
+        extra = {}
+        if intent:
+            extra["intent"] = intent
+        if margin_per_contract is not None:
+            extra["margin_per_contract"] = margin_per_contract
+        if entry_price is not None:
+            extra["entry_price"] = entry_price
+        return self._apply(C5_TARGET_TICKER, "SELL", qty, 0.0,
+                           fill_qty=fill_qty, **extra)
 
     def sell_one_tmon(self, account_id: str) -> ExecutionResult:
         return self._apply(TMON_TICKER_PREFIX, "SELL", 1,
@@ -356,6 +391,9 @@ class SimulatedBroker:
         # ГО per contract blocked by the current long (set at BUY time
         # from the runtime-computed live margin; 0.0 = unknown basis).
         self.margin_locked_per_contract = 0.0
+        # G-9C: symmetric field for the short side — ГО per contract
+        # blocked by an OPEN_SHORT sell (0.0 = no short basis known).
+        self.short_margin_locked_per_contract = 0.0
 
     def snapshot(self, account_id: str) -> AccountSnapshot:
         return AccountSnapshot(
@@ -368,6 +406,34 @@ class SimulatedBroker:
             open_orders=0,
         )
 
+    def _reserve_short_margin(self, qty: int, mpc) -> None:
+        """G-9C: reserve the initial margin (ГО) for a newly OPENED short.
+
+        Same fail-closed rules as the long BUY path: the ГО must arrive in
+        the order metadata (runtime-computed from the live FutureBy rate),
+        a non-positive margin or insufficient free cash refuses the fill —
+        the broker never guesses a constant and never lets ``cash`` go
+        negative on a margined entry.
+        """
+        try:
+            total_margin = float(mpc) * qty
+        except (TypeError, ValueError):
+            raise SimulatedBrokerError(
+                f"PAPER futures SHORT open x{qty} requires "
+                f"margin_per_contract in the order metadata, got "
+                f"{mpc!r} — refusing to guess ГО (fail closed)")
+        if total_margin <= 0:
+            raise SimulatedBrokerError(
+                f"PAPER futures SHORT open x{qty}: non-positive total "
+                f"margin {total_margin}")
+        if self.cash < total_margin:
+            raise SimulatedBrokerError(
+                f"PAPER futures SHORT open x{qty} rejected: cash "
+                f"{self.cash:.2f} < required margin "
+                f"{total_margin:.2f}")
+        self.cash -= total_margin
+        self.short_margin_locked_per_contract = total_margin / qty
+
     def apply(self, order: dict) -> None:
         side, qty = order["side"], int(order["qty"])
         if order["instrument"] == C5_TARGET_TICKER:
@@ -378,8 +444,47 @@ class SimulatedBroker:
             # an EXIT releases it back.  The ГО must come from the order
             # metadata (runtime-computed from the live FutureBy rate);
             # fallback constants are forbidden — fail closed instead.
-            delta = qty if side == "BUY" else -qty
-            if side == "BUY":
+            # G-9C: an OPENING SELL (ENTER_SHORT routed through SELL) is
+            # the symmetric case — it reserves ГО for the new short and
+            # drives ``position_qty`` NEGATIVE; closing/reducing a LONG
+            # stays exactly on the legacy path below.
+            if qty <= 0:
+                raise SimulatedBrokerError(
+                    f"PAPER futures {side} with non-positive qty {qty}")
+            intent = order.get("intent")
+            opening_short = (side == "SELL"
+                             and str(intent or "").upper() == "OPEN_SHORT")
+            if opening_short:
+                if self.position_qty >= 1:
+                    # An OPEN_SHORT order may NEVER flip an existing long
+                    # into a short (no accidental position reversal via
+                    # an opening order): close the LONG first (separate
+                    # slice), refuse here fail-closed.
+                    raise SimulatedBrokerError(
+                        f"PAPER OPEN_SHORT x{qty} refused while a LONG "
+                        f"position ({self.position_qty}) is open — an "
+                        "opening order must never reverse the position")
+                if self.position_qty <= -1:
+                    # A short is already open: a second opening order
+                    # would stack/reserve without a managed basis — block
+                    # until SHORT close-out is implemented (next slice).
+                    raise SimulatedBrokerError(
+                        f"PAPER OPEN_SHORT x{qty} refused while a SHORT "
+                        f"position ({self.position_qty}) is already open")
+                self._reserve_short_margin(qty, order.get("margin_per_contract"))
+                ep = order.get("entry_price")
+                if ep is not None:
+                    self.entry_price = float(ep)
+                self.position_qty -= qty
+            elif side == "BUY":
+                if self.position_qty <= -1:
+                    # Closing a SHORT is also a BUY — but that is the NEXT
+                    # dedicated slice; silently adding to the short (a
+                    # random reversal) is forbidden fail-closed.
+                    raise SimulatedBrokerError(
+                        f"PAPER futures BUY x{qty} refused while a SHORT "
+                        f"position ({self.position_qty}) is open — SHORT "
+                        "close-out via BUY is not implemented yet")
                 mpc = order.get("margin_per_contract")
                 try:
                     total_margin = float(mpc) * qty
@@ -405,18 +510,28 @@ class SimulatedBroker:
                 ep = order.get("entry_price")
                 if ep is not None:
                     self.entry_price = float(ep)
+                self.position_qty += qty
             else:
                 # SELL releases the ГО that the long BUY blocked.  The
                 # per-contract reservation is remembered at BUY time; a
                 # legacy/unknown cost basis releases nothing rather than
                 # inventing a fallback constant (fail-safe, no free cash
                 # printed out of thin air).
-                held = abs(min(0, self.position_qty))
-                released = min(held, qty) * self.margin_locked_per_contract
+                held = max(0, self.position_qty)
+                if qty > held:
+                    # A plain (closing) SELL may NEVER sell more contracts
+                    # than the long actually held — beyond-flat would be an
+                    # accidental reversal into a short.  Refuse fail-closed.
+                    raise SimulatedBrokerError(
+                        f"PAPER futures SELL x{qty} refused: only {held} "
+                        "long contract(s) held — an opening order must "
+                        "not reverse the position (open SHORT requires "
+                        "the explicit OPEN_SHORT intent)")
+                released = qty * self.margin_locked_per_contract
                 self.cash += released
-                if self.position_qty - qty <= 0:
+                if held - qty == 0:
                     self.margin_locked_per_contract = 0.0
-            self.position_qty += delta
+                self.position_qty -= qty
         elif order["instrument"].startswith(TMON_TICKER_PREFIX):
             if side == "SELL":
                 self.tmon_qty -= qty

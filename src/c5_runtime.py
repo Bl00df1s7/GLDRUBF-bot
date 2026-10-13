@@ -93,6 +93,11 @@ EXIT_UNVERIFIED_REASON = REASON_EXIT_UNVERIFIED
 # G-7: the durable SELL-intent marker could not be persisted BEFORE
 # dispatch — fail closed, the order was NOT sent.
 REASON_SELL_INTENT_PERSIST_FAILED = "SELL_INTENT_PERSIST_FAILED"
+# G-9C: an opening SHORT order (SELL) was dispatched but its execution
+# outcome could not be verified from a trustworthy qty_executed — the
+# runtime must NOT invent a position.  Distinct reason code so operators
+# can tell "unknown entry fill" apart from an unverified EXIT.
+ENTRY_UNVERIFIED_REASON = "ENTRY_UNVERIFIED_PENDING_RECONCILE"
 
 
 def _now_utc() -> datetime:
@@ -278,8 +283,25 @@ def reconcile(adapter, account_id: str, state: dict) -> "object":
     return snapshot
 
 
+def _marker_operation(marker) -> str:
+    """G-9C minimal extension of the G-7 durable SELL-intent marker.
+
+    The marker field ``operation`` distinguishes an unfinished EXIT of a
+    LONG (legacy semantics, pre-G-9C markers) from an unfinished OPEN_SHORT
+    ENTRY dispatch.  Markers WITHOUT the field — every marker written by
+    any earlier version of this runtime — are treated as "EXIT" so the
+    established G-7 behaviour stays byte-for-byte compatible.  Anything
+    unrecognised fails closed to "EXIT": the most restrictive legacy
+    interpretation for guards that already assume exit semantics.
+    """
+    if not isinstance(marker, dict):
+        return "EXIT"
+    op = str(marker.get("operation") or "").strip().upper()
+    return op if op in ("ENTRY", "EXIT") else "EXIT"
+
+
 def resolve_pending_sell_intent(state: dict, *, candle_ts: str,
-                                qty: int) -> bool:
+                                qty: int, operation: str = "EXIT") -> bool:
     """G-7 EXPLICIT operator resolution of a pending SELL intent marker.
 
     Deliberately narrow: it clears ONLY the marker whose candle timestamp
@@ -288,9 +310,33 @@ def resolve_pending_sell_intent(state: dict, *, candle_ts: str,
     NEVER lifts the block (same principle as the G-5 EXIT_UNVERIFIED
     freeze).  The operator must first verify at the broker terminal which
     fate the ambiguous SELL actually had; only then may this be used.
+
+    G-9C: the check additionally verifies the marker OPERATION identity
+    (EXIT vs OPEN_SHORT ENTRY).  The default ``operation="EXIT"`` keeps
+    the exact old contract for legacy callers/tests: markers without the
+    ``operation`` field resolve as EXIT (see _marker_operation), so every
+    pre-G-9C clearance path behaves identically.  An ENTRY marker can
+    only be cleared by an explicit ``operation="ENTRY"`` request — a
+    coincidence of candle/qty with an unfinished entry never launders it
+    into an exit clearance.
     """
     marker = state.get("exit_pending_sell_intent")
     if not isinstance(marker, dict):
+        return False
+    wanted_op = str(operation or "").strip().upper()
+    if wanted_op not in ("ENTRY", "EXIT"):
+        logger.error(
+            "SELL_INTENT_RESOLVE refused: unknown operation %r — must be"
+            " 'ENTRY' or 'EXIT'; no implicit clearance is allowed",
+            operation)
+        return False
+    if _marker_operation(marker) != wanted_op:
+        logger.error(
+            "SELL_INTENT_RESOLVE refused: requested operation %r does not"
+            " match the pending marker operation %r (%s) — an unfinished"
+            " %s must never be cleared as if it were a %s",
+            wanted_op, _marker_operation(marker), marker,
+            _marker_operation(marker), wanted_op)
         return False
     if str(marker.get("candle_ts")) != str(candle_ts) \
             or int(marker.get("qty") or 0) != int(qty):
@@ -302,8 +348,8 @@ def resolve_pending_sell_intent(state: dict, *, candle_ts: str,
         return False
     state.pop("exit_pending_sell_intent", None)
     logger.warning(
-        "SELL_INTENT resolved explicitly by operator for candle %s qty %d",
-        candle_ts, qty)
+        "SELL_INTENT resolved explicitly by operator for candle %s qty %d"
+        " (operation=%s)", candle_ts, qty, wanted_op)
     return True
 
 
@@ -505,13 +551,14 @@ class C5Runtime:
         # ScriptedSellAdapter).
         self._last_state = state
 
-        # G-7 fail-closed pre-guard: a durable unfinished SELL-intent
-        # marker on disk means an exit order send is NOT proven terminal.
-        # Block the WHOLE cycle before bootstrap/reconcile — no adapter
-        # call, no snapshot, no position re-baselining could launder the
-        # unknown residual into a fresh ENTRY or a blind re-send.  Only
-        # explicit operator resolution (resolve_pending_sell_intent)
-        # clears it; ordinary snapshots NEVER do.
+        # G-7/G-9C: a durable unfinished SELL-intent marker on disk means
+        # an order send (EXIT of a LONG — or, since G-9C, the opening
+        # SHORT SELL) is NOT proven terminal.  Block the WHOLE cycle
+        # before bootstrap/reconcile — no adapter call, no snapshot, no
+        # position re-baselining could launder the unknown residual into
+        # a fresh ENTRY or a blind re-send.  Only explicit operator
+        # resolution (resolve_pending_sell_intent) clears it; ordinary
+        # snapshots NEVER do.
         pending_marker = state.get("exit_pending_sell_intent")
         if isinstance(pending_marker, dict):
             # G-7 fail-closed restart guard.  A durable unfinished
@@ -533,11 +580,15 @@ class C5Runtime:
             # re-send.  Only resolve_pending_sell_intent() clears the
             # durable marker.  The flag NEVER replaces the marker.
             #
-            # The G-5 freeze flags are deliberately NOT sufficient here:
-            # they do not prove WHICH candle the ambiguous SELL belongs
-            # to, and a freeze can be lifted later by an explicit
-            # operator confirmation — the still-present marker must then
-            # keep blocking the whole cycle (see the G-7 test battery).
+            # G-9C: this exception applies ONLY to EXIT markers.  An
+            # OPEN_SHORT entry marker (operation="ENTRY") that survived
+            # on disk is ALWAYS a full cycle block even for its own
+            # burned candle: unlike an exit, an unverified ENTRY leaves
+            # the runtime with NO trustworthy position at all, so
+            # proceeding under the EXIT guards would let later cycles act
+            # on an invented flat view.  Legacy markers without the
+            # "operation" field keep the pre-G-9C semantics — they are
+            # treated as EXIT (see _marker_operation).
             burned_by_ledger = str(pending_marker.get("candle_ts")) == \
                 str(state.get("last_processed_5m_ts"))
             owns_burned_candle = False
@@ -547,7 +598,8 @@ class C5Runtime:
                 # dispatch finally, initialised False in __init__).
                 owns_burned_candle = True
             elif burned_by_ledger and str(pending_marker.get("status")) \
-                    == "SELL_OUTCOME_UNVERIFIED":
+                    == "SELL_OUTCOME_UNVERIFIED" \
+                    and _marker_operation(pending_marker) == "EXIT":
                 logger.error(
                     "PENDING_SELL_INTENT owned-by-this-process: unfinished"
                     " exit operation %s for already-burned candle %s —"
@@ -1136,32 +1188,229 @@ class C5Runtime:
                          cash.operations)
             return c5_core.block_entry(decision, cash.reason)
 
-        # CNY BUY — the whole final_qty in ONE operation.  The live ГО per
-        # contract computed by c5_core (FutureBy rate × price × size) is
-        # forwarded to the PAPER adapter so SimulatedBroker can block the
-        # margin instead of inventing a cost basis; LIVE ignores the
-        # extra kwargs (the exchange blocks ГО itself).
-        result = self.adapter.buy_cny(
-            self.account_id, decision.qty,
-            margin_per_contract=float(decision.margin_per_contract),
-            entry_price=guard.expected_price or price)
-        state["last_c5_entry_control_timestamp"] = ts
-        if not result.ok:
+        # ── G-9C: durable SELL-intent BEFORE dispatch for the OPENING
+        #    SHORT.  An opening SHORT is routed through SELL — the SAME
+        #    side as a LONG exit — so without a pre-persisted marker a
+        #    crash between send and the final save would leave no trace,
+        #    and a restarted process could re-send the SELL blindly (or
+        #    reconcile could launder an unknown residual into a fresh
+        #    position).  The marker extends the G-7 contract with
+        #    ``operation="ENTRY"`` (legacy EXIT markers simply lack the
+        #    field — see _marker_operation) and carries instrument,
+        #    masked account, direction, candle, requested qty and
+        #    creation time.  A failed strict save means the order is NOT
+        #    sent (fail closed; the control point stays unburned so the
+        #    next cycle retries the persist-and-send atom).  An existing
+        #    unfinished marker can never be overwritten here: the
+        #    run_cycle pre-guard blocks the whole cycle while any marker
+        #    survives on disk, so an unfinished LONG exit is never
+        #    masked/masqueraded by a new SHORT entry intent.
+        entry_intent = None
+        if direction == "SHORT":
+            self._sell_intent_seq += 1
+            entry_intent = {
+                "status": "SELL_IN_FLIGHT",
+                "side": "SELL",
+                "operation": "ENTRY",
+                "intent": "OPEN_SHORT",
+                "instrument": C5_TARGET_TICKER,
+                "account_id_masked": _mask_account_id_local(self.account_id),
+                "direction": direction,
+                "candle_ts": ts,
+                "qty": int(decision.qty),
+                # Per-process sequence folded into created_at keeps this
+                # marker unique to THIS dispatch (G-7 identity rule).
+                "created_at": "%s+seq%d" % (now_utc.isoformat(),
+                                            self._sell_intent_seq),
+            }
+            state["exit_pending_sell_intent"] = entry_intent
+            try:
+                save_state_strict(state)
+            except StateSaveError as exc:
+                # Pre-dispatch failure: sell_cny has NOT been called yet,
+                # so the on-disk previous state provably contains no
+                # marker from this attempt — roll the in-memory marker
+                # back, burn NOTHING (the control point stays
+                # unprocessed) and block.  Same contract as the G-7 EXIT
+                # pre-save failure.
+                state.pop("exit_pending_sell_intent", None)
+                logger.error(
+                    "%s: durable OPEN_SHORT intent could not be persisted"
+                    " (%r) — SELL NOT dispatched, position untouched,"
+                    " control point %s NOT burned",
+                    REASON_SELL_INTENT_PERSIST_FAILED, exc, ts)
+                return c5_core.block_entry(
+                    _noop_decision(), REASON_SELL_INTENT_PERSIST_FAILED)
+            # Marker is durably on disk NOW; this process owns the
+            # in-flight dispatch (flag set strictly AFTER the successful
+            # save, cleared guaranteedly below — same rule as G-7 EXIT).
+            self._sell_dispatch_in_flight = True
+
+        try:
+            if direction == "LONG":
+                # CNY BUY — the whole final_qty in ONE operation.  The live
+                # ГО per contract computed by c5_core (FutureBy rate ×
+                # price × size) is forwarded to the PAPER adapter so
+                # SimulatedBroker can block the margin instead of inventing
+                # a cost basis; LIVE ignores the extra kwargs (the exchange
+                # blocks ГО itself).  ENTER_LONG behaviour unchanged.
+                result = self.adapter.buy_cny(
+                    self.account_id, decision.qty,
+                    margin_per_contract=float(decision.margin_per_contract),
+                    entry_price=guard.expected_price or price)
+            else:
+                # G-9C: ENTER_SHORT → opening SELL.  The ГО/entry metadata
+                # and the OPEN_SHORT intent tag let SimulatedBroker reserve
+                # margin, record the basis and refuse accidental reversals.
+                result = self.adapter.sell_cny(
+                    self.account_id, decision.qty,
+                    margin_per_contract=float(decision.margin_per_contract),
+                    entry_price=guard.expected_price or price,
+                    intent="OPEN_SHORT")
+        except Exception as exc:
+            # G-6/G-9C: an adapter exception after dispatch proves
+            # neither execution nor non-execution.  Fail closed: NO
+            # position is invented, the control point is burned so no
+            # blind re-send can duplicate a possibly-live order, and the
+            # durable marker is relabeled SELL_OUTCOME_UNVERIFIED and
+            # persisted strictly (best-effort fallback) so even a lost
+            # final save leaves the unfinished operation on disk.  A
+            # restarted process sees the ENTRY marker and stays fully
+            # blocked at the run_cycle pre-guard until an explicit
+            # operator resolution.
+            logger.error(
+                "CNY_ENTRY EXCEPTION from adapter after dispatch: %r —"
+                " outcome unknown; position untouched, control point %s"
+                " burned, pending SELL-intent marker kept until explicit"
+                " reconciliation", exc, ts, exc_info=True)
+            state["last_c5_entry_control_timestamp"] = ts
+            state["last_action"] = ENTRY_UNVERIFIED_REASON
+            if entry_intent is not None:
+                entry_intent["status"] = "SELL_OUTCOME_UNVERIFIED"
+                try:
+                    save_state_strict(state)
+                except StateSaveError as exc2:
+                    logger.error(
+                        "G-9C: post-dispatch ENTRY marker persistence not"
+                        " proven (%r) — falling back to best-effort atomic"
+                        " write", exc2)
+                    save_state(state)
+            return c5_core.block_entry(_noop_decision(),
+                                       ENTRY_UNVERIFIED_REASON)
+        finally:
+            # Guaranteed clear of the per-process dispatch flag — every
+            # exit path leaves it False; it NEVER replaces the durable
+            # marker (same invariant as the G-7 EXIT finally).
+            if entry_intent is not None:
+                self._sell_dispatch_in_flight = False
+
+        status, filled = _classify_entry_execution(result, decision.qty)
+        if status == ENTRY_FILL_FAILED:
+            # ok=False: nothing was confirmed executed.  The control
+            # point is burned exactly like the pre-G-9C behaviour (a
+            # market-order re-send on the same bar could duplicate an
+            # accepted-but-unreported order); NO position is created.
+            # G-9C belt: a proven rejection must also RESOLVE the durable
+            # OPEN_SHORT intent — leaving it in flight would block every
+            # later entry under the false assumption that a SELL may have
+            # reached the broker, while the rejected outcome IS proven.
+            state["last_c5_entry_control_timestamp"] = ts
             logger.error("CNY_ENTRY FAILED: %s", result.reason)
+            if entry_intent is not None:
+                state.pop("exit_pending_sell_intent", None)
+                try:
+                    save_state_strict(state)
+                except StateSaveError as exc:
+                    logger.error(
+                        "G-9C: FAILED-entry marker resolution not proven"
+                        " (%r) — one strict retry", exc)
+                    try:
+                        save_state_strict(state)
+                    except StateSaveError as exc2:
+                        logger.critical(
+                            "G-9C: FAILED-entry marker persistence NOT"
+                            " PROVEN (%r); falling back to best-effort"
+                            " atomic write; the marker stays authoritative"
+                            " and keeps blocking until explicit"
+                            " resolution", exc2)
+                        save_state(state)
             return c5_core.block_entry(decision,
                                        f"EXECUTION_FAILED:{result.reason}")
 
-        state["c5_position_qty"] = decision.qty if direction == "LONG" \
-            else -decision.qty
+        if status in (ENTRY_FILL_UNVERIFIED, ENTRY_FILL_ZERO):
+            # ok=True but the executed quantity cannot be trusted
+            # (missing / wrong type / negative / over the request /
+            # contradictory ok=True+qty=0).  G-9C: do NOT invent a
+            # position — keep c5_position_qty/direction at their flat
+            # values, burn the control point against a blind re-send and
+            # KEEP the durable marker (relabeled UNKNOWN-fate) so the
+            # unfinished operation survives any restart until explicit
+            # operator resolution / trustworthy reconcile.
+            logger.error(
+                "CNY_ENTRY UNVERIFIED: ok=%s qty_executed=%r requested=%d"
+                " — NO position recorded, control point %s burned, no"
+                " automatic re-attempt", getattr(result, "ok", None),
+                getattr(result, "qty_executed", None), decision.qty, ts)
+            state["last_c5_entry_control_timestamp"] = ts
+            state["last_action"] = ENTRY_UNVERIFIED_REASON
+            if entry_intent is not None:
+                entry_intent["status"] = "SELL_OUTCOME_UNVERIFIED"
+                try:
+                    save_state_strict(state)
+                except StateSaveError as exc2:
+                    logger.error(
+                        "G-9C: UNVERIFIED ENTRY marker persistence not"
+                        " proven (%r) — falling back to best-effort atomic"
+                        " write", exc2)
+                    save_state(state)
+            return c5_core.block_entry(_noop_decision(),
+                                       ENTRY_UNVERIFIED_REASON)
+
+        # FULL / PARTIAL: the ONLY trustworthy volume source is the
+        # confirmed qty_executed — NEVER the requested decision.qty.  A
+        # partial entry records the smaller confirmed position; the
+        # unfilled remainder is simply not ours (no phantom contracts).
+        # For SHORT the tracked position is NEGATIVE.
+        state["last_c5_entry_control_timestamp"] = ts
+        state["c5_position_qty"] = filled if direction == "LONG" else -filled
         state["c5_position_direction"] = direction
         state["c5_entry_price"] = guard.expected_price
         state["margin_long_rate"] = float(long_rate)
         state["margin_short_rate"] = float(short_rate)
         state["last_action"] = decision.reason
+        if entry_intent is not None:
+            # Proven-terminal CONFIRMED outcome (FULL/PARTIAL): resolve
+            # the durable intent and persist the COMPLETE final state
+            # strictly — position fields first, marker removed last, so a
+            # successful save can never pair a stale marker with a fresh
+            # position or vice versa (runtime ↔ broker snapshot stay in
+            # agreement; reconcile adopts the same negative qty).
+            state.pop("exit_pending_sell_intent", None)
+            try:
+                save_state_strict(state)
+            except StateSaveError as exc:
+                logger.error(
+                    "G-9C: post-dispatch ENTRY state save failed (%r) —"
+                    " one strict retry", exc)
+                try:
+                    save_state_strict(state)
+                except StateSaveError as exc2:
+                    logger.critical(
+                        "G-9C: ENTRY final state durability NOT PROVEN"
+                        " (%r); falling back to best-effort atomic write;"
+                        " pending SELL-intent marker (if any) stays"
+                        " authoritative on the last successful write", exc2)
+                    save_state(state)
+        if status == ENTRY_FILL_PARTIAL:
+            logger.warning(
+                "CNY_ENTRY PARTIAL: %d/%d filled order=%s — confirmed"
+                " position %s x%d recorded from qty_executed only",
+                filled, decision.qty, result.order_id, direction, filled)
         logger.info(
-            "CNY_ENTRY executed: %s x%d order=%s price~%.4f slippage=%.4f%% "
-            "required_margin=%.2f (qty_risk=%d qty_margin=%d qty_raw=%d)",
-            direction, decision.qty, result.order_id,
+            "CNY_ENTRY executed: %s x%d (requested %d) order=%s price~%.4f"
+            " slippage=%.4f%% required_margin=%.2f (qty_risk=%d"
+            " qty_margin=%d qty_raw=%d)",
+            direction, filled, decision.qty, result.order_id,
             guard.expected_price or 0.0,
             (guard.expected_slippage_pct or 0.0) * 100, required_margin,
             decision.qty_risk, decision.qty_margin, decision.qty_raw)
@@ -1287,6 +1536,54 @@ def _noop_decision() -> c5_core.Decision:
         required_margin=Decimal("0"), m_e_ratio=0.0,
         qty_risk=0, qty_margin=0, qty_liquidity=0, qty_raw=0,
     )
+
+
+# ── G-9C: ENTRY fill classification (executed quantity certainty) ──────
+# Same fail-closed contract as the EXIT classifier: ``ok`` alone NEVER
+# proves a fill — only a valid ``qty_executed`` is a confirmation source.
+#   * qty must be a positive int — otherwise UNVERIFIED;
+#   * ok=False ⇒ FAILED (the adapter provably did not execute; safe to
+#     keep the candle unburned and re-attempt);
+#   * qty_executed missing/None/non-int/bool/negative ⇒ UNVERIFIED
+#     (over-request is also UNVERIFIED — an inconsistent report cannot
+#     launder a bigger position into existence);
+#   * 0 while ok=True ⇒ ZERO_FILL (contradictory — treated UNVERIFIED);
+#   * == qty ⇒ FULL; 0 < executed < qty ⇒ PARTIAL.
+ENTRY_FILL_FULL = "FULL"
+ENTRY_FILL_PARTIAL = "PARTIAL"
+ENTRY_FILL_ZERO = "ZERO_FILL"
+ENTRY_FILL_UNVERIFIED = "UNVERIFIED"
+ENTRY_FILL_FAILED = "FAILED"
+
+
+def _classify_entry_execution(result, qty):
+    """Classify one ENTRY execution result against the requested size.
+
+    Returns ``(status, filled)`` where ``filled`` is the trustworthy
+    executed contract count (meaningful for FULL / PARTIAL only).  The
+    caller MUST base any position update on ``filled``, never on the
+    requested ``qty`` — see G-9C requirement "confirmed volume only".
+    """
+    if type(qty) is not int or qty <= 0:
+        return ENTRY_FILL_UNVERIFIED, 0
+    # G-9C: a None (or otherwise result-less) adapter response proves
+    # NOTHING — it must never be treated as a failure-with-reason nor as
+    # a fill.  Classify it UNVERIFIED so the caller keeps the durable
+    # marker and blocks until explicit resolution.
+    if result is None:
+        return ENTRY_FILL_UNVERIFIED, 0
+    if not getattr(result, "ok", False):
+        return ENTRY_FILL_FAILED, 0
+    raw = getattr(result, "qty_executed", None)
+    if raw is None or isinstance(raw, bool) or not isinstance(raw, int):
+        return ENTRY_FILL_UNVERIFIED, 0
+    if raw < 0 or raw > qty:
+        return ENTRY_FILL_UNVERIFIED, 0
+    if raw == 0:
+        return ENTRY_FILL_ZERO, 0
+    if raw == qty:
+        return ENTRY_FILL_FULL, raw
+    return ENTRY_FILL_PARTIAL, raw
 
 
 def run_once(token: str) -> c5_core.Decision:
