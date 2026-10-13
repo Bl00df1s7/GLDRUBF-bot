@@ -237,8 +237,22 @@ def test_t3_get_orders_error_propagates_not_masked_as_zero(live_boundary):
 
 def test_t3b_rate_limit_error_also_escapes(live_boundary):
     """RESOURCE_EXHAUSTED is non-retryable → converted to
-    ApiRateLimitError, which likewise must NOT be swallowed into 0."""
-    error = RuntimeError(grpc.StatusCode.RESOURCE_EXHAUSTED, "throttled")
+    ApiRateLimitError, which likewise must NOT be swallowed into 0.
+
+    The SDK boundary fake raises the real ``t_tech.invest`` exception type
+    (``RequestError(code, details, metadata)``, see
+    t_tech/invest/_errors.py::handle_request_error), exactly as the live
+    OrdersService does on a throttled gRPC call.  With the real SDK
+    installed, ``src.api_retry`` catches ``RequestError`` specifically —
+    a plain ``RuntimeError`` would bypass that handler and escape
+    unchanged, so modelling the SDK error with ``RuntimeError`` here was
+    only valid while the fallback ``RequestError = Exception`` alias was
+    active in stubbed environments.
+    """
+    from t_tech.invest.exceptions import RequestError as SdkRequestError
+
+    error = SdkRequestError(grpc.StatusCode.RESOURCE_EXHAUSTED,
+                            "throttled", None)
     with pytest.raises(ApiRateLimitError):
         snapshot_via_live_adapter(live_boundary["install"],
                                   make_live_response(),
