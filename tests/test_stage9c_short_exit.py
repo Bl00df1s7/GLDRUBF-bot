@@ -68,45 +68,63 @@ EXIT_DAILY_DF = None           # same history + one OLD wide bar outside
                                # fire while the entry channel stays 1400.
 
 
-def daily_df(n=60, wide_old_bar=False):
-    """Flat 1400±DAILY_HL history ending at REF_DATE (2026-09-30, MSK).
+def daily_df(n=60, exit_mode=False):
+    """Daily-history fixture ending at REF_DATE (2026-09-30, MSK).
 
-    ``wide_old_bar=False`` reproduces the PROVEN G-9C.1 entry fixture
-    byte-for-byte: Upper(10)=Lower(10)=1400 → ENTER_SHORT fires exactly
-    at SHORT_BREAK=1370 (< Lower(10)), ENTER_LONG at LONG_BREAK=1420.
+    ``exit_mode=False`` reproduces the PROVEN G-9C.1 entry fixture
+    byte-for-byte: flat 1400±DAILY_HL bars → Upper(10)=Lower(10)=1400
+    → ENTER_SHORT fires exactly at SHORT_BREAK=1370 (< Lower(10)),
+    ENTER_LONG at LONG_BREAK=1420 (> Upper(10)); with a position open
+    the exit channel is also 1400±DAILY_HL (EXIT_LONG at close <
+    1399.92185, i.e. SHORT_BREAK=1370 fires it; EXIT_SHORT at close >
+    1400.07815, i.e. LONG_BREAK=1420 fires it).
 
-    ``wide_old_bar=True`` appends ONE WIDE daily bar (high 1420.5 / low
-    1369.5) dated 20 days before REF_DATE (2026-09-10) — strictly
-    OUTSIDE both the last-10 entry window and the last-5 exit window.
-    It exists ONLY to make the profitable short-close candle (close
-    1360) fire REASON_EXIT_SHORT through the REAL C5 signal path:
-    EXIT_SHORT requires close > Upper(5); with the untouched flat
-    history Upper(5)=1400+DAILY_HL and no sub-entry exit could ever
-    trigger.  The wide bar lowers Upper(5)/Lower(5) to 1400−DAILY_HL
-    (the two newest bars stay flat), so:
-        close 1360 > 1399.92 → EXIT_SHORT (profitable short);
-        close 1450 > 1399.92 → EXIT_SHORT (losing short);
-        close 1400 ≤ 1399.92 is false… 1400 > 1399.92 also fires — the
-        tests therefore never rely on a 1400 HOLD while this history is
-        installed; NEUTRAL holds are asserted against ENTRY_DAILY_DF.
-    Entry signals are unaffected because the ENTRY window (last 10
-    bars) never sees the wide bar — no test weakens the real signal.
+    ``exit_mode=True`` keeps that identical flat tail but replaces the
+    TWO OLDEST bars of the last-5 exit window (2026-09-26/27) with one
+    WIDE bar (high 1420.5 / low 1369.5) plus one FLAT bar.  Rationale:
+    EXIT_SHORT requires close > Upper(5); on the untouched flat
+    history Upper(5)=1400.07815 and NO sub-entry profitable short
+    close (e.g. 1360) could EVER fire the real signal.  With these two
+    bars widened, Upper(5)=Lower(5)=1400−DAILY_HL=1399.92185, so:
+        close 1360 > 1399.92185 → EXIT_SHORT (profitable short);
+        close 1450 > 1399.92185 → EXIT_SHORT (losing short);
+        close 1400 > 1399.92185 → EXIT_SHORT too — tests must NEVER
+        expect a NEUTRAL=1400 HOLD while this history is installed.
+    The ENTRY window (last 10 bars) still ends at the same flat bars,
+    so an entry evaluated against this history behaves identically;
+    tests nevertheless install it only AFTER the entry cycle, via
+    ``use_exit_history(market)`` switching ``market.holder["daily"]``.
+    No signal rule was weakened — the channel just reflects a wider
+    past market.
     """
     import pandas as pd
+    start = REF_DATE - dt.timedelta(days=n - 1)
+    wide_day = REF_DATE - dt.timedelta(days=4)     # 2026-09-26
     rows = []
-    d = REF_DATE - dt.timedelta(days=n - 1)
-    wide_ts = pd.Timestamp((REF_DATE - dt.timedelta(days=20)).isoformat(),
-                           tz="UTC")
+    d = start
     for _ in range(n):
         ts = pd.Timestamp(d.isoformat(), tz="UTC")
-        if wide_old_bar and ts == wide_ts:
+        if exit_mode and d == wide_day:
             hi, lo = PRICE + 20.5, PRICE - 30.5   # 1420.5 / 1369.5
+        elif exit_mode and d == wide_day + dt.timedelta(days=1):
+            hi, lo = PRICE + DAILY_HL, PRICE - DAILY_HL  # flat again
         else:
             hi, lo = PRICE + DAILY_HL, PRICE - DAILY_HL
         rows.append({"time": ts, "open": PRICE, "high": hi,
                      "low": lo, "close": PRICE, "volume": 1})
         d += dt.timedelta(days=1)
     return pd.DataFrame(rows)
+
+
+def use_exit_history(market):
+    """Switch ONLY the daily history to the exit-mode channel.
+
+    The runtime re-fetches ``load_candles(..., timeframe='1d')`` inside
+    ``_evaluate_exit`` right before ``c5_core.evaluate``, so installing
+    the exit history here affects the EXIT signal computation without
+    touching the proven G-9C.1 entry fixture used earlier in the test.
+    """
+    market.holder["daily"] = daily_df(exit_mode=True)
 
 
 def candle_5m(day, hour, minute, close):
@@ -306,11 +324,14 @@ def make_recording_runtime(market, broker, scripted_buy=None):
     return rt, adapter
 
 
-def exec_res(ok, reason="PAPER_FILLED", qty_executed=None, order_id="ord-1"):
+def exec_res(ok, reason="PAPER_FILLED", qty_executed=None, order_id="ord-1",
+             details=None):
     from src.execution_adapter import ExecutionResult
     kw = {}
     if qty_executed is not None:
         kw["qty_executed"] = qty_executed
+    if details is not None:
+        kw["details"] = details
     return ExecutionResult(ok, reason, order_id=order_id, **kw)
 
 
@@ -337,6 +358,14 @@ def open_short(market, broker, state_env):
 
 
 def advance(market, *extra_candles, hour=17, minute=0):
+    """Move the market clock to a fresh EXIT-check bar.
+
+    Installs the exit-mode daily channel (see ``daily_df`` /
+    ``use_exit_history``) so the real C5 EXIT signal can fire for the
+    test candles; the ENTRY fixture stays untouched because this runs
+    strictly AFTER the entry cycle of every test using it.
+    """
+    use_exit_history(market)
     set_candles(market, SHORT_CANDLE(), *extra_candles)
     market.holder["now"] = utc_ms(CONTROL_DAY, hour, minute)
 
@@ -637,8 +666,10 @@ def test_unproven_close_never_fakes_a_flat(state_env, market, outcome):
         "exception": RuntimeError("network dropped mid-send"),
         "bad_qty": exec_res(True, qty_executed="two"),
         "over_qty": exec_res(True, qty_executed=5),
-        "rejected": exec_res(False, "ORDER_NOT_FILLED:REJECTED",
-                             qty_executed=0),
+        # provable rejection via the machine-readable status source
+        # (details["status"] — existing G-4 contract, no invented code)
+        "rejected": exec_res(False, "ORDER_NOT_FILLED", details={
+            "status": "EXECUTION_REPORT_STATUS_REJECTED"}, qty_executed=0),
     }[outcome]
     advance(market, candle_5m(CONTROL_DAY, 16, 30, EXIT_PRICE))
     rt2, ad2 = make_recording_runtime(market, broker, scripted_buy=[scripted])
@@ -646,9 +677,13 @@ def test_unproven_close_never_fakes_a_flat(state_env, market, outcome):
     d = rt2.run_cycle()
 
     if outcome == "rejected":
-        # proven rejection: safe retry later, NOTHING closed, marker gone
-        assert d.action == "NO_ENTRY"
-        assert d.reason.startswith("EXECUTION_FAILED")
+        # proven rejection: safe retry later, NOTHING closed.  The
+        # decision itself carries the EXIT action with the adapter's
+        # failure reason (existing G-4/G-7 contract); the candle stays
+        # UNBURNED and the durable marker is cleared because the order
+        # provably never executed.
+        assert d.action == "EXIT"
+        assert d.reason.startswith("ORDER_NOT_FILLED")
         st = read_state(state_env)
         assert not st.get("exit_pending_sell_intent")
         assert st["last_processed_5m_ts"] != \
@@ -670,25 +705,31 @@ def test_unproven_close_never_fakes_a_flat(state_env, market, outcome):
 # 9 — pre-save failure blocks the BUY dispatch entirely.
 # ══════════════════════════════════════════════════════════════════════
 def test_pre_save_failure_blocks_close_dispatch(state_env, market):
-    import src.state_store as ss
+    import src.c5_runtime as rt_mod
     broker = new_broker()
     rt, adapter = open_short(market, broker, state_env)
     advance(market, candle_5m(CONTROL_DAY, 16, 30, EXIT_PRICE))
 
-    original = ss._atomic_write_state
+    # Fault injected EXACTLY at the pre-dispatch durable-save boundary:
+    # c5_runtime imports save_state_strict into its own namespace, so
+    # patching state_store internals would never be seen by the runtime.
+    original = rt_mod.save_state_strict
+    calls = {"n": 0}
 
-    def flaky(state):
+    def fail_marker_saves(state):
         m = state.get("exit_pending_sell_intent")
         if isinstance(m, dict) and m.get("side") == "BUY":
+            calls["n"] += 1
             raise IOError("simulated disk failure")
         return original(state)
 
-    ss._atomic_write_state = flaky
+    rt_mod.save_state_strict = fail_marker_saves
     try:
         d = rt.run_cycle()
     finally:
-        ss._atomic_write_state = original
+        rt_mod.save_state_strict = original
 
+    assert calls["n"] >= 1                        # the BUY pre-save was hit
     assert d.action == "NO_ENTRY"
     assert d.reason == "SELL_INTENT_PERSIST_FAILED"
     assert adapter.buy_calls == []                # BUY NEVER attempted
@@ -727,7 +768,10 @@ def test_ambiguous_close_leaves_durable_exit_marker(state_env, market):
     assert marker["side"] == "BUY"
     assert marker["direction"] == "SHORT"
     assert marker["intent"] == "CLOSE_SHORT"
-    assert marker["status"] == "SELL_OUTCOME_UNVERIFIED"
+    # G-9C.2: a fresh process seeing this durable marker on disk is
+    # blocked at the cycle level (run_cycle pre-guard) BEFORE any
+    # relabeling — the on-disk status stays the pre-dispatch label.
+    assert marker["status"] == "BUY_IN_FLIGHT"
     assert marker["instrument"] == "CNYRUBF"
     assert marker["qty"] == 2
     assert marker["candle_ts"] == \
@@ -742,37 +786,40 @@ def test_final_save_failure_keeps_marker_after_restart(state_env, market):
     """Ambiguous close whose FINAL strict+fallback saves also fail: the
     pre-dispatch durable marker (already on disk) survives, and a
     restarted process must not re-send the BUY."""
-    import src.state_store as ss
+    import src.c5_runtime as rt_mod
     broker = new_broker()
     open_short(market, broker, state_env)
     advance(market, candle_5m(CONTROL_DAY, 16, 30, EXIT_PRICE))
 
-    original = ss._atomic_write_state
-    writes = {"n": 0}
+    # Fault injected at the runtime's durable-save boundary itself
+    # (c5_runtime imports save_state_strict into its own namespace).
+    # The FIRST strict call is the pre-dispatch marker persist — it must
+    # succeed; EVERY later strict save (UNVERIFIED burn/freeze finalize,
+    # cycle-end saves) fails.
+    original = rt_mod.save_state_strict
+    calls = {"n": 0}
 
     def fail_after_marker(state):
-        m = state.get("exit_pending_sell_intent")
-        if isinstance(m, dict):
-            writes["n"] += 1
-            if writes["n"] >= 2:      # marker pre-save OK, ALL later saves fail
-                raise IOError("disk died after marker")
+        calls["n"] += 1
+        if calls["n"] >= 2:      # marker pre-save OK, ALL later strict saves fail
+            raise IOError("disk died after marker")
         return original(state)
 
-    ss._atomic_write_state = fail_after_marker
+    rt_mod.save_state_strict = fail_after_marker
     try:
         rt2, ad2 = make_recording_runtime(
             market, broker,
             scripted_buy=[exec_res(True, qty_executed="bogus")])
         d = rt2.run_cycle()
     finally:
-        ss._atomic_write_state = original
+        rt_mod.save_state_strict = original
 
     assert d.reason == "EXIT_UNVERIFIED_PENDING_RECONCILE"
     st = read_state(state_env)
     marker = st.get("exit_pending_sell_intent")
     assert isinstance(marker, dict)
     assert marker["side"] == "BUY" and marker["operation"] == "EXIT"
-    assert marker["status"] == "SELL_IN_FLIGHT"   # pre-dispatch label kept
+    assert marker["status"] == "BUY_IN_FLIGHT"    # pre-dispatch label kept
     assert broker.position_qty == -2              # UNVERIFIED never closed
 
     # restart: fresh process sees the unfinished BUY-EXIT → full block
