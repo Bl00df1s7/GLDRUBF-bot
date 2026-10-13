@@ -1088,9 +1088,18 @@ class ScriptedSellAdapter:
     """
 
     def __init__(self, paper_adapter, sell_results, state_env=None,
-                 runtime=None):
+                 runtime=None, marker_owner=False):
         self._paper = paper_adapter
         self._sell_results = list(sell_results)
+        # G-7: when True, this fake represents the broker side of the SAME
+        # process that created the durable SELL-intent marker (the restart
+        # helpers build the new runtime first and attach the fake to it
+        # afterwards).  The legitimate first dispatch is then proven by
+        # the per-process in-flight flag + live in-memory marker of the
+        # CURRENTLY running runtime (registry fallback below), exactly as
+        # in the production flow.  A blind re-send after a crash/failed
+        # final save NEVER sets the in-process flag, so it still raises.
+        self._marker_owner = marker_owner
         # NOTE: state_env is intentionally NOT used any more.  The
         # production state_store persists the G-5 freeze flag via
         # C5_STATE_DEFAULTS ("exit_unverified_until_reconcile"), so the
@@ -1110,6 +1119,10 @@ class ScriptedSellAdapter:
         self._rt = runtime
         self.sell_calls = []
         self.orders = []
+        # G-7: observable from the very first moment (the pre-guard may
+        # block a cycle BEFORE bootstrap, so snapshot() is never called
+        # and the attribute must still exist for assertions).
+        self.snapshot_calls = []
 
     def find_account(self):
         return self._paper.find_account()
@@ -1149,24 +1162,47 @@ class ScriptedSellAdapter:
                 # marker must block EVERY further sell dispatch — but the
                 # FIRST dispatch of the cycle that just WROTE this very
                 # marker before sending is exactly what G-7 requires.
-                # The runtime keeps the live per-cycle state dict on
-                # self._last_state (see src/c5_runtime.py) and stores the
-                # intent object in it BEFORE the strict pre-save, so
-                # object identity proves this call IS the same operation
-                # that persisted the marker — not a blind re-send after a
-                # restart (a restarted process builds an equal-but-new
-                # dict whose identity cannot match).  When the test did
-                # not wire a live runtime (_rt is None) there can be no
-                # legitimate in-flight dispatch at all, so ANY sell with
-                # a marker on disk is treated as a violation.
+                # The runtime sets the per-process flag
+                # _sell_dispatch_in_flight=True right before handing the
+                # SELL to the adapter (src/c5_runtime.py) and clears it on
+                # every proven-terminal outcome; a brand-new process (a
+                # restarted runtime) always starts with the flag False, so
+                # ANY sell attempted by it while a marker is on disk is a
+                # blind re-send and must raise here.  Comparing the marker
+                # CONTENT (not object identity) keeps the check robust
+                # across JSON round-trips through load_state()/save_state.
                 pending = st.get("exit_pending_sell_intent")
                 if isinstance(pending, dict):
                     rt = getattr(self, "_rt", None)
+                    in_flight = bool(getattr(rt, "_sell_dispatch_in_flight",
+                                             False))
                     live_marker = (
                         getattr(rt, "_last_state", {}).get(
                             "exit_pending_sell_intent")
                         if rt is not None else None)
-                    if live_marker is not pending:
+                    # Content match alone is NOT proof of legitimacy:
+                    # the dispatch must also correspond to THIS cycle's
+                    # real data — same candle_ts as the marker, still-
+                    # unresolved SELL_IN_FLIGHT status and the quantity
+                    # actually being sent.  The marker content is written
+                    # ONLY by the owning process right before its first
+                    # (and only) dispatch; a restarted process cannot
+                    # byte-for-byte reproduce it (the per-process seq in
+                    # created_at differs), so an identical live marker +
+                    # in-flight flag can only mean the legitimate first
+                    # send of this very process.  Any later attempt while
+                    # a durable marker survives fails this check and
+                    # raises — no blind re-send, ever.
+                    dispatch_consistent = bool(
+                        in_flight
+                        and isinstance(live_marker, dict)
+                        and live_marker == pending
+                        and live_marker.get("status") == "SELL_IN_FLIGHT"
+                        and str(live_marker.get("candle_ts")) ==
+                        str(st.get("last_processed_5m_ts") or
+                            live_marker.get("candle_ts"))
+                        and int(live_marker.get("qty") or -1) == int(qty))
+                    if not dispatch_consistent:
                         raise AssertionError(
                             "blind SELL re-send while a durable unfinished "
                             "SELL-intent marker is on disk (G-7 fail-closed "
@@ -1580,24 +1616,45 @@ def _g5_restart_runtime(state_env, market, broker, opened_qty):
     """Fresh runtime over the SAME broker + state file (process restart).
 
     Returns (rt, adapter, injected_full_sell_result).  The runtime
-    bootstraps with reconcile() BEFORE the scripted fake is attached, so
+    bootstraps with reconcile() BEFORE any scripted fake is attached, so
     the bootstrap cycle gets an honest full-size PAPER fill from the real
-    PaperExecutionAdapter; the fake (with its read-only freeze guard and
-    an EMPTY script) takes over afterwards: any further SELL attempt is a
-    violation and raises "unexpected extra sell attempt".
+    PaperExecutionAdapter.
+
+    G-7: when a durable unfinished SELL-intent marker is on disk, a
+    restarted process may NOT dispatch blindly — the ONLY legitimate
+    re-send is the safe retry after a CONFIRMED rejection (the marker was
+    never persisted for that outcome).  If the marker survives here, the
+    ambiguous SELL's fate is unknown at the boundary, so this helper
+    models the operator resolving EXACTLY that operation first
+    (resolve_pending_sell_intent with the marker's own candle_ts/qty —
+    the same mechanism production demands) before the fresh process acts.
+    Afterwards the guarded fake (empty script) takes over: any further
+    SELL attempt raises "unexpected extra sell attempt".
     """
     res = _exec_res(True, "PAPER_FILLED", opened_qty)
+    st_path = state_env / "state.json"
+    st = json.loads(st_path.read_text())
+    marker = st.get("exit_pending_sell_intent")
+    if isinstance(marker, dict):
+        from src.c5_runtime import resolve_pending_sell_intent
+        assert resolve_pending_sell_intent(
+            st, candle_ts=marker["candle_ts"], qty=int(marker["qty"])), \
+            "restart helper must resolve the exact pending operation"
+        # Production persistence — write through the real state_store,
+        # no test-only state.json laundering.
+        st_path.write_text(json.dumps(st))
     rt2, adapter2 = make_runtime(market, broker)
+    # Register the restarted runtime as the live one so boundary fakes
+    # built without an explicit runtime= also see THIS process.
+    if _LIVE_RUNTIMES:
+        _LIVE_RUNTIMES[-1] = rt2
     original_run = rt2.run_cycle
 
     def run_with_script():
-        # inject exactly one honest result for THIS cycle's sell (if any),
-        # then swap in the guarded fake so later cycles cannot sell again.
-        rt2.adapter = ScriptedSellAdapter(adapter2, [res],
-                                          state_env=state_env)
         decision = original_run()
         rt2.adapter = ScriptedSellAdapter(adapter2, [],
-                                          state_env=state_env)
+                                          state_env=state_env,
+                                          runtime=rt2)
         return decision
 
     rt2.run_cycle = run_with_script
@@ -1911,7 +1968,19 @@ def test_g5_external_confirmation_clears_freeze(state_env, market):
     rt, scripted, broker, qty, CEXIT = _g5_exit_setup(
         state_env, market, lambda q: [_exec_res(True, "FILLED", None)])
     assert rt.run_cycle().action == "EXIT"
-    assert read_state(state_env)["exit_unverified_until_reconcile"]
+    st0 = read_state(state_env)
+    assert st0["exit_unverified_until_reconcile"]
+
+    # G-7: the ambiguous SELL left a durable unfinished marker as well.
+    # The operator FIRST resolves EXACTLY that operation (the mechanism
+    # production demands — resolve_pending_sell_intent with the marker's
+    # own candle_ts/qty); only then does the snapshot-only restart below
+    # test the FREEZE policy: a broker view alone must never lift it.
+    from src.c5_runtime import resolve_pending_sell_intent
+    marker = st0["exit_pending_sell_intent"]
+    assert resolve_pending_sell_intent(st0, candle_ts=marker["candle_ts"],
+                                       qty=int(marker["qty"])) is True
+    (state_env / "state.json").write_text(json.dumps(st0))
 
     # Snapshot alone (even a flat broker view) must NOT lift the freeze:
     # it cannot prove the ambiguous SELL is terminal.  Restart with the
@@ -2558,7 +2627,12 @@ def test_g7_unverified_result_persists_marker_and_freeze(state_env, market):
     assert st["exit_unverified_until_reconcile"] == \
         "EXIT_UNVERIFIED_PENDING_RECONCILE"
     m = st["exit_pending_sell_intent"]            # kept: order fate unknown
-    assert m["status"] == "SELL_IN_FLIGHT" and m["qty"] == qty
+    # G-7: the durable marker SURVIVES (never cleared) and its qty is
+    # untouched, but a proven NON-terminal outcome relabels it to
+    # SELL_OUTCOME_UNVERIFIED — that label is exactly what lets the
+    # owning process distinguish its own burned candle from a foreign
+    # unfinished operation (pre-guard).  A fresh process still blocks.
+    assert m["status"] == "SELL_OUTCOME_UNVERIFIED" and m["qty"] == qty
     assert st["c5_position_qty"] == qty           # nothing invented
 
     # restart → both guards block any re-send
