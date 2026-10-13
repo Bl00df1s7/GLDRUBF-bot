@@ -1618,19 +1618,33 @@ def _g5_restart_runtime(state_env, market, broker, opened_qty):
     PaperExecutionAdapter; the fake (with its read-only freeze guard and
     an EMPTY script) takes over afterwards: any further SELL attempt is a
     violation and raises "unexpected extra sell attempt".
+
+    G-7: the fake validates the legitimate first dispatch through the
+    CURRENTLY running runtime's per-process in-flight flag + live marker
+    (``runtime=rt2`` / ``marker_owner=True`` — this new process IS the
+    owner of the cycle that re-dispatches after reconcile adopted the
+    broker view).  Without the explicit binding the fallback registry
+    would still point at the OLD process and the guarded fake would
+    raise on the honest restart sell.
     """
     res = _exec_res(True, "PAPER_FILLED", opened_qty)
     rt2, adapter2 = make_runtime(market, broker)
+    # Register the restarted runtime as the live one so boundary fakes
+    # built without an explicit runtime= also see THIS process.
+    if _LIVE_RUNTIMES:
+        _LIVE_RUNTIMES[-1] = rt2
     original_run = rt2.run_cycle
 
     def run_with_script():
         # inject exactly one honest result for THIS cycle's sell (if any),
         # then swap in the guarded fake so later cycles cannot sell again.
         rt2.adapter = ScriptedSellAdapter(adapter2, [res],
-                                          state_env=state_env)
+                                          state_env=state_env,
+                                          runtime=rt2, marker_owner=True)
         decision = original_run()
         rt2.adapter = ScriptedSellAdapter(adapter2, [],
-                                          state_env=state_env)
+                                          state_env=state_env,
+                                          runtime=rt2, marker_owner=True)
         return decision
 
     rt2.run_cycle = run_with_script
@@ -2591,7 +2605,12 @@ def test_g7_unverified_result_persists_marker_and_freeze(state_env, market):
     assert st["exit_unverified_until_reconcile"] == \
         "EXIT_UNVERIFIED_PENDING_RECONCILE"
     m = st["exit_pending_sell_intent"]            # kept: order fate unknown
-    assert m["status"] == "SELL_IN_FLIGHT" and m["qty"] == qty
+    # G-7: the durable marker SURVIVES (never cleared) and its qty is
+    # untouched, but a proven NON-terminal outcome relabels it to
+    # SELL_OUTCOME_UNVERIFIED — that label is exactly what lets the
+    # owning process distinguish its own burned candle from a foreign
+    # unfinished operation (pre-guard).  A fresh process still blocks.
+    assert m["status"] == "SELL_OUTCOME_UNVERIFIED" and m["qty"] == qty
     assert st["c5_position_qty"] == qty           # nothing invented
 
     # restart → both guards block any re-send

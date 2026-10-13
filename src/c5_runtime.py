@@ -450,6 +450,27 @@ class C5Runtime:
                     " the last successful write", exc2)
                 save_state(state)
 
+    def _mark_sell_outcome_unverified(self, state) -> None:
+        """G-7: label the durable SELL-intent marker of THIS cycle as an
+        UNKNOWN-outcome residue (``SELL_OUTCOME_UNVERIFIED``).
+
+        The order was handed to the broker and its fate is not proven
+        terminal.  Relabeling lets the owning process's pre-guard
+        recognise its own burned candle (marker status
+        SELL_OUTCOME_UNVERIFIED + ``last_processed_5m_ts`` == the
+        marker's candle_ts) and reach the ordinary DUPLICATE_CANDLE /
+        freeze classification instead of masking it with the cycle-level
+        block.  A restarted process never carries this knowledge — for
+        it the marker remains an unfinished foreign operation and stays
+        fully blocked (fail-closed).  The marker is NEVER cleared here:
+        only a proven-terminal result or resolve_pending_sell_intent()
+        removes it.  Mutates the in-memory dict only; persistence is the
+        caller's responsibility (strict save before returning).
+        """
+        marker = state.get("exit_pending_sell_intent")
+        if isinstance(marker, dict):
+            marker["status"] = "SELL_OUTCOME_UNVERIFIED"
+
     # ── one full cycle ───────────────────────────────────────────────
     def run_cycle(self) -> c5_core.Decision:
         # STAGE 5A SAFETY GATE — evaluated BEFORE anything that can reach
@@ -506,10 +527,35 @@ class C5Runtime:
             # () clears it.  The flag NEVER replaces the durable marker.
             unverified_outcome = bool(
                 state.get("exit_unverified_until_reconcile")
-                or state.get("exit_failure_reason") == EXIT_UNVERIFIED_REASON)
+                or state.get("exit_failure_reason") == EXIT_UNVERIFIED_REASON
+                or str(pending_marker.get("status"))
+                == "SELL_OUTCOME_UNVERIFIED")
             burned_by_ledger = str(pending_marker.get("candle_ts")) == \
                 str(state.get("last_processed_5m_ts"))
             if self._sell_dispatch_in_flight:
+                owns_burned_candle = True
+            elif (burned_by_ledger
+                  and str(pending_marker.get("status"))
+                  == "SELL_OUTCOME_UNVERIFIED"):
+                # G-7: the marker itself records a NON-TERMINAL outcome
+                # of the SELL this ledger already burned.  The owning
+                # process's own _evaluate_exit guards (duplicate →
+                # freeze → pending) keep blocking every further
+                # dispatch, so the cycle may proceed to
+                # bootstrap/reconcile and reach the ordinary
+                # DUPLICATE_CANDLE / freeze classification for the same
+                # bar.  A FRESH process never carries our in-process
+                # dispatch flag; any marker from a DIFFERENT candle or
+                # an active-trading status (SELL_IN_FLIGHT) remains
+                # fully blocked here.  reconcile() never clears the
+                # durable marker (see its G-7 note), so no blind
+                # re-send is possible on this path either.
+                logger.error(
+                    "PENDING_SELL_INTENT owned-by-this-process: unfinished"
+                    " exit operation %s for already-burned candle %s —"
+                    " proceeding under the EXIT_UNVERIFIED guards; NO"
+                    " further SELL dispatch until explicit resolution",
+                    pending_marker, pending_marker.get("candle_ts"))
                 owns_burned_candle = True
             elif unverified_outcome and burned_by_ledger:
                 # G-7: the owning process proved its SELL non-terminal,
@@ -763,6 +809,7 @@ class C5Runtime:
                 # owning process's pre-guard recognises its own burned
                 # candle; resolve_pending_sell_intent() /
                 # a proven-terminal outcome are the only ways to clear it.
+                self._mark_sell_outcome_unverified(state)
                 # G-7: burn + freeze must be durable BEFORE returning —
                 # otherwise a lost final save would leave an UNBURNED
                 # exit candle plus an SELL_IN_FLIGHT marker on disk, and
@@ -770,10 +817,11 @@ class C5Runtime:
                 # and re-send blindly.  Strict write first; if durability
                 # cannot be proven, fall back to the best-effort atomic
                 # writer (still an atomic replace) and log loudly.  The
-                # in-memory marker keeps its original SELL_IN_FLIGHT
-                # content — a kept durable marker is NEVER rewritten or
-                # relabeled, it is cleared only by a proven-terminal
-                # result or resolve_pending_sell_intent().
+                # kept durable marker is relabeled ONLY to the
+                # SELL_OUTCOME_UNVERIFIED terminal-fate-unknown status
+                # (never cleared, never size/ts-rewritten): that label is
+                # what lets the OWNING process distinguish its own burned
+                # candle from a foreign unfinished operation.
                 try:
                     save_state_strict(state)
                 except StateSaveError as exc2:
@@ -948,6 +996,7 @@ class C5Runtime:
                 # candle and reaches the ordinary DUPLICATE_CANDLE /
                 # freeze classification instead of masking it with the
                 # cycle-level block.
+                self._mark_sell_outcome_unverified(state)
                 # G-7: burn + freeze must be durable BEFORE returning —
                 # same fail-closed reasoning as the exception branch
                 # above (strict write, best-effort fallback, marker is
@@ -983,9 +1032,16 @@ class C5Runtime:
                 # exactly as before G-4 — retrying blindly could create a
                 # duplicate SELL while broker state is not verified.
                 # G-7: outcome not proven terminal — KEEP the marker and
-                # persist it strictly.
-                self._finalize_exit_state(state)
+                # persist it strictly.  Relabel it to the UNKNOWN-fate
+                # status first, so the owning process's pre-guard
+                # recognises its own burned candle (marker candle_ts ==
+                # ledger) and the next pass over this bar reaches the
+                # ordinary DUPLICATE_CANDLE classification instead of the
+                # cycle-level block; a restarted process still sees an
+                # unfinished foreign operation and stays fully blocked.
+                self._mark_sell_outcome_unverified(state)
                 state["last_processed_5m_ts"] = ts
+                self._finalize_exit_state(state)
                 logger.error(
                     "CNY_EXIT FAILED (outcome not confirmed-rejected): %s"
                     " — no automatic re-attempt; reconcile on next start "
