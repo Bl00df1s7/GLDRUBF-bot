@@ -998,7 +998,7 @@ class C5Runtime:
                 state["c5_position_direction"] = None
                 state["c5_entry_price"] = None
                 state["c5_short_margin_locked_per_contract"] = None
-                state["last_action"] = decision.reason)
+                state["last_action"] = decision.reason
                 # G-7: terminal CONFIRMED outcome — resolve the durable
                 # intent and persist the COMPLETE final state strictly
                 # (after every field update, so a successful save can
