@@ -18,6 +18,7 @@ full quantity; TMON is strictly one bond per operation.
 """
 
 import logging
+import math
 import os
 from dataclasses import dataclass, field
 from typing import Optional
@@ -655,7 +656,7 @@ class PaperStartupError(RuntimeError):
     with EQUITY_UNAVAILABLE anyway)."""
 
 
-def _build_paper_broker(read_adapter) -> "SimulatedBroker":
+def _build_paper_broker(read_adapter, state: Optional[dict] = None) -> "SimulatedBroker":
     """Seed a SimulatedBroker from the REAL read-only account snapshot.
 
     Documented PaperExecutionAdapter contract: production paper mode uses
@@ -681,7 +682,7 @@ def _build_paper_broker(read_adapter) -> "SimulatedBroker":
             f"PAPER startup fail closed: real account {account_id} "
             f"snapshot has equity={equity} cash={cash} — refusing to "
             "seed SimulatedBroker with a zero/artificial balance")
-    return SimulatedBroker(
+    broker = SimulatedBroker(
         cash=cash,
         equity=equity,
         tmon_qty=int(live_snap.tmon_qty or 0),
@@ -689,8 +690,46 @@ def _build_paper_broker(read_adapter) -> "SimulatedBroker":
         entry_price=float(live_snap.entry_price or 0.0),
     )
 
+    # PAPER SHORT margin is local accounting state: the read-only broker
+    # snapshot exposes free cash and position basis, but not the amount
+    # reserved by this simulated process. Restore it only when the durable
+    # state independently matches the snapshot; never infer ГО from today's
+    # rate or subtract it from cash a second time (cash is already free cash).
+    if isinstance(state, dict):
+        try:
+            stored_qty = int(state.get("c5_position_qty") or 0)
+            stored_direction = state.get("c5_position_direction")
+            stored_entry = float(state.get("c5_entry_price") or 0.0)
+            stored_margin = float(
+                state.get("c5_short_margin_locked_per_contract") or 0.0)
+        except (TypeError, ValueError, OverflowError):
+            stored_qty = 0
+            stored_direction = None
+            stored_entry = stored_margin = 0.0
+        snapshot_qty = int(live_snap.position_qty or 0)
+        snapshot_entry = float(live_snap.entry_price or 0.0)
+        entry_tolerance = max(0.01, abs(snapshot_entry) * 1e-6)
+        matches = (
+            stored_direction == "SHORT"
+            and stored_qty == snapshot_qty
+            and snapshot_qty < 0
+            and stored_entry > 0
+            and snapshot_entry > 0
+            and abs(stored_entry - snapshot_entry) <= entry_tolerance
+            and math.isfinite(stored_margin)
+            and stored_margin > 0
+        )
+        if matches:
+            broker.short_margin_locked_per_contract = stored_margin
+        elif snapshot_qty < 0:
+            logger.warning(
+                "PAPER SHORT margin ledger not restored: persisted state "
+                "does not exactly match broker snapshot or margin basis is "
+                "missing/invalid; leaving reservation unknown (0.0)")
+    return broker
 
-def build_execution_adapter(token: str, instrument_uid: str, config=None):
+
+def build_execution_adapter(token: str, instrument_uid: str, config=None, state=None):
     """Factory honoring the Stage 5A safety gate (single source of truth).
 
     ``config`` is a validated ``src.runtime_config.TradingConfig``; when
@@ -724,6 +763,6 @@ def build_execution_adapter(token: str, instrument_uid: str, config=None):
         # Same account discovery (_find_open_account) as LIVE ⇒ the exact
         # same real account_id the runtime will use downstream.
         read_adapter = LiveExecutionAdapter(token, instrument_uid)
-        broker = _build_paper_broker(read_adapter)
+        broker = _build_paper_broker(read_adapter, state=state)
         return PaperExecutionAdapter(broker), "PAPER"
     return LiveExecutionAdapter(token, instrument_uid), "LIVE"

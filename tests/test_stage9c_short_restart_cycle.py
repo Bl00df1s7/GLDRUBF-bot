@@ -102,6 +102,7 @@ def test_full_short_cycle_restart_recover_from_broker_snapshot_and_close(
     assert st1["c5_position_qty"] == -2
     assert st1["c5_position_direction"] == "SHORT"
     assert st1["c5_entry_price"] == pytest.approx(1399.95)
+    assert st1["c5_short_margin_locked_per_contract"] == pytest.approx(go_pc)
     assert not st1.get("exit_pending_sell_intent")       # proven-terminal
     persisted_state_file = (state_env / "state.json").read_text()
     assert json.loads(persisted_state_file)["c5_position_qty"] == -2
@@ -145,22 +146,24 @@ def test_full_short_cycle_restart_recover_from_broker_snapshot_and_close(
                 open_orders=0,
             )
 
-    # Documented limitation of the PAPER restart model (NOT a runtime
-    # defect, no production code involved here): ``_build_paper_broker``
-    # seeds only cash/equity/tmon/position/entry from the snapshot — the
-    # ГО reservation ledger (short_margin_locked_per_contract) is a local
-    # paper-broker field with no external representation, so the seeded
-    # broker starts with an UNKNOWN short margin basis (0.0).  This does
-    # not affect position/direction/basis recovery or the EXIT decision;
-    # it only means the restarted paper mirror cannot return ГО it never
-    # recorded (see the release assertion in PHASE 3).
+    # The exact local PAPER reservation is recovered from durable state,
+    # but only because quantity, direction and entry basis all match the
+    # independent broker snapshot. No cash deduction occurs during restore.
     read_api = ReadOnlyAccountApi(broker1)
-    broker2 = _build_paper_broker(read_api)               # production seed
+    broker2 = _build_paper_broker(read_api, state=st1)     # production seed
     assert broker2 is not broker1                         # fresh memory
     assert broker2.position_qty == -2                     # SHORT recovered
     assert broker2.entry_price == pytest.approx(1399.95)  # basis from broker
     assert broker2.cash == pytest.approx(cash_after_open)
-    assert broker2.short_margin_locked_per_contract == 0.0  # documented gap
+    assert broker2.short_margin_locked_per_contract == pytest.approx(go_pc)
+
+    # Old state without an exact persisted reservation must fail safe rather
+    # than infer ГО from the current margin rate or the position notional.
+    legacy_state = dict(st1)
+    legacy_state.pop("c5_short_margin_locked_per_contract")
+    legacy_broker = _build_paper_broker(read_api, state=legacy_state)
+    assert legacy_broker.short_margin_locked_per_contract == 0.0
+    assert legacy_broker.cash == pytest.approx(cash_after_open)
 
     # fresh adapter ⇒ fresh ORDER LEDGER: nothing carried over, so any
     # duplicated order after the restart would be visible immediately.
@@ -231,12 +234,9 @@ def test_full_short_cycle_restart_recover_from_broker_snapshot_and_close(
     assert broker2.entry_price == 0.0                     # basis cleared
     pnl = (1399.95 - EXIT_PRICE) * 1000 * 2               # 79 900 RUB
     assert broker2.realized_pnl == pytest.approx(pnl)
-    # ГО release across the restart: the seeded paper mirror never
-    # recorded the short margin reservation (documented gap above), so
-    # _close_short releases 0 instead of 2 × 78 912 — fail-safe "release
-    # nothing rather than invent a basis" per SimulatedBroker's contract.
-    # The cash delta is therefore EXACTLY the realized P&L.
-    assert broker2.cash == pytest.approx(cash_after_open + pnl)
+    # The restored ledger releases the exact reservation once; cash already
+    # excluded ГО after OPEN, so restoring the ledger itself did not alter it.
+    assert broker2.cash == pytest.approx(cash_after_open + 2 * go_pc + pnl)
     assert broker2.equity == pytest.approx(
         read_api.snapshot("paper-restart-account").equity_rub + pnl)
 
@@ -245,6 +245,7 @@ def test_full_short_cycle_restart_recover_from_broker_snapshot_and_close(
     assert st3["c5_position_qty"] == 0
     assert st3["c5_position_direction"] is None
     assert st3["c5_entry_price"] is None
+    assert st3["c5_short_margin_locked_per_contract"] is None
     assert not st3.get("exit_pending_sell_intent")
     assert not st3.get("exit_unverified_until_reconcile")
     assert st3["last_processed_5m_ts"] is not None        # exit candle burned
@@ -262,7 +263,7 @@ def test_full_short_cycle_restart_recover_from_broker_snapshot_and_close(
 
     # ── a THIRD process sees a clean flat world: reconcile confirms
     #    agreement between the final state file and the broker ───────
-    broker3 = _build_paper_broker(ReadOnlyAccountApi(broker2))
+    broker3 = _build_paper_broker(ReadOnlyAccountApi(broker2), state=st3)
     assert broker3.position_qty == 0
     rt3, ad3 = make_recording_runtime(market, broker3)
     d5 = rt3.run_cycle()

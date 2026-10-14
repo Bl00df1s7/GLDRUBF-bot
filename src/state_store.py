@@ -61,6 +61,9 @@ C5_STATE_DEFAULTS = {
     "c5_position_direction": None,
     "c5_position_qty": 0,
     "c5_entry_price": None,
+    # Exact PAPER SHORT ГО per contract used at confirmed entry; needed to
+    # restore the local reservation ledger across process restarts.
+    "c5_short_margin_locked_per_contract": None,
     "margin_long_rate": None,
     "margin_short_rate": None,
     "reconcile_status": None,
