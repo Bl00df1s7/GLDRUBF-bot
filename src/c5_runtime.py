@@ -445,7 +445,8 @@ class C5Runtime:
 
         if self.adapter is None:
             self.adapter, mode = build_execution_adapter(
-                self.token, self.instrument.uid, config=self.config)
+                self.token, self.instrument.uid, config=self.config,
+                state=state)
             self.trader = self.trader or self.adapter
             logger.info("STARTUP: execution adapter mode=%s", mode)
 
@@ -996,7 +997,8 @@ class C5Runtime:
                 state["c5_position_qty"] = 0
                 state["c5_position_direction"] = None
                 state["c5_entry_price"] = None
-                state["last_action"] = decision.reason
+                state["c5_short_margin_locked_per_contract"] = None
+                state["last_action"] = decision.reason)
                 # G-7: terminal CONFIRMED outcome — resolve the durable
                 # intent and persist the COMPLETE final state strictly
                 # (after every field update, so a successful save can
@@ -1477,6 +1479,9 @@ class C5Runtime:
         state["c5_position_qty"] = filled if direction == "LONG" else -filled
         state["c5_position_direction"] = direction
         state["c5_entry_price"] = guard.expected_price
+        state["c5_short_margin_locked_per_contract"] = (
+            float(decision.margin_per_contract) if direction == "SHORT"
+            else None)
         state["margin_long_rate"] = float(long_rate)
         state["margin_short_rate"] = float(short_rate)
         state["last_action"] = decision.reason
