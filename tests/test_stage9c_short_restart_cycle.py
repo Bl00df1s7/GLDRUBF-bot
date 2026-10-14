@@ -191,7 +191,7 @@ def test_full_short_cycle_restart_recover_from_broker_snapshot_and_close(
     # NO repeated/extra orders across the restart boundary:
     assert ad2.sell_calls == []                           # no re-entry SELL
     assert ad2.buy_calls == []                            # no blind close BUY
-    assert paper2.orders == []
+    assert ad2.orders == []        # fresh process #2 ledger: still empty
     assert len(sell_orders(ad1)) == 1                     # original entry: 1
     assert buy_orders(ad1) == []
 
@@ -268,8 +268,9 @@ def test_full_short_cycle_restart_recover_from_broker_snapshot_and_close(
     d5 = rt3.run_cycle()
     assert d5.action == "NO_ENTRY"                        # no phantom signal
     assert ad3.buy_calls == [] and ad3.sell_calls == []   # zero new orders
-    assert paper2.orders == [o for o in paper2.orders if o["side"] == "BUY"]
-    assert len(paper2.orders) == 1                        # total: ONE close BUY
+    # process #2's ledger holds exactly the one CLOSE_SHORT BUY — no SELLs
+    assert all(o["side"] == "BUY" for o in ad2.orders)
+    assert len(ad2.orders) == 1                           # total: ONE close BUY
     st5 = read_state(state_env)
     assert st5["reconcile_status"] == "OK"
     assert st5["c5_position_qty"] == 0
